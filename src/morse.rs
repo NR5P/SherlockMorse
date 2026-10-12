@@ -62,6 +62,21 @@ pub const TABLE: &[(u8, &str)] = &[
 /// Maximum number of elements in any character we decode.
 pub const MAX_ELEMS: u8 = 7;
 
+/// The error sign (a string of dits, nominally 8, "HH"): the sender is
+/// erasing what they just sent. Stored as the ASCII backspace byte.
+pub const ERROR: u8 = 0x08;
+/// Fewest dits read as the error sign (operators rarely count exactly 8).
+pub const ERROR_MIN_DITS: u8 = 7;
+/// Longest run of dits accepted as one error sign.
+pub const ERROR_MAX_DITS: u8 = 16;
+
+/// True when another element may follow `len` elements: within the normal
+/// character length, or a run of dits that may still be an error sign.
+#[inline]
+pub fn can_extend(bits: u8, len: u8) -> bool {
+    len < MAX_ELEMS || (bits == 0 && len < ERROR_MAX_DITS)
+}
+
 /// Lookup table indexed by `(1 << len) | bits` (a sentinel-bit encoding).
 pub struct MorseLookup {
     table: [u8; 256],
@@ -86,6 +101,9 @@ impl MorseLookup {
     /// Returns the character for an element sequence, or `None`.
     #[inline]
     pub fn get(&self, bits: u8, len: u8) -> Option<u8> {
+        if bits == 0 && (ERROR_MIN_DITS..=ERROR_MAX_DITS).contains(&len) {
+            return Some(ERROR);
+        }
         if len == 0 || len > MAX_ELEMS {
             return None;
         }
@@ -95,7 +113,7 @@ impl MorseLookup {
 
     /// True when some valid character begins with this element prefix.
     pub fn is_prefix(&self, bits: u8, len: u8) -> bool {
-        if len == 0 {
+        if len == 0 || (bits == 0 && len <= ERROR_MAX_DITS) {
             return true;
         }
         if len > MAX_ELEMS {
@@ -140,6 +158,7 @@ pub fn display_char(c: u8) -> &'static str {
         b'(' => "<KN>",
         b'%' => "<SK>",
         b'&' => "<AS>",
+        ERROR => "<HH>",
         _ => "",
     }
 }
@@ -182,5 +201,8 @@ mod tests {
         }
         assert!(m.is_prefix(0, 1));
         assert!(m.get(0b111111, 6).is_none());
+        assert_eq!(m.get(0, 8), Some(ERROR));
+        assert_eq!(m.get(0, 6), None);
+        assert!(m.is_prefix(0, 7));
     }
 }

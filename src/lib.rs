@@ -2,6 +2,7 @@
 //! CAT radio control.
 
 pub mod audio;
+pub mod abbrev;
 pub mod audiofile;
 pub mod callsign;
 pub mod cat;

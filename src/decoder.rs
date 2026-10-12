@@ -19,7 +19,7 @@
 //!    once all surviving hypotheses agree on it.
 
 use crate::lm::LanguageModel;
-use crate::morse::{MorseLookup, MAX_ELEMS};
+use crate::morse::{can_extend, MorseLookup, ERROR};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -229,6 +229,14 @@ impl BeamDecoder {
     }
 
     fn emit(&self, h: &mut Hyp, c: u8) {
+        if c == ERROR {
+            // Not in the language model: a fixed, fairly rare cost. It ends
+            // the word, and the next word starts with fresh context.
+            h.score += self.params.lm_weight * (-4.0 + self.lm.char_bonus);
+            h.ctx = [b' ', b' '];
+            h.out.extend_from_slice(&[ERROR, b' ']);
+            return;
+        }
         let lp = self.lm.logp(h.ctx[0], h.ctx[1], c);
         h.score += self.params.lm_weight * (lp + self.lm.char_bonus);
         h.ctx = [h.ctx[1], c];
@@ -264,7 +272,7 @@ impl BeamDecoder {
                             let mut n = h.clone();
                             n.score += ll;
                             let ok = match k {
-                                0 => n.len < MAX_ELEMS,
+                                0 => can_extend(n.bits, n.len),
                                 1 => self.end_char(&mut n, false),
                                 _ => self.end_char(&mut n, true),
                             };
@@ -292,7 +300,7 @@ impl BeamDecoder {
                 for h in &self.hyps {
                     if h.pend_mark > 0.0 {
                         for (dash, ll) in self.mark_options(h.pend_mark) {
-                            if h.len >= MAX_ELEMS {
+                            if !can_extend(h.bits, h.len) {
                                 continue;
                             }
                             let mut n = h.clone();
@@ -324,7 +332,7 @@ impl BeamDecoder {
                     let mut cands: Vec<Hyp> = Vec::new();
                     if h.pend_mark > 0.0 {
                         for (dash, ll) in self.mark_options(h.pend_mark) {
-                            if h.len >= MAX_ELEMS {
+                            if !can_extend(h.bits, h.len) {
                                 continue;
                             }
                             let mut n = h.clone();
@@ -592,6 +600,37 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
 
 /// Words made only of E and T (single dots/dashes) are what noise and
 /// interference decode as; real traffic almost never contains them.
+/// How long (ms) a finished word is held back waiting for a possible error
+/// sign; the next word releases it sooner.
+const HOLD_MS: f32 = 4000.0;
+
+/// Applies error signs to text: each erases the word in progress, or the
+/// previous word if it follows a word gap.
+pub fn apply_errors(text: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == ERROR {
+            if out.last().is_none_or(|&c| c == b' ') {
+                while out.last() == Some(&b' ') {
+                    out.pop();
+                }
+            }
+            while out.last().is_some_and(|&c| c != b' ') {
+                out.pop();
+            }
+            // Skip the space that follows the sign.
+            if text.get(i + 1) == Some(&b' ') {
+                i += 1;
+            }
+        } else {
+            out.push(text[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn is_noise_word(w: &[u8]) -> bool {
     !w.is_empty() && w.iter().all(|&c| c == b'E' || c == b'T')
 }
@@ -623,6 +662,10 @@ pub struct CwDecoder {
     beam: Option<BeamDecoder>,
     text: Vec<u8>,
     word: Vec<u8>,
+    /// Last complete word, held back briefly in case the sender follows it
+    /// with the error sign.
+    held: Vec<u8>,
+    held_frames: u32,
     pub frames_since_mark: u64,
     pub total_marks: u64,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
@@ -654,6 +697,8 @@ impl CwDecoder {
             beam: None,
             text: Vec::new(),
             word: Vec::new(),
+            held: Vec::new(),
+            held_frames: 0,
             frames_since_mark: 0,
             total_marks: 0,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
@@ -708,23 +753,53 @@ impl CwDecoder {
 
     /// Takes newly decoded text.
     pub fn take_text(&mut self) -> String {
-        if let Some(b) = &mut self.beam {
-            let c = b.take_committed();
-            self.word.extend_from_slice(&c);
-        }
-        // Release complete words, dropping noise artefacts.
-        while let Some(p) = self.word.iter().position(|&c| c == b' ') {
-            let w: Vec<u8> = self.word.drain(..=p).collect();
-            let body = &w[..w.len() - 1];
-            if !is_noise_word(body) {
-                self.text.extend_from_slice(&w);
-            }
+        self.release_words();
+        // Nobody sends the error sign long after the word: release it.
+        if !self.held.is_empty() && self.held_frames as f32 * self.frame_ms > HOLD_MS {
+            self.text.append(&mut self.held);
         }
         String::from_utf8_lossy(&std::mem::take(&mut self.text)).into_owned()
     }
 
+    /// Releases the held word now (e.g. the station has stopped).
+    pub fn release_held(&mut self) -> String {
+        self.release_words();
+        self.text.append(&mut self.held);
+        String::from_utf8_lossy(&std::mem::take(&mut self.text)).into_owned()
+    }
+
+    /// Moves complete words from the beam into the output, dropping noise
+    /// artefacts and applying the error sign.
+    fn release_words(&mut self) {
+        if let Some(b) = &mut self.beam {
+            let c = b.take_committed();
+            self.word.extend_from_slice(&c);
+        }
+        while let Some(p) = self.word.iter().position(|&c| c == b' ') {
+            let w: Vec<u8> = self.word.drain(..=p).collect();
+            let body = &w[..w.len() - 1];
+            if let Some(e) = body.iter().position(|&c| c == ERROR) {
+                // The error sign erases the word in progress, or if it came
+                // after a word gap, the previous word.
+                if body[..e].is_empty() {
+                    self.held.clear();
+                }
+            } else if !is_noise_word(body) {
+                self.text.append(&mut self.held);
+                self.held = w;
+                self.held_frames = 0;
+            }
+        }
+    }
+
+    /// Text not yet released: the held word, then the live decode.
     pub fn tentative(&self) -> String {
-        self.beam.as_ref().map(|b| b.tentative()).unwrap_or_default()
+        let mut b = self.held.clone();
+        b.extend_from_slice(&self.word);
+        if let Some(beam) = &self.beam {
+            b.extend_from_slice(beam.tentative().as_bytes());
+        }
+        String::from_utf8_lossy(&apply_errors(&b)).into_owned()
     }
 
     /// Primes the level trackers with recent frames, then decodes them. Used
@@ -845,6 +920,7 @@ impl CwDecoder {
 
     fn slice(&mut self, want: bool) {
         self.run_frames += 1;
+        self.held_frames = self.held_frames.saturating_add(1);
         if self.state {
             self.frames_since_mark = 0;
         } else {
@@ -976,6 +1052,8 @@ impl CwDecoder {
         if !self.word.ends_with(b" ") && !self.word.is_empty() {
             self.word.push(b' ');
         }
+        self.release_words();
+        self.text.append(&mut self.held);
     }
 }
 
@@ -1019,5 +1097,52 @@ mod tests {
         }
         let out = String::from_utf8(b.take_committed()).unwrap();
         assert_eq!(out.trim(), "CQ CQ DE W1AW K");
+    }
+
+    /// Like `runs_for`, but `#` sends the error sign (8 dits) as one word.
+    fn with_error(text: &str, dot: f32) -> Vec<Run> {
+        let mut v = Vec::new();
+        for (i, part) in text.split('#').enumerate() {
+            if i > 0 {
+                for k in 0..8 {
+                    if k > 0 {
+                        v.push(Run::Space(dot));
+                    }
+                    v.push(Run::Mark(dot));
+                }
+                v.push(Run::Space(7.0 * dot));
+            }
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let mut r = runs_for(part, dot);
+            r.pop(); // Flush
+            v.extend(r);
+        }
+        v.push(Run::Flush);
+        v
+    }
+
+    #[test]
+    fn error_sign_erases() {
+        let lm = Arc::new(LanguageModel::new());
+        let dot = 60.0;
+        for (sent, want) in [
+            ("DE W1AX # W1AW K", "DE W1AW K"),
+            ("NAME IS JPHN # JOHN", "NAME IS JOHN"),
+        ] {
+            let runs = with_error(sent, dot);
+            let mut d = CwDecoder::new(5.0, DecoderParams::default(), lm.clone());
+            let tm = estimate_timing(&runs_for("CQ CQ DE W1AW K", dot)).unwrap();
+            d.beam = Some(BeamDecoder::new(DecoderParams::default(), lm.clone(), tm));
+            for r in runs {
+                d.beam.as_mut().unwrap().push(r);
+            }
+            d.finish();
+            assert_eq!(d.take_text().trim(), want, "{sent}");
+        }
+        assert_eq!(apply_errors(b"DE K1AB\x08 K1ABC"), b"DE K1ABC");
+        assert_eq!(apply_errors(b"DE K1ABX \x08 K1ABC"), b"DE K1ABC");
     }
 }

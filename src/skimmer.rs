@@ -498,19 +498,35 @@ impl Skimmer {
             if fit >= MIN_FIT && text_ok {
                 ch.qualified = true;
             } else if fit < MIN_FIT - 0.13 || (n >= 8 && !text_ok) {
+                if ch.qualified {
+                    Self::hide(ch, now, events, spots);
+                }
                 ch.qualified = false;
             }
         }
         if ch.qualified {
-            let out = std::mem::take(&mut ch.pending_out);
-            if !out.is_empty() {
-                events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: out.clone() });
-                Self::scan_calls(ch, &out, now, spots);
-            }
+            Self::publish(ch, now, events, spots);
         } else if ch.pending_out.len() > 200 {
             let cut = ch.pending_out.len() - 200;
             ch.pending_out.drain(..cut);
         }
+    }
+
+    fn publish(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+        let out = std::mem::take(&mut ch.pending_out);
+        if !out.is_empty() {
+            events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: out.clone() });
+            Self::scan_calls(ch, &out, now, spots);
+        }
+    }
+
+    /// Publishes the word the decoder was holding back (in case of an error
+    /// sign) before the channel is hidden, so the station's last word is kept.
+    fn hide(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+        let txt = ch.decoder.release_held();
+        ch.text.push_str(&txt);
+        ch.pending_out.push_str(&txt);
+        Self::publish(ch, now, events, spots);
     }
 
     fn scan_calls(ch: &mut Channel, txt: &str, now: f64, spots: &mut Vec<Spot>) {
@@ -738,6 +754,7 @@ impl Skimmer {
                 c.last_good = now;
             }
             if !c.pinned && c.qualified && runs >= 20 && fit < MIN_FIT - 0.13 {
+                Self::hide(c, now, &mut self.events, &mut self.spots);
                 c.qualified = false;
             }
         }

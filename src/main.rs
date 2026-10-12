@@ -37,6 +37,8 @@ struct Settings {
     wf_contrast: f32,
     wf_brightness: f32,
     file_path: String,
+    /// Print the English meaning of CW abbreviations in small text inline.
+    explain_abbrev: bool,
 }
 
 impl Default for Settings {
@@ -59,6 +61,7 @@ impl Default for Settings {
             wf_contrast: 1.0,
             wf_brightness: 0.0,
             file_path: String::new(),
+            explain_abbrev: true,
         }
     }
 }
@@ -1094,9 +1097,19 @@ impl App {
             let sel = Some(ch.id) == self.selected;
             let col = if sel { Color32::YELLOW } else if ch.is_mark { Color32::from_rgb(120, 255, 120) } else { Color32::from_rgb(80, 160, 255) };
             painter.line_segment([Pos2::new(x, img_rect.top()), Pos2::new(x, img_rect.top() + 10.0)], Stroke::new(2.0f32, col));
-            let label = ch.callsign.clone().unwrap_or_else(|| ch.wpm.map(|w| format!("{w:.0}")).unwrap_or_default());
+            // Until a callsign is decoded, show the measured code speed.
+            let label = ch.callsign.clone().unwrap_or_else(|| ch.wpm.map(|w| format!("{w:.0}wpm")).unwrap_or_default());
             if !label.is_empty() {
-                painter.text(Pos2::new(x + 2.0, img_rect.top() + 10.0), egui::Align2::LEFT_TOP, label, egui::FontId::monospace(11.0), col);
+                // Dark backing box so the label stands out from the waterfall.
+                let font = if ch.callsign.is_some() { egui::FontId::monospace(13.0) } else { egui::FontId::monospace(11.0) };
+                // Steady colour (the tick above blinks with the keying, the label doesn't).
+                let col = if sel { Color32::YELLOW } else if ch.callsign.is_some() { Color32::from_rgb(255, 210, 90) } else { Color32::from_rgb(170, 200, 255) };
+                let galley = painter.layout_no_wrap(label, font, col);
+                let pos = Pos2::new(x + 3.0, img_rect.top() + 10.0);
+                let bg = Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(3.0, 1.0));
+                painter.rect_filled(bg, 3.0, Color32::from_black_alpha(200));
+                painter.rect_stroke(bg, 3.0, Stroke::new(1.0f32, col.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                painter.galley(pos, galley, col);
             }
         }
         // Hover readout
@@ -1322,12 +1335,15 @@ impl App {
                     }
                 }
             }
+            ui.checkbox(&mut self.s.explain_abbrev, "Explain abbreviations")
+                .on_hover_text("Show the meaning of CW abbreviations (TNX, QTH, 73…) in small print. Highlighted words always explain themselves on hover.");
             if ui.small_button("Open folder").on_hover_text(format!("Conversations are saved in {}", log_dir().display())).clicked() {
                 let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
                 let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
             }
         });
         ui.separator();
+        let gloss = self.s.explain_abbrev;
         match self.bottom_tab {
             0 => match &self.qso {
                 Some(q) => {
@@ -1335,9 +1351,8 @@ impl App {
                     let rf = q.rf;
                     let mut tune = false;
                     egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                        let r = ui.add(egui::Label::new(RichText::new(text).monospace().size(15.0)).wrap().sense(Sense::click()));
+                        let r = cw_text(ui, &text, 15.0, gloss, Sense::click(), "Double-click to tune back to this conversation");
                         tune = r.double_clicked();
-                        r.on_hover_text("Double-click to tune back to this conversation");
                     });
                     if let (true, Some(rf)) = (tune, rf) {
                         self.tune_rf(rf);
@@ -1372,11 +1387,10 @@ impl App {
                         let text = q.text.clone();
                         let rf = q.rf;
                         egui::ScrollArea::vertical().id_salt("hist_text").auto_shrink([false, false]).show(ui, |ui| {
-                            let r = ui.add(egui::Label::new(RichText::new(text).monospace().size(14.0)).wrap().sense(Sense::click()));
+                            let r = cw_text(ui, &text, 14.0, gloss, Sense::click(), "Double-click to tune to this conversation");
                             if r.double_clicked() {
                                 tune = rf;
                             }
-                            r.on_hover_text("Double-click to tune to this conversation");
                         });
                     }
                 });
@@ -1407,11 +1421,95 @@ impl App {
                 self.zero_beat(ch.freq);
             }
         });
+        let gloss = self.s.explain_abbrev;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(format!("{}{}", to_display(&ch.text), to_display(&ch.tentative))).monospace().size(15.0)).wrap(),
-            );
+            cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), 15.0, gloss, Sense::hover(), "");
         });
+    }
+}
+
+/// Decoded CW text with abbreviations, Q-codes and prosigns highlighted.
+/// Hovering one shows its meaning; with `gloss` the meaning is also printed
+/// in small text underneath it (rows holding one get taller to make room).
+/// `hint` is the hover text elsewhere.
+fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, hint: &str) -> egui::Response {
+    use egui::text::{LayoutJob, TextFormat, TextWrapping};
+    let mono = egui::FontId::monospace(size);
+    let small_font = egui::FontId::proportional((size * 0.62).max(9.0));
+    let (text_h, small_h) = ui.fonts(|f| (f.row_height(&mono), f.row_height(&small_font)));
+    // Top-aligned so a taller abbreviation leaves the rest of its row in place.
+    let normal = TextFormat { font_id: mono, color: ui.visuals().text_color(), valign: egui::Align::TOP, ..Default::default() };
+    let abbr = TextFormat {
+        color: if ui.visuals().dark_mode { Color32::from_rgb(110, 205, 255) } else { Color32::from_rgb(0, 95, 170) },
+        line_height: gloss.then_some(text_h + small_h + 1.0),
+        ..normal.clone()
+    };
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    // Char ranges of the highlighted words, with their meanings.
+    let mut spans: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut chars = 0;
+    let mut last = 0;
+    for (r, m) in cwskimmer::abbrev::find(text) {
+        job.append(&text[last..r.start], 0.0, normal.clone());
+        chars += text[last..r.start].chars().count();
+        let n = text[r.clone()].chars().count();
+        job.append(&text[r.clone()], 0.0, abbr.clone());
+        spans.push((chars..chars + n, m));
+        chars += n;
+        last = r.end;
+    }
+    job.append(&text[last..], 0.0, normal);
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let r = ui.add(egui::Label::new(galley.clone()).sense(sense));
+    let origin = r.rect.min.to_vec2();
+    // Word boxes (galley coordinates): x range and row top.
+    let boxes: Vec<(f32, f32, f32)> = spans
+        .iter()
+        .map(|(s, _)| {
+            let a = galley.pos_from_ccursor(egui::text::CCursor::new(s.start));
+            let b = galley.pos_from_ccursor(egui::text::CCursor::new(s.end));
+            (a.left(), if (b.top() - a.top()).abs() < 1.0 { b.left() } else { galley.size().x }, a.top())
+        })
+        .collect();
+    let painter = ui.painter();
+    let underline = Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(110, 205, 255, 70));
+    let mut prev_end = f32::NEG_INFINITY;
+    let mut prev_top = f32::NAN;
+    for (i, ((x0, x1, top), (_, m))) in boxes.iter().zip(&spans).enumerate() {
+        let y = top + text_h - 1.0;
+        if !gloss {
+            painter.line_segment([Pos2::new(*x0, y) + origin, Pos2::new(*x1, y) + origin], underline);
+            continue;
+        }
+        if *top != prev_top {
+            prev_end = f32::NEG_INFINITY;
+            prev_top = *top;
+        }
+        // Left-aligned under the word, shortened (…) to stop before the next one.
+        let x = x0.max(prev_end + 6.0);
+        let limit = match boxes.get(i + 1) {
+            Some((nx, _, nt)) if nt == top => nx - 6.0,
+            _ => galley.size().x.max(r.rect.width()),
+        };
+        let w = (limit - x).max(x1 - x0).max(8.0);
+        let mut gj = LayoutJob::simple_singleline(m.clone(), small_font.clone(), ui.visuals().weak_text_color());
+        gj.wrap = TextWrapping::truncate_at_width(w);
+        let g = ui.fonts(|f| f.layout_job(gj));
+        prev_end = x + g.size().x;
+        painter.galley(Pos2::new(x, top + text_h) + origin, g, Color32::GRAY);
+    }
+    let hit = r.hover_pos().and_then(|p| {
+        let c = galley.cursor_from_pos(p - r.rect.min).ccursor.index;
+        spans.iter().find(|(s, _)| s.contains(&c) || s.end == c)
+    });
+    match hit {
+        Some((s, m)) => {
+            let word: String = galley.job.text.chars().skip(s.start).take(s.len()).collect();
+            r.on_hover_text(RichText::new(format!("{word} — {m}")).strong())
+        }
+        None if !hint.is_empty() => r.on_hover_text(hint),
+        None => r,
     }
 }
 

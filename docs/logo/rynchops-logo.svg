@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360">
+  <title>Rynchops</title>
+  <rect width="1200" height="360" rx="40" fill="#120d1f"/>
+  <g transform="translate(40 40) scale(0.546875)">
+  <defs>
+    <clipPath id="tile"><rect width="512" height="512" rx="112"/></clipPath>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#241640"/>
+      <stop offset="0.38" stop-color="#7a2e63"/>
+      <stop offset="0.58" stop-color="#e2585a"/>
+      <stop offset="0.63" stop-color="#ff9a4a"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#123e52"/>
+      <stop offset="1" stop-color="#06141d"/>
+    </linearGradient>
+    <linearGradient id="wake" x1="110" y1="0" x2="455" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffe2a8" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#ffe2a8" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="bill" x1="414" y1="290" x2="470" y2="336" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff4b2b"/>
+      <stop offset="0.62" stop-color="#ff4b2b"/>
+      <stop offset="0.7" stop-color="#151018"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#tile)">
+    <!-- dusk sky + sun -->
+    <rect width="512" height="512" fill="url(#sky)"/>
+    <circle cx="290" cy="320" r="118" fill="#ffc46b" opacity="0.95"/>
+    <circle cx="290" cy="320" r="150" fill="#ffc46b" opacity="0.18"/>
+    <!-- water -->
+    <rect y="320" width="512" height="192" fill="url(#water)"/>
+    <g fill="#ffc46b" opacity="0.35">
+      <rect x="196" y="352" width="188" height="4" rx="2"/>
+      <rect x="222" y="368" width="136" height="4" rx="2"/>
+      <rect x="246" y="384" width="88" height="4" rx="2"/>
+      <rect x="268" y="400" width="44" height="4" rx="2"/>
+    </g>
+    <!-- wake: CQ in Morse, sliced by the bill -->
+    <g fill="url(#wake)">
+      <rect x="109" y="327" width="44" height="10" rx="5"/>
+      <rect x="163" y="327" width="14" height="10" rx="5"/>
+      <rect x="187" y="327" width="44" height="10" rx="5"/>
+      <rect x="241" y="327" width="14" height="10" rx="5"/>
+      <rect x="279" y="327" width="44" height="10" rx="5"/>
+      <rect x="333" y="327" width="44" height="10" rx="5"/>
+      <rect x="387" y="327" width="14" height="10" rx="5"/>
+      <rect x="411" y="327" width="44" height="10" rx="5"/>
+    </g>
+    <ellipse cx="466" cy="328" rx="18" ry="4" fill="none" stroke="#ffe2a8" stroke-width="3" opacity="0.8"/>
+    <!-- black skimmer -->
+    <g transform="translate(466 331) scale(1.3) translate(-466 -331)">
+    <path d="M372,276 C368,220 345,165 305,130 C320,182 330,232 345,284 Z" fill="#2a2433"/>
+    <path d="M292,292 L258,282 L270,292 L256,302 Z" fill="#0d0b12"/>
+    <path d="M290,292 C315,276 360,270 392,274 C404,275 414,280 419,287 C412,293 398,297 380,298 C350,301 315,300 290,292 Z" fill="#0d0b12"/>
+    <path d="M300,295 C330,302 372,301 402,295 C380,302 336,305 300,295 Z" fill="#f4efe6"/>
+    <path d="M362,280 C340,220 290,160 212,118 C252,176 282,236 312,293 Z" fill="#0d0b12"/>
+    <path d="M413,280 L454,295 L416,292 Z" fill="#ff4b2b"/>
+    <path d="M413,286 L471,330 L465,336 L409,298 Z" fill="url(#bill)"/>
+      <circle cx="406" cy="281" r="2.2" fill="#f4efe6"/>
+    </g>
+  </g>
+
+  </g>
+  <text x="358" y="190" font-family="'Futura','Avenir Next','Montserrat','DejaVu Sans',sans-serif" font-weight="700" font-size="112" letter-spacing="4" textLength="780" lengthAdjust="spacingAndGlyphs" fill="#f4efe6">RYNCHOPS</text>
+  <g fill="#ffc46b">
+    <rect x="364" y="224" width="44" height="10" rx="5"/><rect x="418" y="224" width="14" height="10" rx="5"/><rect x="442" y="224" width="44" height="10" rx="5"/><rect x="496" y="224" width="14" height="10" rx="5"/>
+    <rect x="534" y="224" width="44" height="10" rx="5"/><rect x="588" y="224" width="44" height="10" rx="5"/><rect x="642" y="224" width="14" height="10" rx="5"/><rect x="666" y="224" width="44" height="10" rx="5"/>
+  </g>
+  <text x="732" y="236" font-family="'Avenir Next','Montserrat','DejaVu Sans',sans-serif" font-size="30" letter-spacing="6" fill="#ff9a4a">CW SKIMMER</text>
+  <text x="362" y="290" font-family="'Avenir Next','Montserrat','DejaVu Sans',sans-serif" font-size="26" fill="#a99bbd" font-style="italic">skims the band. catches every call.</text>
+</svg>
