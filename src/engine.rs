@@ -28,6 +28,11 @@ pub enum EngineCmd {
     Shift(f32),
     /// Start recording the input audio to a WAV file (None stops).
     Record(Option<PathBuf>),
+    /// Write a JSON line per second describing every decoder (troubleshooting
+    /// capture that accompanies an audio recording). None stops.
+    DisplayLog(Option<PathBuf>),
+    /// Radio state to include in the display log.
+    RigInfo { vfo: Option<u64>, mode: Option<String>, pitch: f32 },
     /// Precisely measure the tone near `near` Hz (± `span`); the answer
     /// appears in `Snapshot::measurements` under `id`.
     Measure { id: u64, near: f32, span: f32 },
@@ -119,6 +124,9 @@ fn file_reader(path: PathBuf, realtime: bool, looped: bool, tx: Sender<AudioChun
     let (samples, rate) = match crate::audiofile::read_audio(&path) {
         Ok(v) => v,
         Err(e) => {
+            if std::env::var_os("CWSK_TRACE").is_some() {
+                eprintln!("file_reader: {e:#}");
+            }
             snap.lock().error = Some(format!("{e:#}"));
             return;
         }
@@ -142,6 +150,9 @@ fn file_reader(path: PathBuf, realtime: bool, looped: bool, tx: Sender<AudioChun
                 return;
             }
         }
+        if std::env::var_os("CWSK_TRACE").is_some() {
+            eprintln!("file_reader: finished pass, stop={}", stop.load(Ordering::Relaxed));
+        }
         if !looped {
             break;
         }
@@ -162,6 +173,10 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     let mut rate_seen = 0;
     let mut rec_path: Option<PathBuf> = None;
     let mut pending_measure: Vec<(u64, f32, f32, Instant)> = Vec::new();
+    let mut display_log: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut display_t0 = Instant::now();
+    let mut last_display = Instant::now();
+    let mut rig_info: (Option<u64>, Option<String>, f32) = (None, None, 0.0);
     let mut recorder: Option<(PathBuf, hound::WavWriter<std::io::BufWriter<std::fs::File>>)> = None;
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = cmd_rx.try_recv() {
@@ -173,6 +188,15 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                 EngineCmd::Clear => sk.clear(),
                 EngineCmd::Config(c) => sk.cfg = c,
                 EngineCmd::Shift(df) => sk.shift(df),
+                EngineCmd::DisplayLog(p) => {
+                    if std::env::var_os("CWSK_TRACE").is_some() {
+                        eprintln!("engine: DisplayLog {:?}", p);
+                    }
+                    display_log = p.and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new);
+                    display_t0 = Instant::now();
+                    last_display = Instant::now() - Duration::from_secs(2);
+                }
+                EngineCmd::RigInfo { vfo, mode, pitch } => rig_info = (vfo, mode, pitch),
                 EngineCmd::Measure { id, near, span } => pending_measure.push((id, near, span, Instant::now())),
                 EngineCmd::Record(p) => {
                     if let Some((_, w)) = recorder.take() {
@@ -215,8 +239,38 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if std::env::var_os("CWSK_TRACE").is_some() {
+                    eprintln!("engine: audio source disconnected");
+                }
                 sk.finish();
                 stop.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Some(f) = &mut display_log {
+            if last_display.elapsed() >= Duration::from_secs(1) {
+                last_display = Instant::now();
+                let chans: Vec<serde_json::Value> = sk
+                    .debug_channels()
+                    .into_iter()
+                    .map(|(freq, fit, runs, el, dash, shown, text)| {
+                        let tail: String = text.chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
+                        serde_json::json!({"audio_hz": freq, "fit": fit, "runs": runs, "el_per_char": el, "dash_frac": dash, "shown": shown, "text": tail})
+                    })
+                    .collect();
+                let infos: Vec<serde_json::Value> = sk
+                    .channel_info()
+                    .into_iter()
+                    .map(|c| serde_json::json!({"audio_hz": c.freq, "wpm": c.wpm, "snr_db": c.snr_db, "call": c.callsign}))
+                    .collect();
+                let line = serde_json::json!({
+                    "t": display_t0.elapsed().as_secs_f32(), "audio_t": sk.time,
+                    "vfo_hz": rig_info.0, "mode": rig_info.1, "pitch": rig_info.2,
+                    "noise_floor_db": 10.0 * sk.noise_floor.max(1e-15).log10(),
+                    "shown": infos, "all_channels": chans,
+                });
+                use std::io::Write;
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
             }
         }
         // Answer measurement requests once enough fresh audio is buffered.
@@ -261,6 +315,9 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     }
     if let Some((_, w)) = recorder.take() {
         let _ = w.finalize();
+    }
+    if std::env::var_os("CWSK_TRACE").is_some() {
+        eprintln!("engine: dsp loop exit at audio t={:.1}", sk.time);
     }
     snap.lock().running = false;
 }

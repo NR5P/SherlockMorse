@@ -148,8 +148,14 @@ fn main() -> Result<()> {
                 rs.process(chunk, &mut buf);
                 sk.process(&buf);
             };
-            for chunk in samples.chunks(rate as usize / 10) {
+            let chunk_div: usize = std::env::var("CWSK_CHUNKDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            for chunk in samples.chunks(rate as usize / chunk_div) {
                 feed(&mut sk, chunk);
+            }
+            if std::env::var_os("CWSK_CHANNELS").is_some() {
+                for (f, fit, n, q, d, ok, t) in sk.debug_channels() {
+                    eprintln!("CH {f:7.1} fit={fit:.2} n={n:3} el/ch={q:.2} dash={d:.2} shown={ok} | {}", t.trim());
+                }
             }
             feed(&mut sk, &vec![0.0; rate as usize * 3]);
             sk.finish();
@@ -383,7 +389,8 @@ fn cases() -> Vec<Case> {
 fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
     let samples = synth::render(scene);
     let mut sk = Skimmer::new(SkimmerConfig { params: DecoderParams::from_env(), ..Default::default() }, lm);
-    for c in samples.chunks(800) {
+    // 20 ms chunks, like live sound-card capture.
+    for c in samples.chunks(160) {
         sk.process(c);
     }
     sk.finish();

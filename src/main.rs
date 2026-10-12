@@ -95,6 +95,10 @@ struct App {
     lines: std::collections::HashMap<u64, (f32, String, Instant)>,
     recording: Option<(std::path::PathBuf, Instant)>,
     zb: Option<ZeroBeat>,
+    rec_display: Option<RecDisplay>,
+    /// Playing an audio file rather than the sound card.
+    file_mode: bool,
+    last_rig_info: Instant,
     /// Smoothed average level and decaying peak-hold for the input meter.
     meter_avg: f32,
     meter_peak: f32,
@@ -110,6 +114,15 @@ struct App {
     show_settings: bool,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
     screenshot: Option<(std::path::PathBuf, Instant, bool)>,
+}
+
+/// Display capture while recording audio: a JSON line per second with every
+/// decoder's state, and a screenshot every 10 s.
+struct RecDisplay {
+    log: Option<std::io::BufWriter<std::fs::File>>,
+    shots: std::path::PathBuf,
+    last_shot: Instant,
+    shot_n: u32,
 }
 
 /// Click-to-tune with closed-loop correction ("zero-beat").
@@ -158,6 +171,9 @@ impl App {
             lines: Default::default(),
             recording: None,
             zb: None,
+            rec_display: None,
+            file_mode: false,
+            last_rig_info: Instant::now(),
             meter_avg: -90.0,
             meter_peak: -90.0,
             clip_until: None,
@@ -185,6 +201,9 @@ impl App {
         } else {
             app.start_audio();
         }
+        if args.iter().any(|a| a == "--record") {
+            app.toggle_recording();
+        }
         if app.s.rig_enabled {
             app.connect_rig();
         }
@@ -206,6 +225,7 @@ impl App {
     }
 
     fn start_audio(&mut self) {
+        self.file_mode = false;
         self.engine = None;
         if self.s.audio_auto || self.s.audio_device.is_none() {
             self.s.audio_device = audio::auto_select(&self.devices);
@@ -215,12 +235,16 @@ impl App {
     }
 
     fn start_file(&mut self) {
+        self.file_mode = true;
         self.engine = None;
         let path = std::path::PathBuf::from(self.s.file_path.trim());
         self.start_source(Source::File { path, realtime: true, looped: false });
     }
 
     fn start_source(&mut self, src: Source) {
+        // A new engine starts without a recorder: keep the Rec button honest.
+        self.recording = None;
+        self.rec_display = None;
         match Engine::start(src, self.skimmer_config(), self.lm.clone()) {
             Ok(e) => {
                 self.engine = Some(e);
@@ -355,7 +379,7 @@ impl App {
 
     fn poll(&mut self) {
         // In Auto mode, switch to the radio's codec when it (re)appears.
-        if self.s.audio_auto && !self.snap.source.starts_with("file:") && self.last_scan.elapsed() > Duration::from_secs(5) {
+        if self.s.audio_auto && !self.file_mode && self.last_scan.elapsed() > Duration::from_secs(5) {
             self.last_scan = Instant::now();
             let cur_is_radio = self.s.audio_device.as_deref().is_some_and(|n| audio::radio_score(n) >= 50);
             if !cur_is_radio {
@@ -368,7 +392,7 @@ impl App {
         }
         // Live audio lost (radio off / cable pulled): retry every 3 s.
         let failed = self.engine.as_ref().is_some_and(|e| e.audio_failed());
-        let live = !self.snap.source.starts_with("file:");
+        let live = !self.file_mode;
         if (failed || (self.engine.is_none() && self.engine_err.is_some())) && live {
             if self.last_audio_retry.elapsed() > Duration::from_secs(3) {
                 self.last_audio_retry = Instant::now();
@@ -425,6 +449,9 @@ impl App {
         }
         if let Some(r) = &self.rig {
             self.rig_state = r.snapshot();
+        }
+        if self.recording.is_some() && self.last_rig_info.elapsed() > Duration::from_millis(500) {
+            self.send_rig_info();
         }
         // Follow VFO changes: shift decoders with the signals.
         if let Some(f) = self.rig_state.freq {
@@ -511,17 +538,37 @@ impl App {
         }
     }
 
+    fn send_rig_info(&mut self) {
+        self.last_rig_info = Instant::now();
+        if let Some(e) = &self.engine {
+            e.send(EngineCmd::RigInfo {
+                vfo: self.rig_state.freq,
+                mode: self.rig_state.mode.as_ref().map(|m| m.label()),
+                pitch: self.pitch(),
+            });
+        }
+    }
+
     fn toggle_recording(&mut self) {
         let Some(e) = &self.engine else { return };
         if self.recording.is_some() {
             e.send(EngineCmd::Record(None));
+            e.send(EngineCmd::DisplayLog(None));
             self.recording = None;
+            self.rec_display = None;
         } else {
             let (date, time) = utc_now();
             let dir = log_dir();
             let _ = std::fs::create_dir_all(&dir);
             let p = dir.join(format!("audio-{date}-{}.wav", time.replace(':', "")));
             e.send(EngineCmd::Record(Some(p.clone())));
+            // Alongside the audio: what the display showed (for troubleshooting).
+            let stem = p.with_extension("");
+            let shots = std::path::PathBuf::from(format!("{}-screens", stem.display()));
+            let _ = std::fs::create_dir_all(&shots);
+            e.send(EngineCmd::DisplayLog(Some(std::path::PathBuf::from(format!("{}-display.jsonl", stem.display())))));
+            self.send_rig_info();
+            self.rec_display = Some(RecDisplay { log: None, shots, last_shot: Instant::now() - Duration::from_secs(60), shot_n: 0 });
             self.recording = Some((p, Instant::now()));
         }
     }
@@ -1131,6 +1178,31 @@ impl eframe::App for App {
             ui.add_space(4.0);
             self.ui_channels(ui);
         });
+        if let (Some(rd), Some((_, started))) = (&mut self.rec_display, &self.recording) {
+            let _ = &rd.log;
+            let t = started.elapsed().as_secs_f32();
+            if rd.last_shot.elapsed() >= Duration::from_secs(10) {
+                rd.last_shot = Instant::now();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(format!("rec:{t:06.1}"))));
+            }
+            let shots: Vec<(Arc<ColorImage>, String)> = ctx.input(|i| {
+                i.raw
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Screenshot { image, user_data, .. } => {
+                            let tag = user_data.data.as_ref().and_then(|d| d.downcast_ref::<String>()).cloned()?;
+                            tag.starts_with("rec:").then(|| (image.clone(), tag))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for (img, tag) in shots {
+                rd.shot_n += 1;
+                let _ = save_png(&rd.shots.join(format!("{}s.png", &tag[4..])), &img);
+            }
+        }
         if let Some((path, at, sent)) = &mut self.screenshot {
             if !*sent && Instant::now() >= *at {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -1138,9 +1210,17 @@ impl eframe::App for App {
             }
             let path = path.clone();
             let shots: Vec<Arc<ColorImage>> = ctx.input(|i| {
-                i.raw.events.iter().filter_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }).collect()
+                i.raw
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        // Ignore the periodic screenshots taken while recording.
+                        egui::Event::Screenshot { image, user_data, .. } if user_data.data.is_none() => Some(image.clone()),
+                        _ => None,
+                    })
+                    .collect()
             });
-            if let Some(img) = shots.first() {
+            if let (true, Some(img)) = (*sent, shots.first()) {
                 if let Err(e) = save_png(&path, img) {
                     eprintln!("screenshot failed: {e}");
                 }

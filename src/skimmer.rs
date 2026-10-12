@@ -83,6 +83,8 @@ pub struct ChannelInfo {
     pub pinned: bool,
     pub last_mark_age: f32,
     pub callsign: Option<String>,
+    /// Timing-fit score (0..1): how well the keying matches Morse timing.
+    pub fit: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -144,10 +146,14 @@ pub fn bin_hz() -> f32 {
     RATE as f32 / FFT_SIZE as f32
 }
 
+/// Minimum timing-fit score for a channel to be shown (real CW measured
+/// 0.8-0.97 on live recordings; noise 0.35-0.68).
+const MIN_FIT: f32 = 0.78;
+
 /// Minimum mean Morse elements per character for a channel to be shown.
 /// Noise and artefacts decode as short characters (E T I A N M S, ~1.6
 /// elements); real text averages ~3.
-const MIN_QUALITY: f32 = 2.1;
+const MIN_QUALITY: f32 = 1.8;
 
 /// Minimum fraction of dashes among decoded elements. Noise bursts are
 /// short, so noise decodes almost entirely as dots (E I S H 5); real text
@@ -469,9 +475,27 @@ impl Skimmer {
             ch.text.drain(..cut);
         }
         ch.pending_out.push_str(txt);
-        let (q, dash, n) = text_quality(&ch.text);
-        if n >= 12 || (final_ && n >= 4) {
-            ch.qualified = ch.pinned || (q >= MIN_QUALITY && dash >= MIN_DASH_FRAC);
+        // Show a channel once its timing looks like real keying: most marks
+        // and gaps land near Morse durations. Noise (including AGC-pumped
+        // band noise next to a strong station) gives random durations.
+        // Hysteresis: hide again if the fit collapses (station gone).
+        // Once there is enough text, also require it to look like Morse
+        // rather than noise, which decodes as dot-only characters (E I S H 5).
+        let (fit, runs) = ch.decoder.fit();
+        let (el, dash, n) = text_quality(&ch.text);
+        let text_ok = if n >= 8 {
+            el >= MIN_QUALITY && dash >= MIN_DASH_FRAC
+        } else {
+            n >= 3 && dash >= 0.2
+        };
+        if ch.pinned {
+            ch.qualified = true;
+        } else if runs >= 20 || (final_ && runs >= 10) {
+            if fit >= MIN_FIT && text_ok {
+                ch.qualified = true;
+            } else if fit < MIN_FIT - 0.13 || (n >= 8 && !text_ok) {
+                ch.qualified = false;
+            }
         }
         if ch.qualified {
             let out = std::mem::take(&mut ch.pending_out);
@@ -741,6 +765,19 @@ impl Skimmer {
         self.spots.retain(|s| now - s.time < 900.0);
     }
 
+    /// Debug view of every channel, qualified or not:
+    /// (freq, timing fit, fit runs, elements/char, dash fraction, qualified, text).
+    pub fn debug_channels(&self) -> Vec<(f32, f32, u32, f32, f32, bool, String)> {
+        self.channels
+            .iter()
+            .map(|c| {
+                let (fit, n) = c.decoder.fit();
+                let (q, d, _) = text_quality(&c.text);
+                (c.demod.freq as f32, fit, n, q, d, c.qualified, c.text.clone())
+            })
+            .collect()
+    }
+
     pub fn channel_info(&self) -> Vec<ChannelInfo> {
         let mut v: Vec<ChannelInfo> = self
             .channels
@@ -765,6 +802,7 @@ impl Skimmer {
                     pinned: c.pinned,
                     last_mark_age: (self.time - c.last_mark) as f32,
                     callsign,
+                    fit: c.decoder.fit().0,
                 }
             })
             .collect();

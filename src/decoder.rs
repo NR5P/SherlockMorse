@@ -174,6 +174,9 @@ pub struct BeamDecoder {
     hyps: Vec<Hyp>,
     committed: Vec<u8>,
     scratch: Vec<Hyp>,
+    /// Smoothed fraction of runs that fit Morse timing (0..1).
+    pub fit: f32,
+    pub fit_n: u32,
 }
 
 impl BeamDecoder {
@@ -186,6 +189,8 @@ impl BeamDecoder {
             hyps: vec![Self::root()],
             committed: Vec::new(),
             scratch: Vec::new(),
+            fit: 0.6,
+            fit_n: 0,
         }
     }
 
@@ -417,6 +422,23 @@ impl BeamDecoder {
     /// Hard-decision classification of a run under the current timing model,
     /// used to adapt the model.
     pub fn adapt(&mut self, run: Run) {
+        // Timing fit: does this run land near a Morse duration (1 or 3 units
+        // for marks; 1, 3 or 7+ for spaces)? Real keying, even sloppy, mostly
+        // does; noise produces random durations.
+        let ll = match run {
+            Run::Mark(m) => Some(self.mark_options(m).iter().map(|o| o.1).fold(f32::MIN, f32::max) + self.params.sigma_mark.ln()),
+            Run::Space(sp) if sp < self.timing.wgap() * 2.0 => {
+                let o = self.space_options(sp);
+                Some(o[0].max(o[1] - (0.33f32 / 0.55).ln()).max(o[2] - (0.12f32 / 0.55).ln()) - (0.55f32).ln() + self.params.sigma_space.ln())
+            }
+            _ => None,
+        };
+        if let Some(ll) = ll {
+            // ll > -1.1 means within ~1.5 sigma of a Morse duration.
+            let hit = if ll > -1.1 { 1.0 } else { 0.0 };
+            self.fit += 0.05 * (hit - self.fit);
+            self.fit_n += 1;
+        }
         let a = 0.08;
         match run {
             Run::Mark(m) => {
@@ -498,6 +520,12 @@ pub fn clearly_better(runs: &[Run], cur: f32, new: f32) -> bool {
         return false;
     }
     model_score(new, &m, &s) > model_score(cur, &m, &s) + 0.5 * m.len() as f32
+}
+
+/// True if dot length `new` explains the runs better than `cur` at all.
+pub fn better(runs: &[Run], cur: f32, new: f32) -> bool {
+    let (m, s) = solid_runs(runs);
+    m.len() >= 6 && model_score(new, &m, &s) > model_score(cur, &m, &s)
 }
 
 /// Maximum-likelihood speed estimate from a set of runs.
@@ -638,6 +666,12 @@ impl CwDecoder {
 
     pub fn timing(&self) -> Option<&TimingModel> {
         self.beam.as_ref().map(|b| &b.timing)
+    }
+
+    /// Timing-fit score (fraction of recent runs near Morse durations) and
+    /// how many runs it is based on.
+    pub fn fit(&self) -> (f32, u32) {
+        self.beam.as_ref().map(|b| (b.fit, b.fit_n)).unwrap_or((0.0, 0))
     }
 
     pub fn wpm(&self) -> Option<f32> {
@@ -889,13 +923,18 @@ impl CwDecoder {
         }
         // Periodically re-estimate speed in case a different operator (or
         // a speed change) appears on this frequency.
-        if self.marks_since_check >= 16 {
+        let poor_fit = self.beam.as_ref().is_some_and(|b| b.fit < 0.7);
+        if self.marks_since_check >= if poor_fit { 8 } else { 16 } {
             self.marks_since_check = 0;
             let hist: Vec<Run> = self.history.iter().copied().collect();
             if let Some(tm) = estimate_timing(&hist) {
                 let b = self.beam.as_mut().unwrap();
                 let r = tm.dot / b.timing.dot;
-                if !(0.7..=1.43).contains(&r) && clearly_better(&hist, b.timing.dot, tm.dot) {
+                // Switch speed when the new estimate is clearly more likely,
+                // or merely better when the current model fits poorly (e.g.
+                // it was bootstrapped on noise before the station started).
+                let poor = b.fit < 0.7;
+                if !(0.7..=1.43).contains(&r) && (clearly_better(&hist, b.timing.dot, tm.dot) || (poor && better(&hist, b.timing.dot, tm.dot))) {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("re-estimate: {:?} -> {:?}", b.timing, tm);
                     }
