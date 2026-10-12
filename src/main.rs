@@ -136,6 +136,37 @@ struct Qso {
 }
 
 impl Qso {
+    /// Loads the most recent saved conversations (newest first).
+    fn load_recent(n: usize) -> Vec<Qso> {
+        let Ok(rd) = std::fs::read_dir(log_dir()) else { return Vec::new() };
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with("qso-") && f.ends_with(".txt")))
+            .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+            .collect();
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files
+            .into_iter()
+            .take(n)
+            .filter_map(|(mtime, path)| {
+                let content = std::fs::read_to_string(&path).ok()?;
+                let started_utc = content.lines().find_map(|l| l.strip_prefix("Started ")).map(|l| l.trim_end_matches(" UTC").to_string())?;
+                if started_utc.len() < 16 {
+                    return None;
+                }
+                let text = content.splitn(2, "\n\n").nth(1).unwrap_or("").trim_end().to_string();
+                // qso-YYYY-MM-DD-HHMMZ-14047.1-CALL….txt
+                let stem = path.file_stem()?.to_str()?.to_string();
+                let rf = stem.split('-').nth(5).and_then(|f| f.parse::<f64>().ok()).map(|k| (k * 1000.0).round() as u64);
+                let calls = stem.split('-').skip(6).map(|c| c.replace('_', "/")).collect();
+                let age = mtime.elapsed().unwrap_or_default();
+                let last_text = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                Some(Qso { rf, started_utc, last_text, away_since: None, text, calls, path })
+            })
+            .collect()
+    }
+
     fn title(&self) -> String {
         let f = self.rf.map(|r| format!("{:.1} kHz", r as f64 / 1000.0)).unwrap_or_else(|| "on pitch".into());
         let calls = if self.calls.is_empty() { String::new() } else { format!("  {}", self.calls.join(" ")) };
@@ -221,7 +252,7 @@ impl App {
             zb: None,
             rec_display: None,
             qso: None,
-            qso_history: Vec::new(),
+            qso_history: Qso::load_recent(20),
             bottom_tab: 0,
             history_sel: None,
             file_mode: false,
@@ -1301,9 +1332,16 @@ impl App {
             0 => match &self.qso {
                 Some(q) => {
                     let text = q.text.clone();
+                    let rf = q.rf;
+                    let mut tune = false;
                     egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(text).monospace().size(15.0)).wrap());
+                        let r = ui.add(egui::Label::new(RichText::new(text).monospace().size(15.0)).wrap().sense(Sense::click()));
+                        tune = r.double_clicked();
+                        r.on_hover_text("Double-click to tune back to this conversation");
                     });
+                    if let (true, Some(rf)) = (tune, rf) {
+                        self.tune_rf(rf);
+                    }
                 }
                 None => {
                     ui.label(RichText::new("Tune to a station (double-click it). Everything decoded on your frequency is collected here and saved to a file automatically; it is archived when you move away.").weak());
@@ -1332,8 +1370,13 @@ impl App {
                     ui.separator();
                     if let Some(q) = sel.and_then(|i| self.qso_history.get(i)) {
                         let text = q.text.clone();
+                        let rf = q.rf;
                         egui::ScrollArea::vertical().id_salt("hist_text").auto_shrink([false, false]).show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(text).monospace().size(14.0)).wrap());
+                            let r = ui.add(egui::Label::new(RichText::new(text).monospace().size(14.0)).wrap().sense(Sense::click()));
+                            if r.double_clicked() {
+                                tune = rf;
+                            }
+                            r.on_hover_text("Double-click to tune to this conversation");
                         });
                     }
                 });

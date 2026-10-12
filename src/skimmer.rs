@@ -65,6 +65,9 @@ pub struct Channel {
     pending_out: String,
     /// The decoded text looks like real Morse (see [`text_quality`]).
     qualified: bool,
+    /// Last time the keying fitted Morse timing (noise keeps `last_mark`
+    /// fresh, so lifetime is based on this instead).
+    last_good: f64,
     words: String,
     call_counts: HashMap<String, u32>,
     prev_word: String,
@@ -319,6 +322,7 @@ impl Skimmer {
             marks: VecDeque::with_capacity(MARK_HIST),
             pending_out: String::new(),
             qualified: pinned || was_revived,
+            last_good: self.time,
             words: String::new(),
             call_counts: rcalls,
             prev_word: String::new(),
@@ -726,10 +730,21 @@ impl Skimmer {
             self.reject_artifacts();
             self.suppressed.retain(|&(_, t)| t > now);
         }
+        // Re-check every channel continuously, not only when it decodes new
+        // text: a station that stopped leaves a decoder chewing on noise.
+        for c in &mut self.channels {
+            let (fit, runs) = c.decoder.fit();
+            if fit >= MIN_FIT {
+                c.last_good = now;
+            }
+            if !c.pinned && c.qualified && runs >= 20 && fit < MIN_FIT - 0.13 {
+                c.qualified = false;
+            }
+        }
         let timeout = self.cfg.channel_timeout as f64;
         let mut retired = Vec::new();
         self.channels.retain(|c| {
-            let keep = c.pinned || now - c.last_mark < timeout;
+            let keep = c.pinned || (now - c.last_mark < timeout && now - c.last_good < timeout);
             if !keep && c.qualified {
                 retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone() });
             }
