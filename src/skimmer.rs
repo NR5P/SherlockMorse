@@ -325,6 +325,47 @@ impl Skimmer {
         self.channels.retain(|c| c.id != id);
     }
 
+    /// Precisely measures the frequency of the strongest tone within
+    /// `near ± span` Hz over the last second of audio (1 Hz Goertzel scan
+    /// plus parabolic interpolation). Returns `None` if there is not yet
+    /// enough audio or no clear tone. Result: (Hz, peak-to-median dB).
+    pub fn measure_freq(&self, near: f32, span: f32) -> Option<(f32, f32)> {
+        let need = RATE as usize; // 1 s
+        if self.preroll.len() < need + RATE as usize / 5 {
+            return None;
+        }
+        let x: Vec<f32> = self.preroll.iter().skip(self.preroll.len() - need).copied().collect();
+        let n = x.len();
+        let win: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos()).collect();
+        let power = |f: f32| -> f32 {
+            let w = std::f32::consts::TAU * f / RATE as f32;
+            let c = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f32, 0.0f32);
+            for i in 0..n {
+                let s0 = x[i] * win[i] + c * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            s1 * s1 + s2 * s2 - c * s1 * s2
+        };
+        let lo = (near - span).max(50.0);
+        let hi = (near + span).min(RATE as f32 / 2.0 - 50.0);
+        let freqs: Vec<f32> = (0..=((hi - lo) as usize)).map(|i| lo + i as f32).collect();
+        let p: Vec<f32> = freqs.iter().map(|&f| power(f)).collect();
+        let (imax, &pmax) = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+        let mut sorted = p.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let med = sorted[sorted.len() / 2].max(1e-20);
+        let snr_db = 10.0 * (pmax / med).log10();
+        if snr_db < 6.0 || imax == 0 || imax + 1 >= p.len() {
+            return None;
+        }
+        let (a, b, c) = (p[imax - 1].max(1e-20).ln(), pmax.ln(), p[imax + 1].max(1e-20).ln());
+        let den = a - 2.0 * b + c;
+        let off = if den.abs() > 1e-9 { (0.5 * (a - c) / den).clamp(-0.5, 0.5) } else { 0.0 };
+        Some((freqs[imax] + off, snr_db))
+    }
+
     /// The radio was retuned: every signal moved by `df` Hz in the audio
     /// passband. Moves the decoders with them (keeping their text) and drops
     /// those that left the passband.

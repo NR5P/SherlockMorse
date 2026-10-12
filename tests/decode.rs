@@ -63,3 +63,19 @@ fn noise_only_produces_no_text() {
     let total: usize = out.iter().map(|(_, t)| t.trim().len()).sum();
     assert!(total < 10, "decoded noise: {out:?}");
 }
+
+#[test]
+fn measures_keyed_signal_frequency_precisely() {
+    for &(f, snr) in &[(713.4f32, 10.0f32), (521.8, 3.0), (1033.0, 20.0)] {
+        let scene = Scene {
+            signals: vec![SignalSpec { text: "CQ CQ DE W1AW W1AW K".into(), freq: f, snr_db: snr, start: 0.0, ..Default::default() }],
+            seed: 5,
+            ..Default::default()
+        };
+        let audio = render(&scene);
+        let mut sk = Skimmer::new(SkimmerConfig::default(), Arc::new(LanguageModel::uniform()));
+        sk.process(&audio[..(2.5 * 8000.0) as usize]);
+        let (m, _) = sk.measure_freq(f + 12.0, 30.0).expect("tone found");
+        assert!((m - f).abs() < 1.5, "true {f} measured {m}");
+    }
+}

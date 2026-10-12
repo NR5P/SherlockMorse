@@ -94,6 +94,9 @@ struct App {
     /// Per-channel text not yet written to the log file: (freq, text, last update).
     lines: std::collections::HashMap<u64, (f32, String, Instant)>,
     recording: Option<(std::path::PathBuf, Instant)>,
+    zb: Option<ZeroBeat>,
+    zb_status: String,
+    next_req: u64,
     selected: Option<u64>,
     spots: Vec<SpotRow>,
     log: Vec<(f32, String)>,
@@ -103,6 +106,18 @@ struct App {
     show_settings: bool,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
     screenshot: Option<(std::path::PathBuf, Instant, bool)>,
+}
+
+/// Click-to-tune with closed-loop correction ("zero-beat").
+struct ZeroBeat {
+    /// 0 = waiting for the initial measurement, 1.. = verification passes.
+    stage: u8,
+    req: Option<u64>,
+    /// Don't measure before this (radio settling, fresh audio).
+    wait_until: Instant,
+    /// Where to look for the signal (audio Hz) on the next measurement.
+    near: f32,
+    span: f32,
 }
 
 enum ProbeMsg {
@@ -138,6 +153,9 @@ impl App {
             last_scan: Instant::now(),
             lines: Default::default(),
             recording: None,
+            zb: None,
+            zb_status: String::new(),
+            next_req: 1,
             selected: None,
             spots: Vec::new(),
             log: Vec::new(),
@@ -256,6 +274,63 @@ impl App {
         self.set_vfo(vfo.round().max(0.0) as u64);
     }
 
+    /// Starts a zero-beat on the signal near `audio` Hz: measure it
+    /// precisely, tune it onto the pitch, then verify and correct.
+    fn zero_beat(&mut self, audio: f32) {
+        if self.rig.is_none() {
+            return;
+        }
+        self.zb = Some(ZeroBeat { stage: 0, req: None, wait_until: Instant::now(), near: audio, span: 30.0 });
+        self.zb_status = "zero-beat: measuring…".into();
+    }
+
+    /// After tuning to a known RF frequency (spot), verify it lands on pitch.
+    fn zero_beat_verify(&mut self) {
+        if self.rig.is_none() {
+            return;
+        }
+        let p = self.pitch();
+        self.zb = Some(ZeroBeat { stage: 1, req: None, wait_until: Instant::now() + Duration::from_millis(1300), near: p, span: 40.0 });
+        self.zb_status = "zero-beat: checking…".into();
+    }
+
+    fn step_zero_beat(&mut self, results: &[(u64, Option<(f32, f32)>)]) {
+        let Some(zb) = &mut self.zb else { return };
+        let Some(engine) = &self.engine else { return };
+        if zb.req.is_none() {
+            if Instant::now() >= zb.wait_until {
+                let id = self.next_req;
+                self.next_req += 1;
+                engine.send(EngineCmd::Measure { id, near: zb.near, span: zb.span });
+                zb.req = Some(id);
+            }
+            return;
+        }
+        let Some(&(_, res)) = results.iter().find(|(id, _)| Some(*id) == zb.req) else { return };
+        let stage = zb.stage;
+        let pitch = self.pitch();
+        match res {
+            None => {
+                self.zb_status = if stage == 0 { "zero-beat: no clear tone there".into() } else { "zero-beat: signal faded, tuned by estimate".into() };
+                self.zb = None;
+            }
+            Some((f, _)) => {
+                let err = f - pitch;
+                if stage > 0 && err.abs() <= 2.0 {
+                    self.zb_status = format!("zero-beat ✓ {f:.0} Hz (±{:.0} Hz)", err.abs().max(1.0));
+                    self.zb = None;
+                } else if stage >= 3 {
+                    self.zb_status = format!("zero-beat: {:+.0} Hz off (signal unstable)", err);
+                    self.zb = None;
+                } else {
+                    self.tune_to_audio(f);
+                    self.zb = Some(ZeroBeat { stage: stage + 1, req: None, wait_until: Instant::now() + Duration::from_millis(1300), near: pitch, span: 25.0 });
+                    self.zb_status = format!("zero-beat: tuned, verifying… ({err:+.0} Hz)");
+                }
+            }
+        }
+    }
+
     fn set_vfo(&mut self, hz: u64) {
         if let Some(r) = &self.rig {
             r.set_freq(hz);
@@ -316,7 +391,9 @@ impl App {
             self.snap.error = s.error.clone();
             self.snap.running = s.running;
             self.snap.input_rate = s.input_rate;
+            let measurements = std::mem::take(&mut s.measurements);
             drop(s);
+            self.step_zero_beat(&measurements);
             for r in rows {
                 self.push_wf_row(&r);
             }
@@ -625,6 +702,10 @@ impl App {
         ui.label(RichText::new(txt).monospace().size(26.0).color(Color32::from_rgb(255, 200, 80)));
         let mode = self.rig_state.mode.as_ref().map(|m| m.label()).unwrap_or_default();
         ui.label(RichText::new(mode).strong());
+        if !self.zb_status.is_empty() {
+            let col = if self.zb_status.contains('✓') { Color32::LIGHT_GREEN } else { Color32::LIGHT_GRAY };
+            ui.label(RichText::new(&self.zb_status).small().color(col));
+        }
         ui.label(RichText::new(format!("pitch {:.0} Hz", self.pitch())).small())
             .on_hover_text(if self.rig_state.pitch.is_some() && self.s.auto_pitch { "Read from the radio" } else { "From Settings" });
         if let Some(f) = vfo {
@@ -796,7 +877,7 @@ impl App {
             if let Some(p) = resp.interact_pointer_pos() {
                 let f = f_of(p.x);
                 let snapped = self.snap.channels.iter().filter(|c| (c.freq - f).abs() < 30.0).min_by(|a, b| (a.freq - f).abs().total_cmp(&(b.freq - f).abs())).map(|c| c.freq).unwrap_or(f);
-                self.tune_to_audio(snapped);
+                self.zero_beat(snapped);
             }
         }
         // Mouse wheel over the waterfall tunes the radio.
@@ -892,7 +973,7 @@ impl App {
                 }
             });
         if let Some(f) = tune {
-            self.tune_to_audio(f);
+            self.zero_beat(f);
         }
         if let (Some(id), Some(e)) = (remove, &self.engine) {
             e.send(EngineCmd::RemoveChannel(id));
@@ -952,10 +1033,15 @@ impl App {
                 }
             });
         if let Some(rf) = tune_rf {
-            self.set_vfo(rf);
+            // Go to the spot's frequency (minus the pitch offset in SSB/DATA)
+            // and then fine-tune on the live signal.
+            let d = (self.pitch() as f64 - self.audio_ref()) as i64;
+            let vfo = if self.upper() { rf as i64 - d } else { rf as i64 + d };
+            self.set_vfo(vfo.max(0) as u64);
+            self.zero_beat_verify();
         }
         if let Some(a) = tune_audio {
-            self.tune_to_audio(a);
+            self.zero_beat(a);
         }
     }
 
@@ -975,7 +1061,7 @@ impl App {
             }
             ui.label(format!("{} WPM  SNR {:.0} dB", ch.wpm.map(|w| format!("{w:.0}")).unwrap_or("–".into()), ch.snr_db));
             if self.rig.is_some() && ui.button("Tune radio here").clicked() {
-                self.tune_to_audio(ch.freq);
+                self.zero_beat(ch.freq);
             }
         });
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {

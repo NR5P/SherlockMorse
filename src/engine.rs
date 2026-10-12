@@ -28,6 +28,9 @@ pub enum EngineCmd {
     Shift(f32),
     /// Start recording the input audio to a WAV file (None stops).
     Record(Option<PathBuf>),
+    /// Precisely measure the tone near `near` Hz (± `span`); the answer
+    /// appears in `Snapshot::measurements` under `id`.
+    Measure { id: u64, near: f32, span: f32 },
 }
 
 #[derive(Default, Clone)]
@@ -45,6 +48,8 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub running: bool,
     pub input_rate: u32,
+    /// Answers to `EngineCmd::Measure`: (id, Some((Hz, dB)) or None).
+    pub measurements: Vec<(u64, Option<(f32, f32)>)>,
 }
 
 pub struct Engine {
@@ -149,6 +154,7 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     let mut peak = 0.0f32;
     let mut rate_seen = 0;
     let mut rec_path: Option<PathBuf> = None;
+    let mut pending_measure: Vec<(u64, f32, f32, Instant)> = Vec::new();
     let mut recorder: Option<(PathBuf, hound::WavWriter<std::io::BufWriter<std::fs::File>>)> = None;
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = cmd_rx.try_recv() {
@@ -160,6 +166,7 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                 EngineCmd::Clear => sk.clear(),
                 EngineCmd::Config(c) => sk.cfg = c,
                 EngineCmd::Shift(df) => sk.shift(df),
+                EngineCmd::Measure { id, near, span } => pending_measure.push((id, near, span, Instant::now())),
                 EngineCmd::Record(p) => {
                     if let Some((_, w)) = recorder.take() {
                         let _ = w.finalize();
@@ -199,6 +206,16 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                 stop.store(true, Ordering::Relaxed);
             }
         }
+        // Answer measurement requests once enough fresh audio is buffered.
+        pending_measure.retain(|&(id, near, span, t0)| {
+            let r = sk.measure_freq(near, span);
+            if r.is_some() || t0.elapsed() > Duration::from_secs(4) {
+                snap.lock().measurements.push((id, r));
+                false
+            } else {
+                true
+            }
+        });
         if last_pub.elapsed() >= Duration::from_millis(60) || stop.load(Ordering::Relaxed) {
             last_pub = Instant::now();
             let mut s = snap.lock();
