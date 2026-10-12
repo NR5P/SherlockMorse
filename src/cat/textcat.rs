@@ -176,6 +176,20 @@ impl Rig for TextCat {
         Ok(parse_mode_code(self.dialect, c))
     }
 
+    fn get_pitch(&mut self) -> Result<Option<u32>> {
+        match self.dialect {
+            // Yaesu "KP;" -> "KPnn;": pitch = 300 Hz + nn * 10 Hz
+            // (FTDX3000/FTDX5000/FT-991/FTDX101…, range 300-1050 Hz).
+            Dialect::Yaesu => {
+                let r = self.query("KP;")?;
+                let n: u32 = r.trim_start_matches("KP").trim().parse().map_err(|_| anyhow!("bad KP reply '{r}'"))?;
+                let hz = 300 + n * 10;
+                Ok((300..=1050).contains(&hz).then_some(hz))
+            }
+            Dialect::Kenwood => Ok(None),
+        }
+    }
+
     fn set_mode(&mut self, mode: &Mode) -> Result<()> {
         let c = mode_code(mode).ok_or_else(|| anyhow!("mode not supported"))?;
         match self.dialect {

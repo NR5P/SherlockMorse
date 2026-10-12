@@ -32,6 +32,8 @@ struct Settings {
     squelch: f32,
     lm_weight: f32,
     show_rf: bool,
+    /// Use the CW pitch reported by the radio over CAT when available.
+    auto_pitch: bool,
     wf_contrast: f32,
     wf_brightness: f32,
     file_path: String,
@@ -53,6 +55,7 @@ impl Default for Settings {
             squelch: 2.3,
             lm_weight: 0.7,
             show_rf: true,
+            auto_pitch: true,
             wf_contrast: 1.0,
             wf_brightness: 0.0,
             file_path: String::new(),
@@ -223,10 +226,18 @@ impl App {
         self.rig_state.mode.as_ref().map(|m| m.is_upper()).unwrap_or(true)
     }
 
+    /// CW pitch in use: read from the radio when possible, else the setting.
+    fn pitch(&self) -> f32 {
+        match (self.s.auto_pitch, self.rig_state.pitch) {
+            (true, Some(p)) if self.rig.is_some() => p as f32,
+            _ => self.s.pitch,
+        }
+    }
+
     /// Audio frequency that corresponds to the displayed VFO frequency.
     fn audio_ref(&self) -> f64 {
         let cw = self.rig_state.mode.as_ref().map(|m| m.is_cw()).unwrap_or(true);
-        if cw { self.s.pitch as f64 } else { 0.0 }
+        if cw { self.pitch() as f64 } else { 0.0 }
     }
 
     /// RF frequency of a signal heard at `audio` Hz.
@@ -240,7 +251,7 @@ impl App {
     fn tune_to_audio(&mut self, audio: f32) {
         let Some(rf) = self.rf_of(audio) else { return };
         // VFO setting that puts this RF frequency at the pitch.
-        let d = self.s.pitch as f64 - self.audio_ref();
+        let d = self.pitch() as f64 - self.audio_ref();
         let vfo = if self.upper() { rf as f64 - d } else { rf as f64 + d };
         self.set_vfo(vfo.round().max(0.0) as u64);
     }
@@ -614,6 +625,8 @@ impl App {
         ui.label(RichText::new(txt).monospace().size(26.0).color(Color32::from_rgb(255, 200, 80)));
         let mode = self.rig_state.mode.as_ref().map(|m| m.label()).unwrap_or_default();
         ui.label(RichText::new(mode).strong());
+        ui.label(RichText::new(format!("pitch {:.0} Hz", self.pitch())).small())
+            .on_hover_text(if self.rig_state.pitch.is_some() && self.s.auto_pitch { "Read from the radio" } else { "From Settings" });
         if let Some(f) = vfo {
             for (lbl, d) in [("-1k", -1000i64), ("-100", -100), ("-10", -10), ("+10", 10), ("+100", 100), ("+1k", 1000)] {
                 if ui.button(lbl).clicked() {
@@ -650,8 +663,16 @@ impl App {
         let mut changed = false;
         egui::Grid::new("settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("CW pitch (Hz)");
-            ui.add(egui::DragValue::new(&mut self.s.pitch).range(300.0..=1200.0).speed(10.0))
-                .on_hover_text("Must match the radio's CW pitch setting (FTDX3000: menu CW PITCH, default 700)");
+            ui.horizontal(|ui| {
+                let from_radio = self.s.auto_pitch && self.rig.is_some() && self.rig_state.pitch.is_some();
+                if from_radio {
+                    ui.label(RichText::new(format!("{:.0} Hz (read from radio)", self.pitch())).strong());
+                } else {
+                    ui.add(egui::DragValue::new(&mut self.s.pitch).range(300.0..=1200.0).speed(10.0))
+                        .on_hover_text("Must match the radio's CW pitch (FTDX3000 default 700 Hz)");
+                }
+                ui.checkbox(&mut self.s.auto_pitch, "auto").on_hover_text("Read the CW pitch from the radio over CAT (Yaesu)");
+            });
             ui.end_row();
             ui.label("Passband (Hz)");
             ui.horizontal(|ui| {
@@ -733,7 +754,7 @@ impl App {
             f += step;
         }
         // Pitch marker
-        let px = x_of(self.s.pitch);
+        let px = x_of(self.pitch());
         painter.line_segment([Pos2::new(px, img_rect.top()), Pos2::new(px, img_rect.bottom())], Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(255, 80, 80, 120)));
         // Channel markers with callsigns
         for ch in &self.snap.channels {

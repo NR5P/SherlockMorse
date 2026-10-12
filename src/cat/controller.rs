@@ -13,6 +13,8 @@ pub struct RigState {
     pub name: String,
     pub freq: Option<u64>,
     pub mode: Option<Mode>,
+    /// CW pitch reported by the radio (Hz).
+    pub pitch: Option<u32>,
     pub error: Option<String>,
 }
 
@@ -139,6 +141,12 @@ fn run(cfg: RigConfig, rx: Receiver<RigCmd>, state: Arc<Mutex<RigState>>) {
             if mode_counter % 5 == 0 {
                 if let Ok(m) = rig.get_mode() {
                     state.lock().mode = Some(m);
+                }
+            }
+            // Pitch rarely changes; read it at connect and every ~3 s.
+            if mode_counter % 10 == 0 {
+                if let Ok(Some(p)) = rig.get_pitch() {
+                    state.lock().pitch = Some(p);
                 }
             }
             mode_counter += 1;

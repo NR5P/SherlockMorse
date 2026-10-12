@@ -275,6 +275,11 @@ fn main() -> Result<()> {
             if let Ok(m) = rig.get_mode() {
                 println!("mode: {}", m.label());
             }
+            match rig.get_pitch() {
+                Ok(Some(p)) => println!("CW pitch: {p} Hz"),
+                Ok(None) => println!("CW pitch: not reported by this radio"),
+                Err(e) => println!("CW pitch: error {e}"),
+            }
         }
     }
     Ok(())

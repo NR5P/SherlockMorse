@@ -142,6 +142,11 @@ pub trait Rig: Send {
     fn set_freq(&mut self, hz: u64) -> Result<()>;
     fn get_mode(&mut self) -> Result<Mode>;
     fn set_mode(&mut self, mode: &Mode) -> Result<()>;
+    /// The radio's CW pitch (sidetone / receive offset) in Hz, if it can
+    /// report it over CAT.
+    fn get_pitch(&mut self) -> Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 pub fn open_serial(cfg: &RigConfig, stop_bits_two: bool) -> Result<Box<dyn serialport::SerialPort>> {
