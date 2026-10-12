@@ -163,7 +163,7 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(r) = reference {
-                let r = std::fs::read_to_string(r)?;
+                let r = String::from_utf8_lossy(&std::fs::read(r)?).into_owned();
                 let r = normalize_ref(&r);
                 let c = synth::cer(&r, &best);
                 println!("\nCER vs reference (longest channel): {:.1}%", c * 100.0);

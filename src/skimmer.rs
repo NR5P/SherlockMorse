@@ -59,6 +59,12 @@ pub struct Channel {
     pub level_db: f32,
     /// Spectral activity gate: something is transmitting at this frequency.
     pub active: bool,
+    /// Recent mark/space decisions (one per frame) for artefact detection.
+    marks: VecDeque<bool>,
+    /// Text not yet published (held until the channel qualifies).
+    pending_out: String,
+    /// The decoded text looks like real Morse (see [`text_quality`]).
+    qualified: bool,
     words: String,
     call_counts: HashMap<String, u32>,
     prev_word: String,
@@ -120,12 +126,90 @@ pub struct Skimmer {
     /// Recent audio, replayed into newly created channels so the start of a
     /// transmission (before detection triggered) is not lost.
     preroll: VecDeque<f32>,
+    /// Frequencies where artefacts of strong signals were found: (Hz, until).
+    suppressed: Vec<(f32, f64)>,
+    last_artifact_check: f64,
 }
 
 const PREROLL_SECS: f32 = 1.5;
+/// Frames of mark history kept per channel (5 s).
+const MARK_HIST: usize = 2500;
 
 pub fn bin_hz() -> f32 {
     RATE as f32 / FFT_SIZE as f32
+}
+
+/// Minimum mean Morse elements per character for a channel to be shown.
+/// Noise and artefacts decode as short characters (E T I A N M S, ~1.6
+/// elements); real text averages ~3.
+const MIN_QUALITY: f32 = 2.1;
+
+/// Mean number of Morse elements per character over the last 40 characters
+/// (ignoring spaces), and the number of characters considered.
+pub fn text_quality(text: &str) -> (f32, usize) {
+    let mut n = 0usize;
+    let mut tot = 0usize;
+    for b in text.bytes().rev() {
+        if b == b' ' {
+            continue;
+        }
+        if let Some(p) = crate::morse::pattern_for(b) {
+            tot += p.len();
+            n += 1;
+        }
+        if n >= 40 {
+            break;
+        }
+    }
+    (if n > 0 { tot as f32 / n as f32 } else { 0.0 }, n)
+}
+
+/// Maximum |Pearson correlation| between two mark histories over lags of
+/// ±100 ms, computed only where both channels are keying (so two stations
+/// taking turns are not mistaken for an echo).
+fn lagged_corr(a: &VecDeque<bool>, b: &VecDeque<bool>) -> f32 {
+    let n = a.len().min(b.len());
+    let (oa, ob) = (a.len() - n, b.len() - n);
+    let x: Vec<bool> = a.iter().skip(oa).copied().collect();
+    let y: Vec<bool> = b.iter().skip(ob).copied().collect();
+    // Activity: a mark within ±0.6 s.
+    let act = |v: &[bool]| -> Vec<bool> {
+        let mut pre = vec![0u32; v.len() + 1];
+        for (i, &m) in v.iter().enumerate() {
+            pre[i + 1] = pre[i] + u32::from(m);
+        }
+        (0..v.len()).map(|i| pre[(i + 301).min(v.len())] > pre[i.saturating_sub(300)]).collect()
+    };
+    let (ax, ay) = (act(&x), act(&y));
+    let mut best = 0.0f32;
+    for lag in (-50i32..=50).step_by(5) {
+        let (mut sx, mut sy, mut sxy, mut cnt) = (0f64, 0f64, 0f64, 0f64);
+        for i in 0..n {
+            let j = i as i32 + lag;
+            if j < 0 || j as usize >= n {
+                continue;
+            }
+            let j = j as usize;
+            if !(ax[i] && ay[j]) {
+                continue;
+            }
+            let (xv, yv) = (f64::from(u8::from(x[i])), f64::from(u8::from(y[j])));
+            sx += xv;
+            sy += yv;
+            sxy += xv * yv;
+            cnt += 1.0;
+        }
+        if cnt < 400.0 {
+            continue;
+        }
+        let (mx, my) = (sx / cnt, sy / cnt);
+        let cov = sxy / cnt - mx * my;
+        let var = (mx * (1.0 - mx)) * (my * (1.0 - my));
+        if var > 1e-9 {
+            best = best.max((cov / var.sqrt()).abs() as f32);
+        }
+    }
+    best
 }
 
 impl Skimmer {
@@ -150,6 +234,8 @@ impl Skimmer {
             events: Vec::new(),
             spots: Vec::new(),
             preroll: VecDeque::new(),
+            suppressed: Vec::new(),
+            last_artifact_check: 0.0,
         }
     }
 
@@ -180,6 +266,9 @@ impl Skimmer {
             pinned,
             level_db: -200.0,
             active: true,
+            marks: VecDeque::with_capacity(MARK_HIST),
+            pending_out: String::new(),
+            qualified: pinned,
             words: String::new(),
             call_counts: HashMap::new(),
             prev_word: String::new(),
@@ -208,6 +297,10 @@ impl Skimmer {
         self.trough = vec![0.0; nb];
         self.persist = vec![0; nb];
         self.preroll.clear();
+        self.suppressed.clear();
+        for c in &mut self.channels {
+            c.marks.clear();
+        }
     }
 
     pub fn clear(&mut self) {
@@ -239,6 +332,10 @@ impl Skimmer {
                 // a neighbour.
                 let strong = ch.decoder.snr_db() > 12.0;
                 ch.demod.afc(z, ch.decoder.is_mark() && strong);
+                if ch.marks.len() >= MARK_HIST {
+                    ch.marks.pop_front();
+                }
+                ch.marks.push_back(ch.decoder.is_mark());
             }
             if ch.decoder.is_mark() {
                 ch.last_mark = now;
@@ -250,13 +347,7 @@ impl Skimmer {
             }
             let txt = ch.decoder.take_text();
             if !txt.is_empty() {
-                ch.text.push_str(&txt);
-                if ch.text.len() > 4000 {
-                    let cut = ch.text.len() - 3000;
-                    ch.text.drain(..cut);
-                }
-                self.events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: txt.clone() });
-                Self::scan_calls(ch, &txt, now, &mut self.spots);
+                Self::deliver(ch, &txt, now, false, &mut self.events, &mut self.spots);
             }
         }
         self.time += samples.len() as f64 / RATE as f64;
@@ -268,11 +359,32 @@ impl Skimmer {
         for ch in &mut self.channels {
             ch.decoder.finish();
             let txt = ch.decoder.take_text();
-            if !txt.is_empty() {
-                ch.text.push_str(&txt);
-                self.events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: txt.clone() });
-                Self::scan_calls(ch, &txt, self.time, &mut self.spots);
+            Self::deliver(ch, &txt, self.time, true, &mut self.events, &mut self.spots);
+        }
+    }
+
+    /// Appends decoded text to a channel and publishes it once the channel
+    /// looks like real Morse rather than noise or an artefact.
+    fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+        ch.text.push_str(txt);
+        if ch.text.len() > 4000 {
+            let cut = ch.text.len() - 3000;
+            ch.text.drain(..cut);
+        }
+        ch.pending_out.push_str(txt);
+        let (q, n) = text_quality(&ch.text);
+        if n >= 12 || (final_ && n >= 4) {
+            ch.qualified = ch.pinned || q >= MIN_QUALITY;
+        }
+        if ch.qualified {
+            let out = std::mem::take(&mut ch.pending_out);
+            if !out.is_empty() {
+                events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: out.clone() });
+                Self::scan_calls(ch, &out, now, spots);
             }
+        } else if ch.pending_out.len() > 200 {
+            let cut = ch.pending_out.len() - 200;
+            ch.pending_out.drain(..cut);
         }
     }
 
@@ -375,6 +487,9 @@ impl Skimmer {
             let den = a - 2.0 * c0 + c;
             let off = if den.abs() > 1e-9 { 0.5 * (a - c) / den } else { 0.0 };
             let f = (b as f32 + off.clamp(-0.5, 0.5)) * hz;
+            if self.suppressed.iter().any(|&(sf, _)| (sf - f).abs() < self.cfg.min_spacing) {
+                continue;
+            }
             if self.channels.iter().any(|ch| (ch.demod.freq as f32 - f).abs() < self.cfg.min_spacing) {
                 continue;
             }
@@ -406,8 +521,71 @@ impl Skimmer {
         }
     }
 
+    /// Removes channels whose keying is just an artefact of a much stronger
+    /// signal: harmonics, intermodulation, key clicks. Their marks almost
+    /// all fall inside (or at the edges of) the strong signal's marks.
+    fn reject_artifacts(&mut self) {
+        let n = self.channels.len();
+        let mut dead = vec![false; n];
+        for (si, strong) in self.channels.iter().enumerate() {
+            let len = strong.marks.len();
+            if len < 500 {
+                continue;
+            }
+            // Dilate the strong channel's marks by ±20 ms (key-click edges).
+            let mut pre = vec![0u32; len + 1];
+            for (i, &m) in strong.marks.iter().enumerate() {
+                pre[i + 1] = pre[i] + u32::from(m);
+            }
+            let r = 10usize;
+            let dil = |i: usize| pre[(i + r + 1).min(len)] > pre[i.saturating_sub(r)];
+            for (wi, weak) in self.channels.iter().enumerate() {
+                if wi == si || dead[wi] || weak.pinned || strong.level_db < weak.level_db + 10.0 {
+                    continue;
+                }
+                let wl = weak.marks.len().min(len);
+                let (wo, so) = (weak.marks.len() - wl, len - wl);
+                let mut tot = 0u32;
+                let mut inside = 0u32;
+                for i in 0..wl {
+                    if weak.marks[wo + i] {
+                        tot += 1;
+                        if dil(so + i) {
+                            inside += 1;
+                        }
+                    }
+                }
+                if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
+                    eprintln!("t={:.0} weak {:.0}Hz ({:.0}dB) vs strong {:.0}Hz ({:.0}dB): {}/{} = {:.2}", self.time, weak.demod.freq, weak.level_db, strong.demod.freq, strong.level_db, inside, tot, inside as f32 / tot as f32);
+                }
+                let corr = if tot >= 100 { lagged_corr(&strong.marks, &weak.marks) } else { 0.0 };
+                if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
+                    eprintln!("    corr {corr:.2}");
+                }
+                if tot >= 100 && (inside as f32 > 0.92 * tot as f32 || corr > 0.5) {
+                    dead[wi] = true;
+                }
+            }
+        }
+        let until = self.time + 60.0;
+        let mut i = 0;
+        self.channels.retain(|c| {
+            let keep = !dead[i];
+            i += 1;
+            if !keep {
+                self.suppressed.push((c.demod.freq as f32, until));
+            }
+            keep
+        });
+    }
+
     fn housekeeping(&mut self) {
         let now = self.time;
+        if now - self.last_artifact_check >= 1.0 {
+            self.last_artifact_check = now;
+            self.reject_artifacts();
+            self.suppressed.retain(|&(_, t)| t > now);
+        }
         let timeout = self.cfg.channel_timeout as f64;
         self.channels.retain(|c| c.pinned || now - c.last_mark < timeout);
         // Merge channels that drifted together via AFC.
@@ -442,6 +620,7 @@ impl Skimmer {
         let mut v: Vec<ChannelInfo> = self
             .channels
             .iter()
+            .filter(|c| c.qualified || c.pinned)
             .map(|c| {
                 let callsign = c
                     .call_counts
