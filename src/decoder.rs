@@ -45,6 +45,12 @@ pub struct DecoderParams {
     pub sig_decay: f32,
     /// Demodulator bandwidth as a multiple of 1/dot.
     pub bw_factor: f32,
+    /// Signal-level tracking rate during marks, and attack rate outside.
+    pub sig_track: f32,
+    pub sig_attack: f32,
+    /// Flicker shorter than this fraction of a dot is ignored (once the
+    /// speed is known).
+    pub debounce: f32,
 }
 
 impl DecoderParams {
@@ -68,6 +74,9 @@ impl DecoderParams {
                     "threshold" => p.threshold = v,
                     "sig_decay" => p.sig_decay = v,
                     "bw_factor" => p.bw_factor = v,
+                    "sig_track" => p.sig_track = v,
+                    "sig_attack" => p.sig_attack = v,
+                    "debounce" => p.debounce = v,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -90,6 +99,9 @@ impl Default for DecoderParams {
             threshold: 0.5,
             sig_decay: 0.0015,
             bw_factor: 2.8,
+            sig_track: 0.02,
+            sig_attack: 0.01,
+            debounce: 0.24,
         }
     }
 }
@@ -414,7 +426,7 @@ impl BeamDecoder {
                     if m < t.dot * 6.0 {
                         t.dash += a * (m - t.dash);
                     }
-                } else if m > t.dot * 0.4 {
+                } else if m > t.dot * 0.5 {
                     t.dot += a * (m - t.dot);
                 }
                 // Keep the model sane.
@@ -439,40 +451,72 @@ impl BeamDecoder {
     }
 }
 
-/// Maximum-likelihood speed estimate from a set of runs.
-pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
-    let marks: Vec<f32> = runs.iter().filter_map(|r| if let Run::Mark(m) = r { Some(*m) } else { None }).collect();
-    let spaces: Vec<f32> = runs.iter().filter_map(|r| if let Run::Space(s) = r { Some(*s) } else { None }).collect();
-    if marks.len() < 4 {
-        return None;
-    }
+/// Log-likelihood of mark/space durations under a dot length `d` (ms),
+/// with outliers capped, plus a mild prior toward common speeds.
+fn model_score(d: f32, marks: &[f32], spaces: &[f32]) -> f32 {
     let sm = 0.30f32;
     let ss = 0.40f32;
     const FLOOR: f32 = -3.0;
+    let mut score = 0.0;
+    for &m in marks {
+        let a = lognorm(m, d, sm);
+        let b = lognorm(m, 3.0 * d, sm);
+        score += a.max(b).max(FLOOR);
+    }
+    for &s in spaces {
+        if s > 15.0 * d {
+            continue;
+        }
+        let a = lognorm(s, d, ss);
+        let b = lognorm(s, 3.0 * d, ss);
+        let c = if s > 7.0 * d { -ss.ln() } else { lognorm(s, 7.0 * d, ss) };
+        score += 0.6 * a.max(b).max(c).max(FLOOR);
+    }
+    let wpm = 1200.0 / d;
+    score - 0.5 * ((wpm / 22.0).ln() / 0.8).powi(2)
+}
+
+/// Filters out noise blips: keeps marks/spaces of at least 1/5 of the
+/// 75th-percentile mark (a real dot is never shorter than that).
+fn solid_runs(runs: &[Run]) -> (Vec<f32>, Vec<f32>) {
+    let marks: Vec<f32> = runs.iter().filter_map(|r| if let Run::Mark(m) = r { Some(*m) } else { None }).collect();
+    let spaces: Vec<f32> = runs.iter().filter_map(|r| if let Run::Space(s) = r { Some(*s) } else { None }).collect();
+    if marks.is_empty() {
+        return (marks, spaces);
+    }
+    let mut sorted = marks.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let l90 = sorted[(sorted.len() * 9 / 10).min(sorted.len() - 1)];
+    let min_len = (l90 / 4.5).max(16.0);
+    (marks.into_iter().filter(|&m| m >= min_len).collect(), spaces.into_iter().filter(|&s| s >= min_len).collect())
+}
+
+/// True if dot length `new` explains the runs clearly better than `cur`.
+pub fn clearly_better(runs: &[Run], cur: f32, new: f32) -> bool {
+    let (m, s) = solid_runs(runs);
+    if m.len() < 6 {
+        return false;
+    }
+    model_score(new, &m, &s) > model_score(cur, &m, &s) + 0.5 * m.len() as f32
+}
+
+/// Maximum-likelihood speed estimate from a set of runs.
+pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
+    let total_marks = runs.iter().filter(|r| matches!(r, Run::Mark(_))).count();
+    if total_marks < 4 {
+        return None;
+    }
+    // In noise, short blips can outnumber real elements; anchor on the
+    // solid marks.
+    let (marks, spaces) = solid_runs(runs);
+    if marks.len() < 3 {
+        return None;
+    }
     let mut best = (f32::NEG_INFINITY, 0.0f32);
     // 5-60 WPM.
     let mut d = 20.0f32;
     while d < 240.0 {
-        let mut score = 0.0;
-        // Outliers (noise bursts, drop-outs) get a capped penalty so they
-        // cannot drag the estimate.
-        for &m in &marks {
-            let a = lognorm(m, d, sm);
-            let b = lognorm(m, 3.0 * d, sm);
-            score += a.max(b).max(FLOOR);
-        }
-        for &s in &spaces {
-            if s > 15.0 * d {
-                continue;
-            }
-            let a = lognorm(s, d, ss);
-            let b = lognorm(s, 3.0 * d, ss);
-            let c = if s > 7.0 * d { -ss.ln() } else { lognorm(s, 7.0 * d, ss) };
-            score += 0.6 * a.max(b).max(c).max(FLOOR);
-        }
-        // Mild prior toward common speeds (12-35 WPM).
-        let wpm = 1200.0 / d;
-        score -= 0.5 * ((wpm / 22.0).ln() / 0.8).powi(2);
+        let score = model_score(d, &marks, &spaces);
         if score > best.0 {
             best = (score, d);
         }
@@ -483,17 +527,26 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
         return None;
     }
     let mut tm = TimingModel::from_dot(dot);
-    // Refine with class means.
+    // Refine with robust class medians. Ignore marks far shorter than a dot
+    // (noise blips) so they cannot drag the speed estimate up.
+    let median = |v: &mut Vec<f32>| {
+        if v.len() >= 2 {
+            v.sort_by(|a, b| a.total_cmp(b));
+            Some(v[v.len() / 2])
+        } else {
+            None
+        }
+    };
     let mean = |v: &mut Vec<f32>| if v.len() >= 2 { Some(v.iter().sum::<f32>() / v.len() as f32) } else { None };
-    let mut dots: Vec<f32> = marks.iter().copied().filter(|&m| m < 2.0 * dot).collect();
+    let mut dots: Vec<f32> = marks.iter().copied().filter(|&m| m >= 0.5 * dot && m < 2.0 * dot).collect();
     let mut dashes: Vec<f32> = marks.iter().copied().filter(|&m| m >= 2.0 * dot && m < 6.0 * dot).collect();
-    if let Some(v) = mean(&mut dots) {
-        tm.dot = v;
+    if let Some(v) = median(&mut dots) {
+        tm.dot = v.clamp(dot * 0.75, dot * 1.33).clamp(20.0, 240.0);
     }
-    if let Some(v) = mean(&mut dashes) {
+    if let Some(v) = median(&mut dashes) {
         tm.dash = v.clamp(tm.dot * 2.0, tm.dot * 5.0);
     }
-    let mut eg: Vec<f32> = spaces.iter().copied().filter(|&s| s < 2.0 * dot).collect();
+    let mut eg: Vec<f32> = spaces.iter().copied().filter(|&s| s >= 0.5 * dot && s < 2.0 * dot).collect();
     if let Some(v) = mean(&mut eg) {
         tm.egap = v.clamp(tm.dot * 0.5, tm.dot * 2.0);
     }
@@ -525,6 +578,8 @@ pub struct CwDecoder {
     sig: f32,
     level_frames: u32,
     init_buf: Vec<f32>,
+    block: Vec<f32>,
+    block_p25: std::collections::VecDeque<f32>,
     squelch_open: bool,
     gate: bool,
     erasure: bool,
@@ -542,6 +597,8 @@ pub struct CwDecoder {
     word: Vec<u8>,
     pub frames_since_mark: u64,
     pub total_marks: u64,
+    /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
+    dump: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 impl CwDecoder {
@@ -554,6 +611,8 @@ impl CwDecoder {
             sig: 0.0,
             level_frames: 0,
             init_buf: Vec::new(),
+            block: Vec::with_capacity(100),
+            block_p25: Default::default(),
             squelch_open: false,
             gate: true,
             erasure: false,
@@ -569,6 +628,7 @@ impl CwDecoder {
             word: Vec::new(),
             frames_since_mark: 0,
             total_marks: 0,
+            dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
         }
     }
 
@@ -668,21 +728,32 @@ impl CwDecoder {
             }
             return;
         }
-        // Converge faster during the first second.
-        let eta = if self.level_frames < 600 { 0.06 } else { 0.02 };
-        if x < self.noise_q {
-            self.noise_q *= 1.0 - eta * 0.75;
-        } else {
-            self.noise_q *= 1.0 + eta * 0.25;
+        // Noise floor by minimum statistics: the 25th percentile of each
+        // 200 ms block, minimum over the last ~1.6 s. Every transmission has
+        // gaps, so marks (however long) cannot raise it, yet it follows
+        // changing band noise within a couple of seconds.
+        self.block.push(x);
+        if self.block.len() >= 100 {
+            let mut b = std::mem::take(&mut self.block);
+            b.sort_by(|a, c| a.total_cmp(c));
+            self.block_p25.push_back(b[b.len() / 4]);
+            if self.block_p25.len() > 8 {
+                self.block_p25.pop_front();
+            }
+            self.noise_q = self.block_p25.iter().copied().fold(f32::MAX, f32::min);
+            self.block = b;
+            self.block.clear();
         }
         // Never let the floor fall more than 60 dB below the signal level
         // (e.g. after a stretch of digital silence).
         self.noise_q = self.noise_q.max(self.sig * 1e-3);
         let nm = self.noise_q * 1.65;
-        if x > self.sig {
-            self.sig += 0.04 * (x - self.sig);
-        } else if self.state {
-            self.sig += 0.01 * (x - self.sig);
+        // Signal level: the mean mark amplitude. A slow attack outside marks
+        // lets a new signal pull it up without noise spikes inflating it.
+        if self.state {
+            self.sig += self.params.sig_track * (x - self.sig);
+        } else if x > self.sig {
+            self.sig += self.params.sig_attack * (x - self.sig);
         }
         self.sig += self.params.sig_decay * (nm - self.sig);
         if self.sig < nm {
@@ -723,12 +794,19 @@ impl CwDecoder {
         } else {
             x > thr + hyst
         };
+        if let Some(d) = &mut self.dump {
+            use std::io::Write;
+            let _ = writeln!(d, "{:.5e},{:.5e},{:.5e},{:.5e},{}", x, nm, self.sig, thr, u8::from(self.state));
+        }
         self.slice(want);
     }
 
     fn confirm_frames(&self) -> u32 {
         let dot = self.beam.as_ref().map(|b| b.timing.dot).unwrap_or(40.0);
-        ((0.18 * dot / self.frame_ms).round() as u32).clamp(1, 12)
+        // Ignore flicker shorter than ~30 % of a dot (noise); real elements
+        // are never that short. Before the speed is known, stay permissive.
+        let frac = if self.beam.is_some() { self.params.debounce } else { 0.18 };
+        ((frac * dot / self.frame_ms).round() as u32).clamp(1, 20)
     }
 
     fn slice(&mut self, want: bool) {
@@ -817,7 +895,7 @@ impl CwDecoder {
             if let Some(tm) = estimate_timing(&hist) {
                 let b = self.beam.as_mut().unwrap();
                 let r = tm.dot / b.timing.dot;
-                if !(0.7..=1.43).contains(&r) {
+                if !(0.7..=1.43).contains(&r) && clearly_better(&hist, b.timing.dot, tm.dot) {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("re-estimate: {:?} -> {:?}", b.timing, tm);
                     }
