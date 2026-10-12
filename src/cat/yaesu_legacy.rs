@@ -1,6 +1,6 @@
 //! Yaesu FT-817/818/857/897 five-byte binary CAT.
 
-use super::{open_serial, Mode, Rig, RigConfig};
+use super::{Mode, Rig, RigConfig};
 use anyhow::{anyhow, Result};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -11,10 +11,11 @@ pub struct YaesuLegacy {
 
 impl YaesuLegacy {
     pub fn open(cfg: &RigConfig) -> Result<Self> {
-        let port = open_serial(cfg, true)?;
-        let mut s = Self { port };
-        s.read_status()?;
-        Ok(s)
+        super::with_rts_fallback(cfg, true, |port| {
+            let mut s = Self { port };
+            s.read_status()?;
+            Ok(s)
+        })
     }
 
     fn cmd(&mut self, c: [u8; 5], reply: usize) -> Result<Vec<u8>> {

@@ -1,6 +1,6 @@
 //! Yaesu and Kenwood/Elecraft ASCII CAT ("FA;", "MD;" …).
 
-use super::{open_serial, Mode, Rig, RigConfig};
+use super::{Mode, Rig, RigConfig};
 use anyhow::{anyhow, Result};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -48,10 +48,14 @@ pub fn model_name(id: &str) -> Option<&'static str> {
 
 impl TextCat {
     pub fn open(cfg: &RigConfig, dialect: Dialect) -> Result<Self> {
-        let port = open_serial(cfg, false)?;
+        super::with_rts_fallback(cfg, false, |port| Self::init(port, dialect))
+    }
+
+    fn init(port: Box<dyn serialport::SerialPort>, dialect: Dialect) -> Result<Self> {
         let mut s = Self { port, dialect, digits: if dialect == Dialect::Yaesu { 9 } else { 11 }, model: String::new() };
         // Wake up / identify.
-        let id = s.query("ID;").unwrap_or_default();
+        // The first command after (re)opening is sometimes dropped.
+        let id = s.query("ID;").or_else(|_| s.query("ID;")).unwrap_or_default();
         let id = id.trim_start_matches("ID").to_string();
         s.model = model_name(&id).map(|m| m.to_string()).unwrap_or_else(|| {
             if id.is_empty() {
@@ -123,7 +127,8 @@ pub fn parse_mode_code(dialect: Dialect, c: char) -> Mode {
         (_, '5') => Mode::Am,
         (_, '7') => Mode::CwR,
         (Dialect::Yaesu, '6') | (Dialect::Yaesu, '9') | (Dialect::Kenwood, '6') | (Dialect::Kenwood, '9') => Mode::Rtty,
-        (Dialect::Yaesu, '8') | (Dialect::Yaesu, 'C') | (Dialect::Yaesu, 'A') => Mode::Data,
+        (Dialect::Yaesu, '8') => Mode::Other("DATA-L".into()),
+        (Dialect::Yaesu, 'C') | (Dialect::Yaesu, 'A') => Mode::Data,
         (_, 'B') => Mode::Fm,
         (_, 'D') => Mode::Am,
         (_, x) => Mode::Other(format!("MD{x}")),

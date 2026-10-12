@@ -67,15 +67,20 @@ pub fn probe_port(port: &str, progress: &mut impl FnMut(&str)) -> Option<Found> 
     // ASCII protocols. FTDX3000 default CAT rate is 4800; most people set 38400.
     for baud in [38400, 4800, 9600, 19200, 57600, 115200] {
         progress(&format!("{port} @ {baud}: ID;"));
-        let cfg = RigConfig { port: port.into(), baud, assert_rts: false, assert_dtr: false, ..Default::default() };
-        let Ok(p) = super::open_serial(&cfg, false) else { break };
-        let mut t = TextCat::with_port(p, Dialect::Yaesu);
-        if let Ok(r) = t.query("ID;") {
-            let id = r.trim_start_matches("ID").to_string();
-            let yaesu = id.len() == 4;
-            let model = model_name(&id).map(|s| s.to_string()).unwrap_or_else(|| format!("ID {id}"));
-            let kind = if yaesu { RigKind::Yaesu } else { RigKind::Kenwood };
-            return Some(Found { config: RigConfig { kind, ..cfg }, model });
+        // RTS low first; then RTS high as a CAT handshake, but only on a
+        // port confirmed to be the CAT port (never a PTT/keying port).
+        let rts_options: &[bool] = if super::rts_handshake_allowed(port) { &[false, true] } else { &[false] };
+        for &rts in rts_options {
+            let cfg = RigConfig { port: port.into(), baud, assert_rts: rts, assert_dtr: false, ..Default::default() };
+            let Ok(p) = super::open_serial(&cfg, false) else { return None };
+            let mut t = TextCat::with_port(p, Dialect::Yaesu);
+            if let Ok(r) = t.query("ID;") {
+                let id = r.trim_start_matches("ID").to_string();
+                let yaesu = id.len() == 4;
+                let model = model_name(&id).map(|s| s.to_string()).unwrap_or_else(|| format!("ID {id}"));
+                let kind = if yaesu { RigKind::Yaesu } else { RigKind::Kenwood };
+                return Some(Found { config: RigConfig { kind, ..cfg }, model });
+            }
         }
     }
     // Icom CI-V: broadcast "read transceiver ID" (19 00).

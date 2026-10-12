@@ -223,18 +223,26 @@ impl App {
         self.rig_state.mode.as_ref().map(|m| m.is_upper()).unwrap_or(true)
     }
 
+    /// Audio frequency that corresponds to the displayed VFO frequency.
+    fn audio_ref(&self) -> f64 {
+        let cw = self.rig_state.mode.as_ref().map(|m| m.is_cw()).unwrap_or(true);
+        if cw { self.s.pitch as f64 } else { 0.0 }
+    }
+
     /// RF frequency of a signal heard at `audio` Hz.
     fn rf_of(&self, audio: f32) -> Option<u64> {
         let vfo = self.rig_state.freq? as f64;
-        let d = (audio - self.s.pitch) as f64;
+        let d = audio as f64 - self.audio_ref();
         Some((if self.upper() { vfo + d } else { vfo - d }).round() as u64)
     }
 
     /// Tunes the radio so the signal at `audio` Hz lands on the CW pitch.
     fn tune_to_audio(&mut self, audio: f32) {
-        if let Some(rf) = self.rf_of(audio) {
-            self.set_vfo(rf);
-        }
+        let Some(rf) = self.rf_of(audio) else { return };
+        // VFO setting that puts this RF frequency at the pitch.
+        let d = self.s.pitch as f64 - self.audio_ref();
+        let vfo = if self.upper() { rf as f64 - d } else { rf as f64 + d };
+        self.set_vfo(vfo.round().max(0.0) as u64);
     }
 
     fn set_vfo(&mut self, hz: u64) {
@@ -673,10 +681,10 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.s.wf_contrast, 0.3..=3.0).show_value(false));
             });
             ui.end_row();
-            ui.label("Drive RTS / DTR high");
+            ui.label("Always drive RTS / DTR high");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.s.rig.assert_rts, "RTS")
-                    .on_hover_text("Leave OFF. RTS/DTR can key PTT or CW on many radios. Only enable if the radio's CAT RTS menu is ON and CAT gets no reply.");
+                    .on_hover_text("Normally leave OFF: the RTS handshake is raised automatically on the CAT port if the radio needs it (CAT RTS = ON), and never on a PTT/keying port.");
                 ui.checkbox(&mut self.s.rig.assert_dtr, "DTR").on_hover_text("Leave OFF: DTR can key the transmitter.");
             });
             ui.end_row();

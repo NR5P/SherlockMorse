@@ -77,7 +77,18 @@ impl Mode {
     /// Whether audio frequency increases with RF frequency in this mode.
     /// (CW on Yaesu/Kenwood/Icom is upper sideband; CW-R is lower.)
     pub fn is_upper(&self) -> bool {
-        !matches!(self, Mode::CwR | Mode::Lsb)
+        match self {
+            Mode::CwR | Mode::Lsb => false,
+            Mode::Other(s) => !s.ends_with("-L"),
+            _ => true,
+        }
+    }
+
+    /// In CW modes the displayed frequency is the carrier of a signal heard
+    /// at the CW pitch; in SSB/DATA modes it is the suppressed carrier
+    /// (audio 0 Hz).
+    pub fn is_cw(&self) -> bool {
+        matches!(self, Mode::Cw | Mode::CwR)
     }
 }
 
@@ -180,6 +191,40 @@ pub fn usb_interface(port: &str) -> Option<u8> {
 /// CP2105 interface 1). Such ports must never be probed.
 pub fn is_keying_port(port: &str) -> bool {
     usb_interface(port).is_some_and(|i| i != 0)
+}
+
+/// Whether RTS may be raised automatically as a CAT handshake on this port.
+/// Only for a port positively identified as the CAT port (USB interface 0),
+/// or, where interface info is unavailable, one not named a "Standard"
+/// (PTT/keying) port. Many radios (e.g. FTDX3000 with CAT RTS = ON) ignore
+/// CAT until the computer raises RTS, as WSJT-X/Hamlib do.
+pub fn rts_handshake_allowed(port: &str) -> bool {
+    match usb_interface(port) {
+        Some(i) => i == 0,
+        None => {
+            let named_standard = serialport::available_ports().unwrap_or_default().into_iter().any(|p| {
+                p.port_name == port
+                    && matches!(&p.port_type, serialport::SerialPortType::UsbPort(u)
+                        if u.product.as_deref().is_some_and(|x| x.to_ascii_lowercase().contains("standard")))
+            });
+            !named_standard
+        }
+    }
+}
+
+/// Runs `attempt` with RTS low; if the radio does not answer and the port is
+/// a confirmed CAT port, raises RTS (hardware handshake) and tries again.
+pub fn with_rts_fallback<T>(
+    cfg: &RigConfig,
+    two_stop: bool,
+    mut attempt: impl FnMut(Box<dyn serialport::SerialPort>) -> Result<T>,
+) -> Result<T> {
+    let first = attempt(open_serial(cfg, two_stop)?);
+    if first.is_ok() || cfg.assert_rts || !rts_handshake_allowed(&cfg.port) {
+        return first;
+    }
+    let cfg2 = RigConfig { assert_rts: true, ..cfg.clone() };
+    attempt(open_serial(&cfg2, two_stop)?).map_err(|e| anyhow!("{e} (also tried with RTS handshake)"))
 }
 
 /// Lists serial ports, USB ones first, with a description.

@@ -1,6 +1,6 @@
 //! Icom CI-V protocol.
 
-use super::{open_serial, Mode, Rig, RigConfig};
+use super::{Mode, Rig, RigConfig};
 use anyhow::{anyhow, Result};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -52,10 +52,11 @@ pub fn hz_to_bcd(mut hz: u64) -> [u8; 5] {
 
 impl Icom {
     pub fn open(cfg: &RigConfig) -> Result<Self> {
-        let port = open_serial(cfg, false)?;
-        let mut s = Self { port, addr: cfg.civ_addr };
-        s.get_freq()?;
-        Ok(s)
+        super::with_rts_fallback(cfg, false, |port| {
+            let mut s = Self { port, addr: cfg.civ_addr };
+            s.get_freq()?;
+            Ok(s)
+        })
     }
 
     pub fn with_port(port: Box<dyn serialport::SerialPort>, addr: u8) -> Self {
