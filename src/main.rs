@@ -85,6 +85,7 @@ struct App {
     wf_img: ColorImage,
     wf_tex: Option<TextureHandle>,
     wf_dirty: bool,
+    wf_peak: f32,
     selected: Option<u64>,
     spots: Vec<SpotRow>,
     log: Vec<(f32, String)>,
@@ -124,6 +125,7 @@ impl App {
             wf_img: ColorImage::new([wf_width(), WF_ROWS], Color32::BLACK),
             wf_tex: None,
             wf_dirty: true,
+            wf_peak: -200.0,
             selected: None,
             spots: Vec::new(),
             log: Vec::new(),
@@ -327,9 +329,13 @@ impl App {
         let px = &mut self.wf_img.pixels;
         px.copy_within(0..w * (WF_ROWS - 1), w);
         let nf = self.snap.noise_floor_db;
+        // Auto-range between the noise floor and the strongest recent signal.
+        let rowmax = row.iter().copied().fold(f32::MIN, f32::max);
+        self.wf_peak = if rowmax > self.wf_peak { rowmax } else { self.wf_peak - 0.05 };
+        let range = (self.wf_peak - nf).clamp(25.0, 80.0);
         for (i, p) in px.iter_mut().take(w).enumerate() {
             let db = row.get(i).copied().unwrap_or(-150.0);
-            let v = ((db - nf + 3.0 - self.s.wf_brightness) / 50.0 * self.s.wf_contrast).clamp(0.0, 1.0);
+            let v = ((db - nf + 3.0 - self.s.wf_brightness) / range * self.s.wf_contrast).clamp(0.0, 1.0);
             *p = colormap(v);
         }
         self.wf_dirty = true;

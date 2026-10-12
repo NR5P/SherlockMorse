@@ -418,7 +418,7 @@ impl BeamDecoder {
                     t.dot += a * (m - t.dot);
                 }
                 // Keep the model sane.
-                t.dot = t.dot.clamp(12.0, 300.0);
+                t.dot = t.dot.clamp(20.0, 240.0);
                 t.dash = t.dash.clamp(t.dot * 2.0, t.dot * 5.0);
             }
             Run::Space(s) => {
@@ -450,8 +450,9 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     let ss = 0.40f32;
     const FLOOR: f32 = -3.0;
     let mut best = (f32::NEG_INFINITY, 0.0f32);
-    let mut d = 15.0f32;
-    while d < 300.0 {
+    // 5-60 WPM.
+    let mut d = 20.0f32;
+    while d < 240.0 {
         let mut score = 0.0;
         // Outliers (noise bursts, drop-outs) get a capped penalty so they
         // cannot drag the estimate.
@@ -526,6 +527,7 @@ pub struct CwDecoder {
     init_buf: Vec<f32>,
     squelch_open: bool,
     gate: bool,
+    erasure: bool,
     // slicer / run builder
     state: bool,
     run_frames: u32,
@@ -554,6 +556,7 @@ impl CwDecoder {
             init_buf: Vec::new(),
             squelch_open: false,
             gate: true,
+            erasure: false,
             state: false,
             run_frames: 0,
             cand: 0,
@@ -592,6 +595,12 @@ impl CwDecoder {
 
     pub fn is_mark(&self) -> bool {
         self.state
+    }
+
+    /// Marks the following frames as unreliable (broadband static crash):
+    /// they are treated as space and do not disturb the level trackers.
+    pub fn set_erasure(&mut self, e: bool) {
+        self.erasure = e;
     }
 
     /// External activity gate (spectral energy present at this frequency).
@@ -680,6 +689,10 @@ impl CwDecoder {
     /// Feeds one envelope amplitude frame.
     pub fn push_frame(&mut self, x: f32) {
         let x = x.max(1e-12);
+        if self.erasure {
+            self.slice(false);
+            return;
+        }
         // Noise floor: 25th-percentile tracker. Signal: fast attack on peaks,
         // slower tracking during marks, decay toward the noise floor.
         self.track_levels(x);

@@ -129,6 +129,11 @@ pub struct Skimmer {
     /// Frequencies where artefacts of strong signals were found: (Hz, until).
     suppressed: Vec<(f32, f64)>,
     last_artifact_check: f64,
+    graveyard: Vec<Retired>,
+    hops: u64,
+    /// The latest spectrum frame was a broadband burst (static crash).
+    burst: bool,
+    burst_hops: u32,
 }
 
 const PREROLL_SECS: f32 = 1.5;
@@ -144,24 +149,44 @@ pub fn bin_hz() -> f32 {
 /// elements); real text averages ~3.
 const MIN_QUALITY: f32 = 2.1;
 
-/// Mean number of Morse elements per character over the last 40 characters
-/// (ignoring spaces), and the number of characters considered.
-pub fn text_quality(text: &str) -> (f32, usize) {
+/// Minimum fraction of dashes among decoded elements. Noise bursts are
+/// short, so noise decodes almost entirely as dots (E I S H 5); real text
+/// is ~35-45 % dashes.
+const MIN_DASH_FRAC: f32 = 0.22;
+
+/// Text statistics over the last 40 characters (ignoring spaces): mean Morse
+/// elements per character, fraction of dashes, and characters considered.
+pub fn text_quality(text: &str) -> (f32, f32, usize) {
     let mut n = 0usize;
     let mut tot = 0usize;
+    let mut dashes = 0usize;
     for b in text.bytes().rev() {
         if b == b' ' {
             continue;
         }
         if let Some(p) = crate::morse::pattern_for(b) {
             tot += p.len();
+            dashes += p.bytes().filter(|&c| c == b'-').count();
             n += 1;
         }
         if n >= 40 {
             break;
         }
     }
-    (if n > 0 { tot as f32 / n as f32 } else { 0.0 }, n)
+    if n == 0 {
+        return (0.0, 0.0, 0);
+    }
+    (tot as f32 / n as f32, dashes as f32 / tot as f32, n)
+}
+
+/// A recently timed-out channel, kept so a station that pauses and comes
+/// back on the same frequency continues in the same row.
+struct Retired {
+    id: u64,
+    freq: f32,
+    at: f64,
+    text: String,
+    call_counts: HashMap<String, u32>,
 }
 
 /// Maximum |Pearson correlation| between two mark histories over lags of
@@ -236,6 +261,10 @@ impl Skimmer {
             preroll: VecDeque::new(),
             suppressed: Vec::new(),
             last_artifact_check: 0.0,
+            graveyard: Vec::new(),
+            hops: 0,
+            burst: false,
+            burst_hops: 0,
         }
     }
 
@@ -245,8 +274,23 @@ impl Skimmer {
             c.pinned |= pinned;
             return c.id;
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        let revived = self
+            .graveyard
+            .iter()
+            .position(|r| (r.freq - freq).abs() < 40.0)
+            .map(|i| self.graveyard.remove(i));
+        let was_revived = revived.is_some();
+        let id = match &revived {
+            Some(r) => r.id,
+            None => {
+                self.next_id += 1;
+                self.next_id - 1
+            }
+        };
+        let (rtext, rcalls) = match revived {
+            Some(r) => (r.text + " ", r.call_counts),
+            None => (String::new(), HashMap::new()),
+        };
         let mut demod = ChannelDemod::new(RATE as f32, freq as f64, 100.0, FRAME);
         let mut decoder = CwDecoder::new(demod.frame_ms(), self.cfg.params.clone(), self.lm.clone());
         // Warm up on the pre-roll audio.
@@ -260,7 +304,7 @@ impl Skimmer {
             id,
             demod,
             decoder,
-            text: String::new(),
+            text: rtext,
             created: self.time,
             last_mark: self.time,
             pinned,
@@ -268,9 +312,9 @@ impl Skimmer {
             active: true,
             marks: VecDeque::with_capacity(MARK_HIST),
             pending_out: String::new(),
-            qualified: pinned,
+            qualified: pinned || was_revived,
             words: String::new(),
-            call_counts: HashMap::new(),
+            call_counts: rcalls,
             prev_word: String::new(),
             frames: Vec::new(),
         });
@@ -298,6 +342,9 @@ impl Skimmer {
         self.persist = vec![0; nb];
         self.preroll.clear();
         self.suppressed.clear();
+        for r in &mut self.graveyard {
+            r.freq += df;
+        }
         for c in &mut self.channels {
             c.marks.clear();
         }
@@ -305,11 +352,19 @@ impl Skimmer {
 
     pub fn clear(&mut self) {
         self.channels.clear();
+        self.graveyard.clear();
         self.spots.clear();
     }
 
     /// Processes audio at [`RATE`].
     pub fn process(&mut self, samples: &[f32]) {
+        // Work in FFT-hop sized pieces so burst erasures line up in time.
+        for piece in samples.chunks(FFT_HOP) {
+            self.process_piece(piece);
+        }
+    }
+
+    fn process_piece(&mut self, samples: &[f32]) {
         let mut spectra: Vec<Vec<f32>> = Vec::new();
         self.spectrum.process(samples, |p| spectra.push(p.to_vec()));
         for p in &spectra {
@@ -325,6 +380,7 @@ impl Skimmer {
         for ch in &mut self.channels {
             ch.frames.clear();
             ch.demod.process(samples, &mut ch.frames);
+            ch.decoder.set_erasure(self.burst && (5..60).contains(&self.burst_hops));
             for i in 0..ch.frames.len() {
                 let z = ch.frames[i];
                 ch.decoder.push_frame(z.norm());
@@ -372,9 +428,9 @@ impl Skimmer {
             ch.text.drain(..cut);
         }
         ch.pending_out.push_str(txt);
-        let (q, n) = text_quality(&ch.text);
+        let (q, dash, n) = text_quality(&ch.text);
         if n >= 12 || (final_ && n >= 4) {
-            ch.qualified = ch.pinned || q >= MIN_QUALITY;
+            ch.qualified = ch.pinned || (q >= MIN_QUALITY && dash >= MIN_DASH_FRAC);
         }
         if ch.qualified {
             let out = std::mem::take(&mut ch.pending_out);
@@ -444,6 +500,25 @@ impl Skimmer {
         }
 
         let (lo, hi) = self.bin_range();
+        // Broadband static crashes raise the whole spectrum at once. Treat
+        // such frames as erasures instead of letting every bin look keyed.
+        let mut inst: Vec<f32> = p[lo..hi].to_vec();
+        inst.sort_unstable_by(|a, b| a.total_cmp(b));
+        let med = inst[inst.len() / 2];
+        self.hops += 1;
+        let top = inst[inst.len() - 1];
+        // A crash is flat: the floor comes up close to the strongest signal.
+        // (Codec noise riding on a strong keyed tone stays far below it.)
+        self.burst = self.hops > 30 && med > self.noise_floor * 5.0 && med * 3000.0 > top;
+        if self.burst {
+            self.burst_hops += 1;
+            // A sustained rise is a real change of band noise, not a crash.
+            if self.burst_hops < 60 {
+                return;
+            }
+        } else {
+            self.burst_hops = 0;
+        }
         for i in 0..p.len() {
             self.fast[i] = 0.65 * self.fast[i] + 0.35 * p[i];
             self.peak[i] = (self.peak[i] * 0.993).max(self.fast[i]);
@@ -587,7 +662,16 @@ impl Skimmer {
             self.suppressed.retain(|&(_, t)| t > now);
         }
         let timeout = self.cfg.channel_timeout as f64;
-        self.channels.retain(|c| c.pinned || now - c.last_mark < timeout);
+        let mut retired = Vec::new();
+        self.channels.retain(|c| {
+            let keep = c.pinned || now - c.last_mark < timeout;
+            if !keep && c.qualified {
+                retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone() });
+            }
+            keep
+        });
+        self.graveyard.extend(retired);
+        self.graveyard.retain(|r| now - r.at < 180.0);
         // Merge channels that drifted together via AFC.
         let mut i = 0;
         while i < self.channels.len() {

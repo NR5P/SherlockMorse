@@ -80,6 +80,16 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Render a waterfall PNG of an audio file (for inspecting recordings).
+    Waterfall {
+        file: PathBuf,
+        #[arg(short, long, default_value = "waterfall.png")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0.0)]
+        skip: f32,
+        #[arg(long, default_value_t = 60.0)]
+        duration: f32,
+    },
     /// List audio input devices (best radio match marked).
     Devices,
     /// List serial ports.
@@ -201,6 +211,28 @@ fn main() -> Result<()> {
             println!("wrote {} ({:.1} s)", out.display(), s.len() as f32 / scene.rate as f32);
         }
         Cmd::Bench { trials, compare_lm, only, verbose } => bench(trials, compare_lm, only, verbose),
+        Cmd::Waterfall { file, out, skip, duration } => {
+            let (samples, rate) = cwskimmer::audiofile::read_audio(&file)?;
+            let s0 = ((skip * rate as f32) as usize).min(samples.len());
+            let s1 = (s0 + (duration * rate as f32) as usize).min(samples.len());
+            let mut rs = Resampler::new(rate, RATE);
+            let mut buf = Vec::new();
+            rs.process(&samples[s0..s1], &mut buf);
+            let mut sp = cwskimmer::dsp::spectrum::Spectrum::new(1024, 160);
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            sp.process(&buf, |p| rows.push(p.iter().map(|v| 10.0 * (v + 1e-14).log10()).collect()));
+            let w = 1024 / 2 * 3000 / 4000; // up to 3 kHz
+            let mut all: Vec<f32> = rows.iter().flat_map(|r| r[..w].iter().copied()).collect();
+            all.sort_by(|a, b| a.total_cmp(b));
+            let (lo, hi) = (all[all.len() / 2] - 3.0, all[all.len() * 999 / 1000]);
+            let f = std::io::BufWriter::new(std::fs::File::create(&out)?);
+            let mut enc = png::Encoder::new(f, w as u32, rows.len() as u32);
+            enc.set_color(png::ColorType::Grayscale);
+            let mut wr = enc.write_header()?;
+            let data: Vec<u8> = rows.iter().flat_map(|r| r[..w].iter().map(|&v| (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * 255.0) as u8).collect::<Vec<_>>()).collect();
+            wr.write_image_data(&data)?;
+            println!("wrote {} ({} x {}, 0-3000 Hz left to right, time downward, {:.0} ms/row)", out.display(), w, rows.len(), 160.0 / 8.0);
+        }
         Cmd::Devices => {
             let devs = cwskimmer::audio::list_input_devices();
             let pick = cwskimmer::audio::auto_select(&devs);

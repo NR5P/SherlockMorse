@@ -116,7 +116,7 @@ signals with realistic impairments. The score is character error rate
 | Clean, 20 WPM | 0.0 % |
 | SNR +5 dB, 25 WPM | 0.0 % |
 | SNR 0 dB, 22 WPM | 0.8 % |
-| SNR −4 dB, 18 WPM | ~16 % |
+| SNR −4 dB, 18 WPM | ~15 % |
 | Hand key, 15 % timing jitter | 0.7 % |
 | Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 7.3 % |
 | Farnsworth 18/8 WPM | 3.3 % |
@@ -128,7 +128,31 @@ signals with realistic impairments. The score is character error rate
 | 5-station pileup, 80–240 Hz apart | 0.4 % |
 
 Turning the language model off (`--compare-lm`) raises the error rate on clean
-signals from about 0 % to about 20 %, so the text prediction matters.
+signals from about 0 % to about 20 %, so the text prediction matters. At
+−8 dB most output is suppressed as noise rather than shown as garbage.
+
+### Real recordings
+
+| Recording | Result |
+|---|---|
+| ARRL W1AW code practice, 15 WPM (published transcript) | 1.8 % CER |
+| ARRL W1AW code practice, 20 WPM | 0.1 % CER |
+| ARRL W1AW code practice, 25 WPM | 0.1 % CER |
+| DARC "Morse class on the air" (real HF reception, several stations) | main text copied, e.g. "…NASAL BONES WERE A UNIQUE FEATURE OF TYRANNOSAURIDS…"; some noise channels remain in the hiss |
+
+W1AW files come from <https://www.arrl.org/code-practice-files>. To check
+them yourself, run `cwtool decode <mp3> --reference <txt>`.
+
+### Noise and artifact handling
+
+- Key clicks, harmonics and codec noise around very strong signals are
+  detected (their keying correlates with the strong signal) and removed.
+- Long broadband static crashes are treated as erasures, not as keying.
+- A channel only shows text once it looks like Morse rather than noise:
+  enough elements per character and enough dashes, since noise decodes as
+  E/I/S/H.
+- A station that pauses and comes back on the same frequency continues in
+  the same row.
 
 ## Architecture
 
