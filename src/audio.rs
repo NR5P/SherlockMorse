@@ -93,12 +93,24 @@ pub struct AudioChunk {
 /// A running capture; stops when dropped.
 pub struct Capture {
     stop: Arc<AtomicBool>,
-    /// Set when the stream reports an error (e.g. the device was unplugged).
-    pub failed: Arc<AtomicBool>,
+    /// Set once the stream has reported an error (logged only once). Errors
+    /// such as buffer overruns are not fatal; see [`Capture::stalled`].
+    pub errored: Arc<AtomicBool>,
+    started: std::time::Instant,
+    /// Milliseconds after `started` when audio last arrived.
+    last_data: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub device: String,
     pub rate: u32,
     pub channels: u16,
+}
+
+impl Capture {
+    /// True when no audio has arrived for 2 s (device unplugged or dead).
+    pub fn stalled(&self) -> bool {
+        let now = self.started.elapsed().as_millis() as u64;
+        now > 3000 && now.saturating_sub(self.last_data.load(Ordering::Relaxed)) > 2000
+    }
 }
 
 impl Drop for Capture {
@@ -118,15 +130,18 @@ pub fn start_capture(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>
     let stop2 = stop.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let failed2 = failed.clone();
+    let started = std::time::Instant::now();
+    let last_data = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last2 = last_data.clone();
     let thread = std::thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
             // The stream must live on this thread (it is !Send on some hosts).
-            let res = build_stream(name.as_deref(), sel, tx, failed2.clone());
+            let res = build_stream(name.as_deref(), sel, tx, failed2.clone(), started, last2);
             match res {
                 Ok((stream, info)) => {
                     let _ = ready_tx.send(Ok(info));
-                    while !stop2.load(Ordering::Relaxed) && !failed2.load(Ordering::Relaxed) {
+                    while !stop2.load(Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     drop(stream);
@@ -139,10 +154,17 @@ pub fn start_capture(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>
     let (device, rate, channels) = ready_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| anyhow!("audio device did not start"))??;
-    Ok(Capture { stop, failed, thread: Some(thread), device, rate, channels })
+    Ok(Capture { stop, errored: failed, started, last_data, thread: Some(thread), device, rate, channels })
 }
 
-fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, (String, u32, u16))> {
+fn build_stream(
+    name: Option<&str>,
+    sel: ChannelSel,
+    tx: Sender<AudioChunk>,
+    failed: Arc<AtomicBool>,
+    started: std::time::Instant,
+    last_data: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(cpal::Stream, (String, u32, u16))> {
     let host = cpal::default_host();
     let device = match name {
         Some(n) => host
@@ -171,7 +193,8 @@ fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>, fai
     let channels = cfg.channels();
     let fmt = cfg.sample_format();
     let config: cpal::StreamConfig = cfg.into();
-    // Report once; the owner notices `failed` and reconnects.
+    // Log once. Overruns etc. are recoverable; a real disconnect shows up as
+    // audio no longer arriving (Capture::stalled).
     let err_fn = move |e| {
         if !failed.swap(true, Ordering::Relaxed) {
             eprintln!("audio stream error: {e}");
@@ -180,6 +203,7 @@ fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>, fai
     macro_rules! build {
         ($t:ty, $conv:expr) => {{
             let tx = tx.clone();
+            let last_data = last_data.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[$t], _: &cpal::InputCallbackInfo| {
@@ -195,6 +219,7 @@ fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>, fai
                         };
                         out.push(v);
                     }
+                    last_data.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     let _ = tx.try_send(AudioChunk { samples: out, rate });
                 },
                 err_fn,

@@ -88,6 +88,9 @@ struct App {
     wf_peak: f32,
     last_audio_retry: Instant,
     last_scan: Instant,
+    /// Per-channel text not yet written to the log file: (freq, text, last update).
+    lines: std::collections::HashMap<u64, (f32, String, Instant)>,
+    recording: Option<(std::path::PathBuf, Instant)>,
     selected: Option<u64>,
     spots: Vec<SpotRow>,
     log: Vec<(f32, String)>,
@@ -130,6 +133,8 @@ impl App {
             wf_peak: -200.0,
             last_audio_retry: Instant::now(),
             last_scan: Instant::now(),
+            lines: Default::default(),
+            recording: None,
             selected: None,
             spots: Vec::new(),
             log: Vec::new(),
@@ -297,8 +302,13 @@ impl App {
                 self.push_wf_row(&r);
             }
             for ev in events {
+                let e = self.lines.entry(ev.channel).or_insert_with(|| (ev.freq, String::new(), Instant::now()));
+                e.0 = ev.freq;
+                e.1.push_str(&ev.text);
+                e.2 = Instant::now();
                 self.log.push((ev.freq, ev.text));
             }
+            self.flush_log_lines(false);
             if self.log.len() > 500 {
                 let n = self.log.len() - 500;
                 self.log.drain(..n);
@@ -361,6 +371,49 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Writes finished lines of decoded text to today's log file: a line ends
+    /// after 8 s without new text or once it is long.
+    fn flush_log_lines(&mut self, all: bool) {
+        let ids: Vec<u64> = self.lines.keys().copied().collect();
+        for id in ids {
+            let (freq, text, last) = self.lines[&id].clone();
+            let long = text.len() > 90 && text.ends_with(' ');
+            if !(all || long || last.elapsed() > Duration::from_secs(8)) || text.trim().is_empty() {
+                continue;
+            }
+            self.lines.remove(&id);
+            let call = self.snap.channels.iter().find(|c| c.id == id).and_then(|c| c.callsign.clone()).unwrap_or_default();
+            let f = match self.rf_of(freq) {
+                Some(rf) => format!("{:>10.2} kHz", rf as f64 / 1000.0),
+                None => format!("{freq:>7.0} Hz audio"),
+            };
+            let (date, time) = utc_now();
+            let line = format!("{date} {time}Z  {f}  {call:<10}  {}\n", to_display(text.trim()));
+            let dir = log_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("cw-{date}.txt"));
+            use std::io::Write;
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = fh.write_all(line.as_bytes());
+            }
+        }
+    }
+
+    fn toggle_recording(&mut self) {
+        let Some(e) = &self.engine else { return };
+        if self.recording.is_some() {
+            e.send(EngineCmd::Record(None));
+            self.recording = None;
+        } else {
+            let (date, time) = utc_now();
+            let dir = log_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let p = dir.join(format!("audio-{date}-{}.wav", time.replace(':', "")));
+            e.send(EngineCmd::Record(Some(p.clone())));
+            self.recording = Some((p, Instant::now()));
         }
     }
 
@@ -457,6 +510,18 @@ impl App {
                 }
                 self.log.clear();
                 self.spots.clear();
+            }
+            let rec_label = match &self.recording {
+                Some((_, t)) => RichText::new(format!("■ Stop rec {}s", t.elapsed().as_secs())).color(Color32::LIGHT_RED),
+                None => RichText::new("● Rec audio"),
+            };
+            if ui.button(rec_label).on_hover_text(format!("Record the radio audio to a WAV file in {}", log_dir().display())).clicked() {
+                self.toggle_recording();
+            }
+            if ui.button("📂 Logs").on_hover_text(format!("Decoded text from every station is saved automatically to {}", log_dir().display())).clicked() {
+                let _ = std::fs::create_dir_all(log_dir());
+                let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
             }
             ui.toggle_value(&mut self.show_settings, "⚙ Settings");
         });
@@ -946,6 +1011,13 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_log_lines(true);
+        if let Some(e) = &self.engine {
+            e.send(EngineCmd::Record(None));
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.s);
     }
@@ -960,6 +1032,28 @@ fn save_png(path: &std::path::Path, img: &ColorImage) -> anyhow::Result<()> {
     let data: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
     w.write_image_data(&data)?;
     Ok(())
+}
+
+fn log_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_else(|| ".".into());
+    std::path::PathBuf::from(home).join("CwSkimmer-logs")
+}
+
+/// Current UTC date ("YYYY-MM-DD") and time ("HH:MM:SS").
+fn utc_now() -> (String, String) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Civil-from-days (H. Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (format!("{y:04}-{m:02}-{d:02}"), format!("{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60))
 }
 
 fn fmt_vfo(hz: u64) -> String {

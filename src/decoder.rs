@@ -662,7 +662,8 @@ impl CwDecoder {
             if self.level_frames == 70 {
                 let mut v = std::mem::take(&mut self.init_buf);
                 v.sort_by(|a, b| a.total_cmp(b));
-                self.noise_q = v[v.len() / 4].max(1e-9);
+                // Guard against digital silence at the start of a stream.
+                self.noise_q = v[v.len() / 4].max(v[v.len() - 1] * 1e-3).max(1e-9);
                 self.sig = v[v.len() - 1].max(self.noise_q * 1.65);
             }
             return;
@@ -674,6 +675,9 @@ impl CwDecoder {
         } else {
             self.noise_q *= 1.0 + eta * 0.25;
         }
+        // Never let the floor fall more than 60 dB below the signal level
+        // (e.g. after a stretch of digital silence).
+        self.noise_q = self.noise_q.max(self.sig * 1e-3);
         let nm = self.noise_q * 1.65;
         if x > self.sig {
             self.sig += 0.04 * (x - self.sig);

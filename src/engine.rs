@@ -26,6 +26,8 @@ pub enum EngineCmd {
     Config(SkimmerConfig),
     /// Radio retuned; signals moved by this many Hz in the audio.
     Shift(f32),
+    /// Start recording the input audio to a WAV file (None stops).
+    Record(Option<PathBuf>),
 }
 
 #[derive(Default, Clone)]
@@ -87,7 +89,7 @@ impl Engine {
 
     /// True when the live audio device stopped working (e.g. unplugged).
     pub fn audio_failed(&self) -> bool {
-        self._capture.as_ref().is_some_and(|c| c.failed.load(Ordering::Relaxed))
+        self._capture.as_ref().is_some_and(|c| c.stalled())
     }
 
     pub fn send(&self, c: EngineCmd) {
@@ -146,6 +148,8 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     let mut last_pub = Instant::now();
     let mut peak = 0.0f32;
     let mut rate_seen = 0;
+    let mut rec_path: Option<PathBuf> = None;
+    let mut recorder: Option<(PathBuf, hound::WavWriter<std::io::BufWriter<std::fs::File>>)> = None;
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = cmd_rx.try_recv() {
             match c {
@@ -156,11 +160,29 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                 EngineCmd::Clear => sk.clear(),
                 EngineCmd::Config(c) => sk.cfg = c,
                 EngineCmd::Shift(df) => sk.shift(df),
+                EngineCmd::Record(p) => {
+                    if let Some((_, w)) = recorder.take() {
+                        let _ = w.finalize();
+                    }
+                    rec_path = p;
+                }
             }
         }
         match audio_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
                 rate_seen = chunk.rate;
+                if let Some(p) = rec_path.take() {
+                    let spec = hound::WavSpec { channels: 1, sample_rate: chunk.rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+                    match hound::WavWriter::create(&p, spec) {
+                        Ok(w) => recorder = Some((p, w)),
+                        Err(e) => snap.lock().error = Some(format!("recording failed: {e}")),
+                    }
+                }
+                if let Some((_, w)) = &mut recorder {
+                    for &x in &chunk.samples {
+                        let _ = w.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    }
+                }
                 if resampler.as_ref().map(|r| r.0) != Some(chunk.rate) {
                     resampler = Some((chunk.rate, Resampler::new(chunk.rate, RATE)));
                 }
@@ -198,6 +220,9 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
             s.input_rate = rate_seen;
             peak *= 0.5;
         }
+    }
+    if let Some((_, w)) = recorder.take() {
+        let _ = w.finalize();
     }
     snap.lock().running = false;
 }
