@@ -85,6 +85,11 @@ impl Engine {
         Ok(Self { cmd_tx, snap, stop, thread: Some(thread), _capture: capture })
     }
 
+    /// True when the live audio device stopped working (e.g. unplugged).
+    pub fn audio_failed(&self) -> bool {
+        self._capture.as_ref().is_some_and(|c| c.failed.load(Ordering::Relaxed))
+    }
+
     pub fn send(&self, c: EngineCmd) {
         let _ = self.cmd_tx.send(c);
     }

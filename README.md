@@ -63,7 +63,12 @@ Runs on Linux, Windows and macOS (single native binary, no runtime needed).
 2. Radio menus (press and hold MENU):
    - **CAT RATE**: 38400 (the default is 4800; any rate works, as long as the
      program uses the same one).
-   - **CAT RTS**: either setting works; the program asserts RTS.
+   - **CAT RTS**: **OFF**. The program keeps RTS and DTR low on every
+     port so it can never key the transmitter. With CAT RTS on, the radio
+     would wait for RTS and ignore CAT commands.
+   - Use only the **Enhanced** port (`/dev/ttyUSB0`) for CAT. The Standard
+     port (`/dev/ttyUSB1`) can key PTT/CW through RTS/DTR. The program
+     labels it, refuses to connect to it, and auto-detect never probes it.
    - **CW PITCH**: note the value (default 700 Hz) and enter it under
      ⚙ Settings → CW pitch so that click-to-tune lands signals exactly.
    - USB audio output level (**USB OUT LEVEL** in the CW/DATA menus) about

@@ -93,6 +93,8 @@ pub struct AudioChunk {
 /// A running capture; stops when dropped.
 pub struct Capture {
     stop: Arc<AtomicBool>,
+    /// Set when the stream reports an error (e.g. the device was unplugged).
+    pub failed: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub device: String,
     pub rate: u32,
@@ -114,15 +116,17 @@ pub fn start_capture(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(String, u32, u16)>>(1);
     let name = name.map(|s| s.to_string());
     let stop2 = stop.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed2 = failed.clone();
     let thread = std::thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
             // The stream must live on this thread (it is !Send on some hosts).
-            let res = build_stream(name.as_deref(), sel, tx);
+            let res = build_stream(name.as_deref(), sel, tx, failed2.clone());
             match res {
                 Ok((stream, info)) => {
                     let _ = ready_tx.send(Ok(info));
-                    while !stop2.load(Ordering::Relaxed) {
+                    while !stop2.load(Ordering::Relaxed) && !failed2.load(Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     drop(stream);
@@ -135,10 +139,10 @@ pub fn start_capture(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>
     let (device, rate, channels) = ready_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| anyhow!("audio device did not start"))??;
-    Ok(Capture { stop, thread: Some(thread), device, rate, channels })
+    Ok(Capture { stop, failed, thread: Some(thread), device, rate, channels })
 }
 
-fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>) -> Result<(cpal::Stream, (String, u32, u16))> {
+fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, (String, u32, u16))> {
     let host = cpal::default_host();
     let device = match name {
         Some(n) => host
@@ -167,7 +171,12 @@ fn build_stream(name: Option<&str>, sel: ChannelSel, tx: Sender<AudioChunk>) -> 
     let channels = cfg.channels();
     let fmt = cfg.sample_format();
     let config: cpal::StreamConfig = cfg.into();
-    let err_fn = |e| eprintln!("audio stream error: {e}");
+    // Report once; the owner notices `failed` and reconnects.
+    let err_fn = move |e| {
+        if !failed.swap(true, Ordering::Relaxed) {
+            eprintln!("audio stream error: {e}");
+        }
+    };
     macro_rules! build {
         ($t:ty, $conv:expr) => {{
             let tx = tx.clone();

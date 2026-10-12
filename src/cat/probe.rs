@@ -16,12 +16,37 @@ pub struct Found {
 }
 
 fn usb_ports() -> Vec<String> {
-    serialport::available_ports()
+    let mut ports: Vec<(String, serialport::UsbPortInfo)> = serialport::available_ports()
         .unwrap_or_default()
         .into_iter()
-        .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(_)))
-        .map(|p| p.port_name)
-        .collect()
+        .filter_map(|p| match p.port_type {
+            serialport::SerialPortType::UsbPort(u) => Some((p.port_name, u)),
+            _ => None,
+        })
+        .collect();
+    ports.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    let mut seen: Vec<(u16, u16, Option<String>)> = Vec::new();
+    for (name, u) in ports {
+        if super::is_keying_port(&name) {
+            continue;
+        }
+        // Windows names the CP2105 PTT port "Standard COM Port".
+        if u.product.as_deref().is_some_and(|p| p.to_ascii_lowercase().contains("standard")) {
+            continue;
+        }
+        // Without interface info (Windows/macOS), only probe the first port
+        // of a multi-port device; the others are typically PTT/keying.
+        if super::usb_interface(&name).is_none() && u.serial_number.is_some() {
+            let key = (u.vid, u.pid, u.serial_number.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+        }
+        out.push(name);
+    }
+    out
 }
 
 /// Probes all USB serial ports. Stops at the first radio found per port.
@@ -36,10 +61,13 @@ pub fn probe(mut progress: impl FnMut(&str)) -> Vec<Found> {
 }
 
 pub fn probe_port(port: &str, progress: &mut impl FnMut(&str)) -> Option<Found> {
+    if super::is_keying_port(port) {
+        return None;
+    }
     // ASCII protocols. FTDX3000 default CAT rate is 4800; most people set 38400.
     for baud in [38400, 4800, 9600, 19200, 57600, 115200] {
         progress(&format!("{port} @ {baud}: ID;"));
-        let cfg = RigConfig { port: port.into(), baud, rts: true, ..Default::default() };
+        let cfg = RigConfig { port: port.into(), baud, assert_rts: false, assert_dtr: false, ..Default::default() };
         let Ok(p) = super::open_serial(&cfg, false) else { break };
         let mut t = TextCat::with_port(p, Dialect::Yaesu);
         if let Ok(r) = t.query("ID;") {
@@ -53,7 +81,7 @@ pub fn probe_port(port: &str, progress: &mut impl FnMut(&str)) -> Option<Found> 
     // Icom CI-V: broadcast "read transceiver ID" (19 00).
     for baud in [19200, 115200, 9600, 4800] {
         progress(&format!("{port} @ {baud}: CI-V"));
-        let cfg = RigConfig { port: port.into(), baud, rts: false, dtr: false, kind: RigKind::Icom, ..Default::default() };
+        let cfg = RigConfig { port: port.into(), baud, assert_rts: false, assert_dtr: false, kind: RigKind::Icom, ..Default::default() };
         let Ok(p) = super::open_serial(&cfg, false) else { break };
         let mut ic = Icom::with_port(p, 0x00);
         if let Ok(r) = ic.transact(&[0x19, 0x00]) {

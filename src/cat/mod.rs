@@ -90,9 +90,13 @@ pub struct RigConfig {
     pub civ_addr: u8,
     /// rigctld address, host:port.
     pub host: String,
-    /// Assert RTS (needed by Yaesu radios with "CAT RTS" enabled).
-    pub rts: bool,
-    pub dtr: bool,
+    /// Drive RTS high. OFF by default: on many radios RTS/DTR key PTT or CW
+    /// (e.g. the FTDX3000 "Standard" COM port). Only enable this for a CAT
+    /// port whose radio menu requires it ("CAT RTS" = ON).
+    #[serde(default)]
+    pub assert_rts: bool,
+    #[serde(default)]
+    pub assert_dtr: bool,
     pub poll_ms: u64,
 }
 
@@ -104,8 +108,8 @@ impl Default for RigConfig {
             baud: 38400,
             civ_addr: 0x94,
             host: "127.0.0.1:4532".into(),
-            rts: true,
-            dtr: false,
+            assert_rts: false,
+            assert_dtr: false,
             poll_ms: 300,
         }
     }
@@ -138,8 +142,10 @@ pub fn open_serial(cfg: &RigConfig, stop_bits_two: bool) -> Result<Box<dyn seria
         .flow_control(serialport::FlowControl::None)
         .open()
         .map_err(|e| anyhow!("cannot open {}: {e}", cfg.port))?;
-    let _ = p.write_request_to_send(cfg.rts);
-    let _ = p.write_data_terminal_ready(cfg.dtr);
+    // Set the control lines immediately after opening (the OS may raise
+    // them on open). Low unless explicitly enabled, so we never key PTT/CW.
+    let _ = p.write_request_to_send(cfg.assert_rts);
+    let _ = p.write_data_terminal_ready(cfg.assert_dtr);
     let _ = p.clear(serialport::ClearBuffer::All);
     Ok(p)
 }
@@ -153,6 +159,27 @@ pub fn open(cfg: &RigConfig) -> Result<Box<dyn Rig>> {
         RigKind::YaesuLegacy => Box::new(yaesu_legacy::YaesuLegacy::open(cfg)?),
         RigKind::Hamlib => Box::new(hamlib::Rigctld::open(cfg)?),
     })
+}
+
+/// USB interface number of a serial port (Linux sysfs), if known.
+pub fn usb_interface(port: &str) -> Option<u8> {
+    let name = std::path::Path::new(port).file_name()?.to_str()?;
+    for rel in ["device/../bInterfaceNumber", "device/bInterfaceNumber"] {
+        let p = format!("/sys/class/tty/{name}/{rel}");
+        if let Ok(v) = std::fs::read_to_string(&p) {
+            if let Ok(n) = u8::from_str_radix(v.trim(), 16) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// True for the secondary port of dual-port USB serial chips, which radios
+/// use for PTT / CW keying via RTS/DTR (FTDX3000 "Standard" COM port on the
+/// CP2105 interface 1). Such ports must never be probed.
+pub fn is_keying_port(port: &str) -> bool {
+    usb_interface(port).is_some_and(|i| i != 0)
 }
 
 /// Lists serial ports, USB ones first, with a description.
@@ -169,7 +196,13 @@ pub fn list_ports() -> Vec<(String, String)> {
                     u.vid,
                     u.pid,
                 );
-                (p.port_name.clone(), desc.trim().to_string(), true)
+                let mut desc = desc.trim().to_string();
+                match usb_interface(&p.port_name) {
+                    Some(0) if u.vid == 0x10c4 && u.pid == 0xea70 => desc = format!("CAT (Enhanced port) — {desc}"),
+                    Some(i) if i > 0 => desc = format!("⚠ secondary port (PTT/keying, not CAT) — {desc}"),
+                    _ => {}
+                }
+                (p.port_name.clone(), desc, true)
             }
             _ => (p.port_name.clone(), String::new(), false),
         })

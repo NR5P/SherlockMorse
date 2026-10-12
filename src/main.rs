@@ -86,6 +86,8 @@ struct App {
     wf_tex: Option<TextureHandle>,
     wf_dirty: bool,
     wf_peak: f32,
+    last_audio_retry: Instant,
+    last_scan: Instant,
     selected: Option<u64>,
     spots: Vec<SpotRow>,
     log: Vec<(f32, String)>,
@@ -126,6 +128,8 @@ impl App {
             wf_tex: None,
             wf_dirty: true,
             wf_peak: -200.0,
+            last_audio_retry: Instant::now(),
+            last_scan: Instant::now(),
             selected: None,
             spots: Vec::new(),
             log: Vec::new(),
@@ -194,6 +198,11 @@ impl App {
     }
 
     fn connect_rig(&mut self) {
+        if self.s.rig.kind != RigKind::Hamlib && cat::is_keying_port(&self.s.rig.port) {
+            self.probe_status = format!("{} is the radio's PTT/keying port, not CAT — pick the other port", self.s.rig.port);
+            self.s.rig_enabled = false;
+            return;
+        }
         self.rig = Some(RigController::start(self.s.rig.clone()));
         self.s.rig_enabled = true;
     }
@@ -239,6 +248,37 @@ impl App {
     }
 
     fn poll(&mut self) {
+        // In Auto mode, switch to the radio's codec when it (re)appears.
+        if self.s.audio_auto && !self.snap.source.starts_with("file:") && self.last_scan.elapsed() > Duration::from_secs(5) {
+            self.last_scan = Instant::now();
+            let cur_is_radio = self.s.audio_device.as_deref().is_some_and(|n| audio::radio_score(n) >= 50);
+            if !cur_is_radio {
+                let devs = audio::list_input_devices();
+                if devs.iter().any(|d| d.score >= 50) {
+                    self.devices = devs;
+                    self.start_audio();
+                }
+            }
+        }
+        // Live audio lost (radio off / cable pulled): retry every 3 s.
+        let failed = self.engine.as_ref().is_some_and(|e| e.audio_failed());
+        let live = !self.snap.source.starts_with("file:");
+        if (failed || (self.engine.is_none() && self.engine_err.is_some())) && live {
+            if self.last_audio_retry.elapsed() > Duration::from_secs(3) {
+                self.last_audio_retry = Instant::now();
+                self.devices = audio::list_input_devices();
+                let want = self.s.audio_device.clone();
+                let present = want.as_ref().is_some_and(|w| self.devices.iter().any(|d| &d.name == w));
+                if self.s.audio_auto || present {
+                    self.start_audio();
+                } else {
+                    self.engine = None;
+                }
+                if self.engine.is_none() || self.engine.as_ref().is_some_and(|e| e.audio_failed()) {
+                    self.engine_err = Some("audio device disconnected — waiting for it to come back…".into());
+                }
+            }
+        }
         if let Some(e) = &self.engine {
             let mut s = e.snap.lock();
             let rows = std::mem::take(&mut s.new_rows);
@@ -431,15 +471,9 @@ impl App {
             if before != self.s.rig.kind {
                 // Sensible defaults per protocol.
                 match self.s.rig.kind {
-                    RigKind::Yaesu => {
-                        self.s.rig.baud = 38400;
-                        self.s.rig.rts = true;
-                    }
+                    RigKind::Yaesu => self.s.rig.baud = 38400,
                     RigKind::Kenwood => self.s.rig.baud = 38400,
-                    RigKind::Icom => {
-                        self.s.rig.baud = 19200;
-                        self.s.rig.rts = false;
-                    }
+                    RigKind::Icom => self.s.rig.baud = 19200,
                     RigKind::YaesuLegacy => self.s.rig.baud = 9600,
                     RigKind::Hamlib => {}
                 }
@@ -574,10 +608,11 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.s.wf_contrast, 0.3..=3.0).show_value(false));
             });
             ui.end_row();
-            ui.label("Assert RTS / DTR");
+            ui.label("Drive RTS / DTR high");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.s.rig.rts, "RTS").on_hover_text("Yaesu radios with CAT RTS = ON need this");
-                ui.checkbox(&mut self.s.rig.dtr, "DTR");
+                ui.checkbox(&mut self.s.rig.assert_rts, "RTS")
+                    .on_hover_text("Leave OFF. RTS/DTR can key PTT or CW on many radios. Only enable if the radio's CAT RTS menu is ON and CAT gets no reply.");
+                ui.checkbox(&mut self.s.rig.assert_dtr, "DTR").on_hover_text("Leave OFF: DTR can key the transmitter.");
             });
             ui.end_row();
         });
