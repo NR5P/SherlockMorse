@@ -1690,3 +1690,36 @@ fn main() -> eframe::Result<()> {
     };
     eframe::run_native("CW Skimmer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders `cw_text` offscreen and returns all text that was painted.
+    fn painted(gloss: bool) -> String {
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        for _ in 0..2 {
+            let o = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    cw_text(ui, "[12:00Z] W1AW DE K1ABC TNX FER CALL UR 5NN QTH? 73", 15.0, gloss, Sense::click(), "");
+                });
+            });
+            out.clear();
+            for s in o.shapes {
+                if let egui::epaint::Shape::Text(t) = s.shape {
+                    out.push_str(&t.galley.job.text);
+                    out.push('|');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn glosses_are_painted() {
+        let t = painted(true);
+        assert!(t.contains("thanks") && t.contains("best regards") && t.contains("location?"), "{t}");
+        assert!(!painted(false).contains("thanks"));
+    }
+}
