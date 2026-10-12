@@ -594,6 +594,18 @@ impl App {
         }
     }
 
+    /// Tunes so a station at RF frequency `rf` lands on the pitch, then
+    /// fine-tunes on the live signal (zero-beat).
+    fn tune_rf(&mut self, rf: u64) {
+        if self.rig.is_none() {
+            return;
+        }
+        let d = (self.pitch() as f64 - self.audio_ref()) as i64;
+        let vfo = if self.upper() { rf as i64 - d } else { rf as i64 + d };
+        self.set_vfo(vfo.max(0) as u64);
+        self.zero_beat_verify();
+    }
+
     /// Adds decoded text to the conversation on our frequency.
     fn qso_feed(&mut self, audio: f32, text: &str) {
         if (audio - self.pitch()).abs() > 75.0 {
@@ -607,6 +619,16 @@ impl App {
         });
         if !same {
             self.qso_finish();
+        }
+        if self.qso.is_none() {
+            // Back on a recent conversation's frequency: resume it.
+            if let Some(i) = self.qso_history.iter().position(|q| {
+                matches!((q.rf, rf), (Some(a), Some(b)) if (a as i64 - b as i64).abs() <= 150) && q.last_text.elapsed() < Duration::from_secs(1800)
+            }) {
+                let q = self.qso_history.remove(i);
+                self.history_sel = None;
+                self.qso = Some(q);
+            }
         }
         let q = self.qso.get_or_insert_with(|| {
             let (d, t) = utc_now();
@@ -1234,12 +1256,7 @@ impl App {
                 }
             });
         if let Some(rf) = tune_rf {
-            // Go to the spot's frequency (minus the pitch offset in SSB/DATA)
-            // and then fine-tune on the live signal.
-            let d = (self.pitch() as f64 - self.audio_ref()) as i64;
-            let vfo = if self.upper() { rf as i64 - d } else { rf as i64 + d };
-            self.set_vfo(vfo.max(0) as u64);
-            self.zero_beat_verify();
+            self.tune_rf(rf);
         }
         if let Some(a) = tune_audio {
             self.zero_beat(a);
@@ -1256,8 +1273,22 @@ impl App {
             ui.selectable_value(&mut self.bottom_tab, 1, "Selected signal");
             ui.selectable_value(&mut self.bottom_tab, 2, format!("History ({})", self.qso_history.len()));
             if self.bottom_tab == 0 && self.qso.is_some() {
+                let rf = self.qso.as_ref().and_then(|q| q.rf);
+                if let (Some(rf), true) = (rf, self.rig.is_some()) {
+                    if ui.small_button("Tune back").on_hover_text(format!("Return to {:.2} kHz", rf as f64 / 1000.0)).clicked() {
+                        self.tune_rf(rf);
+                    }
+                }
                 if ui.small_button("End / new").on_hover_text("Save and close this conversation now").clicked() {
                     self.qso_finish();
+                }
+            }
+            if self.bottom_tab == 2 {
+                let rf = self.history_sel.and_then(|i| self.qso_history.get(i)).and_then(|q| q.rf);
+                if let (Some(rf), true) = (rf, self.rig.is_some()) {
+                    if ui.small_button("Tune").on_hover_text(format!("Go to {:.2} kHz", rf as f64 / 1000.0)).clicked() {
+                        self.tune_rf(rf);
+                    }
                 }
             }
             if ui.small_button("Open folder").on_hover_text(format!("Conversations are saved in {}", log_dir().display())).clicked() {
@@ -1281,12 +1312,18 @@ impl App {
             1 => self.ui_selected(ui),
             _ => {
                 let mut sel = self.history_sel;
+                let mut tune: Option<u64> = None;
                 ui.horizontal_top(|ui| {
                     egui::ScrollArea::vertical().id_salt("hist_list").max_width(300.0).auto_shrink([true, false]).show(ui, |ui| {
                         for (i, q) in self.qso_history.iter().enumerate() {
-                            if ui.selectable_label(sel == Some(i), q.title()).clicked() {
+                            let r = ui.selectable_label(sel == Some(i), q.title());
+                            if r.clicked() {
                                 sel = Some(i);
                             }
+                            if r.double_clicked() {
+                                tune = q.rf;
+                            }
+                            r.on_hover_text("Click to read · double-click to tune there");
                         }
                         if self.qso_history.is_empty() {
                             ui.label(RichText::new("Finished conversations appear here.").weak());
@@ -1301,6 +1338,9 @@ impl App {
                     }
                 });
                 self.history_sel = sel;
+                if let Some(rf) = tune {
+                    self.tune_rf(rf);
+                }
             }
         }
     }
