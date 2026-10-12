@@ -96,6 +96,10 @@ struct App {
     recording: Option<(std::path::PathBuf, Instant)>,
     zb: Option<ZeroBeat>,
     rec_display: Option<RecDisplay>,
+    qso: Option<Qso>,
+    qso_history: Vec<Qso>,
+    bottom_tab: u8,
+    history_sel: Option<usize>,
     /// Playing an audio file rather than the sound card.
     file_mode: bool,
     last_rig_info: Instant,
@@ -114,6 +118,50 @@ struct App {
     show_settings: bool,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
     screenshot: Option<(std::path::PathBuf, Instant, bool)>,
+}
+
+/// The conversation on the operator's own frequency: everything decoded
+/// within ±75 Hz of the CW pitch, saved to a file as it arrives.
+#[derive(Clone)]
+struct Qso {
+    /// RF frequency of the conversation (None without CAT).
+    rf: Option<u64>,
+    started_utc: String,
+    last_text: Instant,
+    /// Time we moved away from the frequency (finalize after 30 s).
+    away_since: Option<Instant>,
+    text: String,
+    calls: Vec<String>,
+    path: std::path::PathBuf,
+}
+
+impl Qso {
+    fn title(&self) -> String {
+        let f = self.rf.map(|r| format!("{:.1} kHz", r as f64 / 1000.0)).unwrap_or_else(|| "on pitch".into());
+        let calls = if self.calls.is_empty() { String::new() } else { format!("  {}", self.calls.join(" ")) };
+        format!("{}Z  {f}{calls}", &self.started_utc[11..16])
+    }
+
+    fn save(&mut self) {
+        // File name carries the callsigns heard; rename as they appear.
+        let calls: Vec<&str> = self.calls.iter().take(3).map(|c| c.as_str()).collect();
+        let f = self.rf.map(|r| format!("-{:.1}", r as f64 / 1000.0)).unwrap_or_default();
+        let name = format!(
+            "qso-{}-{}Z{f}{}{}.txt",
+            &self.started_utc[..10],
+            self.started_utc[11..16].replace(':', ""),
+            if calls.is_empty() { "" } else { "-" },
+            calls.join("-").replace('/', "_")
+        );
+        let path = log_dir().join(name);
+        if path != self.path && self.path.exists() {
+            let _ = std::fs::rename(&self.path, &path);
+        }
+        self.path = path;
+        let _ = std::fs::create_dir_all(log_dir());
+        let header = format!("Conversation {}\nStarted {} UTC\n\n", self.title(), self.started_utc);
+        let _ = std::fs::write(&self.path, format!("{header}{}\n", self.text.trim_end()));
+    }
 }
 
 /// Display capture while recording audio: a JSON line per second with every
@@ -172,6 +220,10 @@ impl App {
             recording: None,
             zb: None,
             rec_display: None,
+            qso: None,
+            qso_history: Vec::new(),
+            bottom_tab: 0,
+            history_sel: None,
             file_mode: false,
             last_rig_info: Instant::now(),
             meter_avg: -90.0,
@@ -434,6 +486,9 @@ impl App {
             for r in rows {
                 self.push_wf_row(&r);
             }
+            for ev in &events {
+                self.qso_feed(ev.freq, &ev.text);
+            }
             for ev in events {
                 let e = self.lines.entry(ev.channel).or_insert_with(|| (ev.freq, String::new(), Instant::now()));
                 e.0 = ev.freq;
@@ -453,6 +508,7 @@ impl App {
         if self.recording.is_some() && self.last_rig_info.elapsed() > Duration::from_millis(500) {
             self.send_rig_info();
         }
+        self.qso_tick();
         // Follow VFO changes: shift decoders with the signals.
         if let Some(f) = self.rig_state.freq {
             if let Some(prev) = self.last_vfo {
@@ -535,6 +591,77 @@ impl App {
             if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let _ = fh.write_all(line.as_bytes());
             }
+        }
+    }
+
+    /// Adds decoded text to the conversation on our frequency.
+    fn qso_feed(&mut self, audio: f32, text: &str) {
+        if (audio - self.pitch()).abs() > 75.0 {
+            return;
+        }
+        let rf = self.rf_of(audio);
+        let now = Instant::now();
+        let same = self.qso.as_ref().is_some_and(|q| match (q.rf, rf) {
+            (Some(a), Some(b)) => (a as i64 - b as i64).abs() <= 150,
+            _ => true,
+        });
+        if !same {
+            self.qso_finish();
+        }
+        let q = self.qso.get_or_insert_with(|| {
+            let (d, t) = utc_now();
+            Qso { rf, started_utc: format!("{d} {t}"), last_text: now, away_since: None, text: String::new(), calls: Vec::new(), path: std::path::PathBuf::new() }
+        });
+        // A pause of more than 4 s means someone else (or a new over) is sending.
+        if q.text.is_empty() || q.last_text.elapsed() > Duration::from_secs(4) {
+            let (_, t) = utc_now();
+            if !q.text.is_empty() {
+                q.text.push('\n');
+            }
+            q.text.push_str(&format!("[{}Z] ", &t[..5]));
+        }
+        q.text.push_str(&to_display(text));
+        q.last_text = now;
+        q.away_since = None;
+        for w in text.split_whitespace() {
+            if let Some(c) = cwskimmer::callsign::parse_callsign(w) {
+                if !q.calls.contains(&c) {
+                    q.calls.push(c);
+                }
+            }
+        }
+        q.save();
+    }
+
+    /// Finalizes the current conversation into the history.
+    fn qso_finish(&mut self) {
+        if let Some(mut q) = self.qso.take() {
+            if q.text.trim().len() >= 3 {
+                q.save();
+                self.qso_history.insert(0, q);
+                self.qso_history.truncate(20);
+            } else if q.path.exists() {
+                let _ = std::fs::remove_file(&q.path);
+            }
+        }
+    }
+
+    /// Ends the conversation when we have moved off frequency for 30 s, or
+    /// after 10 minutes without text.
+    fn qso_tick(&mut self) {
+        let vfo_rf = self.rf_of(self.pitch());
+        let Some(q) = &mut self.qso else { return };
+        let away = matches!((q.rf, vfo_rf), (Some(a), Some(b)) if (a as i64 - b as i64).abs() > 300);
+        if away {
+            if q.away_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(30) {
+                self.qso_finish();
+                return;
+            }
+        } else {
+            q.away_since = None;
+        }
+        if self.qso.as_ref().is_some_and(|q| q.last_text.elapsed() > Duration::from_secs(600)) {
+            self.qso_finish();
         }
     }
 
@@ -685,7 +812,7 @@ impl App {
             if ui.button(rec_label).on_hover_text(format!("Record the radio audio to a WAV file in {}", log_dir().display())).clicked() {
                 self.toggle_recording();
             }
-            if ui.button("📂 Logs").on_hover_text(format!("Decoded text from every station is saved automatically to {}", log_dir().display())).clicked() {
+            if ui.button("Logs").on_hover_text(format!("Decoded text from every station is saved automatically to {}", log_dir().display())).clicked() {
                 let _ = std::fs::create_dir_all(log_dir());
                 let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
                 let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
@@ -935,7 +1062,10 @@ impl App {
                 // Select the nearest channel, or start a decoder there.
                 let near = self.snap.channels.iter().filter(|c| (c.freq - f).abs() < 30.0).min_by(|a, b| (a.freq - f).abs().total_cmp(&(b.freq - f).abs())).map(|c| c.id);
                 match near {
-                    Some(id) => self.selected = Some(id),
+                    Some(id) => {
+                        self.selected = Some(id);
+                        self.bottom_tab = 1;
+                    }
                     None => {
                         if let Some(e) = &self.engine {
                             e.send(EngineCmd::AddChannel(f));
@@ -1116,6 +1246,65 @@ impl App {
         }
     }
 
+    fn ui_bottom(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let conv = match &self.qso {
+                Some(q) => format!("Conversation: {}", q.title()),
+                None => "Conversation".into(),
+            };
+            ui.selectable_value(&mut self.bottom_tab, 0, conv);
+            ui.selectable_value(&mut self.bottom_tab, 1, "Selected signal");
+            ui.selectable_value(&mut self.bottom_tab, 2, format!("History ({})", self.qso_history.len()));
+            if self.bottom_tab == 0 && self.qso.is_some() {
+                if ui.small_button("End / new").on_hover_text("Save and close this conversation now").clicked() {
+                    self.qso_finish();
+                }
+            }
+            if ui.small_button("Open folder").on_hover_text(format!("Conversations are saved in {}", log_dir().display())).clicked() {
+                let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
+            }
+        });
+        ui.separator();
+        match self.bottom_tab {
+            0 => match &self.qso {
+                Some(q) => {
+                    let text = q.text.clone();
+                    egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(text).monospace().size(15.0)).wrap());
+                    });
+                }
+                None => {
+                    ui.label(RichText::new("Tune to a station (double-click it). Everything decoded on your frequency is collected here and saved to a file automatically; it is archived when you move away.").weak());
+                }
+            },
+            1 => self.ui_selected(ui),
+            _ => {
+                let mut sel = self.history_sel;
+                ui.horizontal_top(|ui| {
+                    egui::ScrollArea::vertical().id_salt("hist_list").max_width(300.0).auto_shrink([true, false]).show(ui, |ui| {
+                        for (i, q) in self.qso_history.iter().enumerate() {
+                            if ui.selectable_label(sel == Some(i), q.title()).clicked() {
+                                sel = Some(i);
+                            }
+                        }
+                        if self.qso_history.is_empty() {
+                            ui.label(RichText::new("Finished conversations appear here.").weak());
+                        }
+                    });
+                    ui.separator();
+                    if let Some(q) = sel.and_then(|i| self.qso_history.get(i)) {
+                        let text = q.text.clone();
+                        egui::ScrollArea::vertical().id_salt("hist_text").auto_shrink([false, false]).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(text).monospace().size(14.0)).wrap());
+                        });
+                    }
+                });
+                self.history_sel = sel;
+            }
+        }
+    }
+
     fn ui_selected(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected else {
             ui.label(RichText::new("Click a signal on the waterfall or a row above to follow it here.").weak());
@@ -1171,7 +1360,7 @@ impl eframe::App for App {
             });
         }
         egui::SidePanel::right("spots").default_width(280.0).resizable(true).show(ctx, |ui| self.ui_spots(ui));
-        egui::TopBottomPanel::bottom("selected").resizable(true).default_height(110.0).show(ctx, |ui| self.ui_selected(ui));
+        egui::TopBottomPanel::bottom("selected").resizable(true).default_height(150.0).show(ctx, |ui| self.ui_bottom(ui));
         egui::CentralPanel::default().show(ctx, |ui| {
             let h = (ui.available_height() * 0.42).clamp(120.0, 420.0);
             self.ui_waterfall(ui, h);
@@ -1232,6 +1421,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_log_lines(true);
+        self.qso_finish();
         if let Some(e) = &self.engine {
             e.send(EngineCmd::Record(None));
         }
