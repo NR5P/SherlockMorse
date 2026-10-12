@@ -41,8 +41,12 @@ pub struct Snapshot {
     pub new_rows: Vec<Vec<f32>>,
     pub events: Vec<TextEvent>,
     pub noise_floor_db: f32,
-    /// Peak input level, dBFS.
+    /// Peak input level over the last ~60 ms, dBFS.
     pub input_db: f32,
+    /// Average (RMS) input level over the last ~60 ms, dBFS.
+    pub input_rms_db: f32,
+    /// Set when any sample reached full scale; the UI clears it.
+    pub input_clipped: bool,
     pub time: f64,
     pub source: String,
     pub error: Option<String>,
@@ -152,6 +156,9 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     let mut buf = Vec::new();
     let mut last_pub = Instant::now();
     let mut peak = 0.0f32;
+    let mut sumsq = 0.0f64;
+    let mut nsamp = 0u64;
+    let mut clipped = false;
     let mut rate_seen = 0;
     let mut rec_path: Option<PathBuf> = None;
     let mut pending_measure: Vec<(u64, f32, f32, Instant)> = Vec::new();
@@ -194,7 +201,13 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                     resampler = Some((chunk.rate, Resampler::new(chunk.rate, RATE)));
                 }
                 for &s in &chunk.samples {
-                    peak = peak.max(s.abs());
+                    let a = s.abs();
+                    peak = peak.max(a);
+                    sumsq += (s as f64) * (s as f64);
+                    nsamp += 1;
+                    if a >= 0.999 {
+                        clipped = true;
+                    }
                 }
                 buf.clear();
                 resampler.as_mut().unwrap().1.process(&chunk.samples, &mut buf);
@@ -233,9 +246,17 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
             }
             s.noise_floor_db = 10.0 * sk.noise_floor.max(1e-15).log10();
             s.input_db = 20.0 * peak.max(1e-9).log10();
+            if nsamp > 0 {
+                let rms = (sumsq / nsamp as f64).sqrt() as f32;
+                s.input_rms_db = 20.0 * rms.max(1e-9).log10();
+            }
+            s.input_clipped |= clipped;
+            sumsq = 0.0;
+            nsamp = 0;
+            clipped = false;
             s.time = sk.time;
             s.input_rate = rate_seen;
-            peak *= 0.5;
+            peak = 0.0;
         }
     }
     if let Some((_, w)) = recorder.take() {

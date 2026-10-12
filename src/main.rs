@@ -95,6 +95,10 @@ struct App {
     lines: std::collections::HashMap<u64, (f32, String, Instant)>,
     recording: Option<(std::path::PathBuf, Instant)>,
     zb: Option<ZeroBeat>,
+    /// Smoothed average level and decaying peak-hold for the input meter.
+    meter_avg: f32,
+    meter_peak: f32,
+    clip_until: Option<Instant>,
     zb_status: String,
     next_req: u64,
     selected: Option<u64>,
@@ -154,6 +158,9 @@ impl App {
             lines: Default::default(),
             recording: None,
             zb: None,
+            meter_avg: -90.0,
+            meter_peak: -90.0,
+            clip_until: None,
             zb_status: String::new(),
             next_req: 1,
             selected: None,
@@ -392,6 +399,12 @@ impl App {
             self.snap.running = s.running;
             self.snap.input_rate = s.input_rate;
             let measurements = std::mem::take(&mut s.measurements);
+            if std::mem::take(&mut s.input_clipped) {
+                self.clip_until = Some(Instant::now() + Duration::from_secs(2));
+            }
+            // Meter ballistics: average smoothed (~0.3 s), peak holds and falls ~10 dB/s.
+            self.meter_avg += 0.15 * (s.input_rms_db - self.meter_avg);
+            self.meter_peak = (self.meter_peak - 0.6).max(s.input_db);
             drop(s);
             self.step_zero_beat(&measurements);
             for r in rows {
@@ -583,13 +596,24 @@ impl App {
             if before != self.s.channel_sel {
                 self.start_audio();
             }
-            // Input level meter.
-            let lvl = ((self.snap.input_db + 60.0) / 60.0).clamp(0.0, 1.0);
-            let (r, _) = ui.allocate_exact_size(Vec2::new(70.0, 12.0), Sense::hover());
-            ui.painter().rect_filled(r, 2.0, Color32::from_gray(40));
-            let col = if self.snap.input_db > -3.0 { Color32::RED } else if self.snap.input_db > -12.0 { Color32::YELLOW } else { Color32::GREEN };
-            ui.painter().rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * lvl, r.height())), 2.0, col);
-            ui.label(RichText::new(format!("{:.0} dBFS", self.snap.input_db)).small());
+            // Input level meter: average level bar, peak-hold tick, clip light.
+            let to_x = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(90.0, 12.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(r, 2.0, Color32::from_gray(40));
+            let avg = self.meter_avg;
+            let col = if avg > -10.0 { Color32::RED } else if avg > -18.0 { Color32::YELLOW } else { Color32::from_rgb(70, 200, 90) };
+            p.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * to_x(avg), r.height())), 2.0, col);
+            let px = r.left() + r.width() * to_x(self.meter_peak);
+            p.line_segment([Pos2::new(px, r.top()), Pos2::new(px, r.bottom())], Stroke::new(2.0f32, Color32::WHITE));
+            resp.on_hover_text("Bar: average input level. White tick: recent peak. CLIP lights only when the sound card actually overloads.\nAim for the bar in the green (about −40 to −18 dBFS) with no CLIP. On the FTDX3000, Menu 077 sets the USB audio level.");
+            ui.label(RichText::new(format!("{avg:.0} dB")).small());
+            let clip_on = self.clip_until.is_some_and(|t| Instant::now() < t);
+            ui.label(RichText::new(" CLIP ").small().strong().color(if clip_on { Color32::WHITE } else { Color32::from_gray(70) }).background_color(if clip_on {
+                Color32::from_rgb(200, 30, 30)
+            } else {
+                Color32::from_gray(35)
+            }));
             ui.separator();
             ui.label("File");
             ui.add(egui::TextEdit::singleline(&mut self.s.file_path).desired_width(160.0).hint_text("path to .wav/.mp3"));
