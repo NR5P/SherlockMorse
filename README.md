@@ -28,7 +28,13 @@ Runs on Linux, Windows and macOS (single native binary, no runtime needed).
   it; double-click or right-click to tune the radio to it; the mouse wheel
   tunes ±50 Hz.
 - **Spots list** of callsigns heard (after `DE`/`CQ`, or seen twice), with RF
-  frequency, speed and SNR. Click a spot to tune to it.
+  frequency, speed and SNR. Click a spot's frequency to tune to it.
+- **Station info.** Click any callsign (spots, decoder list, decoded text)
+  for a popup with name, address, grid, distance and beam heading, and photo,
+  plus buttons to open the call on QRZ.com or HamQTH. US and Canadian calls
+  need no account (HamDB). A free QRZ.com login adds name and country for any
+  call, and a free HamQTH.com login adds worldwide data and photos. Set the
+  logins and your own grid in Settings.
 - **Decoders follow the radio.** When you QSY, decoders move with their
   signals in the passband instead of being lost.
 - **Sound card selection with auto-detect.** The radio's USB audio codec

@@ -5,6 +5,7 @@ use cwskimmer::cat::controller::{RigController, RigState};
 use cwskimmer::cat::{self, Mode, RigConfig, RigKind};
 use cwskimmer::engine::{Engine, EngineCmd, Snapshot, Source};
 use cwskimmer::lm::LanguageModel;
+use cwskimmer::lookup::{self, Credentials, Lookup, LookupState};
 use cwskimmer::morse::to_display;
 use cwskimmer::skimmer::{bin_hz, ChannelInfo, SkimmerConfig, FFT_SIZE};
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
@@ -39,6 +40,10 @@ struct Settings {
     file_path: String,
     /// Print the English meaning of CW abbreviations in small text inline.
     explain_abbrev: bool,
+    /// Logins for callsign lookups (optional; HamDB needs none).
+    lookup: Credentials,
+    /// Operator's own locator, for distance and bearing to stations.
+    my_grid: String,
 }
 
 impl Default for Settings {
@@ -62,6 +67,8 @@ impl Default for Settings {
             wf_brightness: 0.0,
             file_path: String::new(),
             explain_abbrev: true,
+            lookup: Credentials::default(),
+            my_grid: String::new(),
         }
     }
 }
@@ -119,6 +126,9 @@ struct App {
     probe_rx: Option<crossbeam_channel::Receiver<ProbeMsg>>,
     probe_status: String,
     show_settings: bool,
+    lookup: Lookup,
+    /// Callsign shown in the station-info window.
+    info_call: Option<String>,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
     screenshot: Option<(std::path::PathBuf, Instant, bool)>,
 }
@@ -234,6 +244,7 @@ impl App {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = Vec2::new(6.0, 4.0);
         cc.egui_ctx.set_style(style);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut app = Self {
             lm: Arc::new(LanguageModel::new()),
             engine: None,
@@ -272,6 +283,8 @@ impl App {
             probe_rx: None,
             probe_status: String::new(),
             show_settings: false,
+            lookup: Lookup::default(),
+            info_call: None,
             screenshot: None,
             s,
         };
@@ -1045,6 +1058,33 @@ impl App {
             });
             ui.end_row();
         });
+        ui.add_space(6.0);
+        ui.strong("Station lookup");
+        ui.label(
+            RichText::new("Click a callsign for name, location and photo. US/Canada calls work without an account (HamDB). Add a free QRZ.com and/or HamQTH.com login for DX stations and photos.")
+                .small()
+                .weak(),
+        );
+        let before = self.s.lookup.clone();
+        egui::Grid::new("lookup").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label("My grid");
+            ui.add(egui::TextEdit::singleline(&mut self.s.my_grid).desired_width(70.0).hint_text("FN31pr"))
+                .on_hover_text("Your Maidenhead locator, to show distance and beam heading");
+            ui.end_row();
+            for (label, user, pass) in [
+                ("QRZ.com", &mut self.s.lookup.qrz_user, &mut self.s.lookup.qrz_pass),
+                ("HamQTH", &mut self.s.lookup.hamqth_user, &mut self.s.lookup.hamqth_pass),
+            ] {
+                ui.label(label);
+                ui.add(egui::TextEdit::singleline(user).desired_width(90.0).hint_text("username"));
+                ui.add(egui::TextEdit::singleline(pass).desired_width(90.0).password(true).hint_text("password"));
+                ui.end_row();
+            }
+        });
+        ui.label(RichText::new("Passwords are stored unencrypted in the app's settings file.").small().weak());
+        if self.s.lookup != before {
+            self.lookup.clear();
+        }
         if changed {
             if let Some(e) = &self.engine {
                 e.send(EngineCmd::Config(self.skimmer_config()));
@@ -1201,10 +1241,14 @@ impl App {
                         });
                         row.col(|ui| {
                             if let Some(c) = &ch.callsign {
-                                let r = ui.add(egui::Label::new(RichText::new(c).monospace().strong().color(Color32::from_rgb(255, 210, 90))).sense(Sense::click()));
+                                let r = call_link(ui, c, 13.0);
+                                if r.clicked() {
+                                    self.info_call = Some(c.clone());
+                                }
                                 if r.double_clicked() {
                                     tune = Some(ch.freq);
                                 }
+                                r.on_hover_text("Click: station info   Double-click: tune the radio here");
                             }
                         });
                         row.col(|ui| {
@@ -1271,7 +1315,24 @@ impl App {
                 for s in &spots {
                     body.row(18.0, |mut row| {
                         row.col(|ui| {
-                            let r = ui.add(egui::Label::new(RichText::new(&s.call).monospace().strong().color(Color32::from_rgb(255, 210, 90))).sense(Sense::click()));
+                            let r = call_link(ui, &s.call, 13.0);
+                            if r.clicked() {
+                                self.info_call = Some(s.call.clone());
+                            }
+                            if r.double_clicked() {
+                                match s.rf {
+                                    Some(rf) => tune_rf = Some(rf),
+                                    None => tune_audio = Some(s.audio),
+                                }
+                            }
+                            r.on_hover_text("Click: station info   Double-click: tune");
+                        });
+                        row.col(|ui| {
+                            let f = match s.rf {
+                                Some(rf) => format!("{:.2}", rf as f64 / 1000.0),
+                                None => format!("{:.0} Hz", s.audio),
+                            };
+                            let r = ui.add(egui::Label::new(f).sense(Sense::click()));
                             if r.clicked() {
                                 match s.rf {
                                     Some(rf) => tune_rf = Some(rf),
@@ -1279,12 +1340,6 @@ impl App {
                                 }
                             }
                             r.on_hover_text("Click to tune");
-                        });
-                        row.col(|ui| {
-                            ui.label(match s.rf {
-                                Some(rf) => format!("{:.2}", rf as f64 / 1000.0),
-                                None => format!("{:.0} Hz", s.audio),
-                            });
                         });
                         row.col(|ui| {
                             ui.label(format!("{:.0}", s.wpm));
@@ -1351,8 +1406,11 @@ impl App {
                     let rf = q.rf;
                     let mut tune = false;
                     egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                        let r = cw_text(ui, &text, 15.0, gloss, Sense::click(), "Double-click to tune back to this conversation");
+                        let (r, call) = cw_text(ui, &text, 15.0, gloss, Sense::click(), "Double-click to tune back to this conversation");
                         tune = r.double_clicked();
+                        if call.is_some() {
+                            self.info_call = call;
+                        }
                     });
                     if let (true, Some(rf)) = (tune, rf) {
                         self.tune_rf(rf);
@@ -1387,9 +1445,12 @@ impl App {
                         let text = q.text.clone();
                         let rf = q.rf;
                         egui::ScrollArea::vertical().id_salt("hist_text").auto_shrink([false, false]).show(ui, |ui| {
-                            let r = cw_text(ui, &text, 14.0, gloss, Sense::click(), "Double-click to tune to this conversation");
+                            let (r, call) = cw_text(ui, &text, 14.0, gloss, Sense::click(), "Double-click to tune to this conversation");
                             if r.double_clicked() {
                                 tune = rf;
+                            }
+                            if call.is_some() {
+                                self.info_call = call;
                             }
                         });
                     }
@@ -1414,7 +1475,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(self.fmt_freq(ch.freq)).monospace().strong());
             if let Some(c) = &ch.callsign {
-                ui.label(RichText::new(c).strong().color(Color32::from_rgb(255, 210, 90)));
+                if call_link(ui, c, 14.0).on_hover_text("Station info").clicked() {
+                    self.info_call = Some(c.clone());
+                }
             }
             ui.label(format!("{} WPM  SNR {:.0} dB", ch.wpm.map(|w| format!("{w:.0}")).unwrap_or("–".into()), ch.snr_db));
             if self.rig.is_some() && ui.button("Tune radio here").clicked() {
@@ -1423,7 +1486,104 @@ impl App {
         });
         let gloss = self.s.explain_abbrev;
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), 15.0, gloss, Sense::hover(), "");
+            let (_, call) = cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), 15.0, gloss, Sense::hover(), "");
+            if call.is_some() {
+                self.info_call = call;
+            }
+        });
+    }
+
+    /// Station-info window for the clicked callsign.
+    fn ui_call_info(&mut self, ctx: &egui::Context) {
+        let Some(call) = self.info_call.clone() else { return };
+        let state = self.lookup.get(&call, &self.s.lookup);
+        let mut open = true;
+        egui::Window::new(RichText::new(&call).monospace().strong().color(CALL_COLOR))
+            .id(egui::Id::new("call_info"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                match &state {
+                    LookupState::Pending => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Looking up…");
+                        });
+                    }
+                    LookupState::Failed(e) => {
+                        ui.label("No information found.");
+                        ui.label(RichText::new(e).small().weak());
+                        if self.s.lookup.qrz_user.is_empty() && self.s.lookup.hamqth_user.is_empty() {
+                            ui.label(RichText::new("Without a login only US and Canadian calls can be looked up. Add a free QRZ.com or HamQTH login in Settings.").small());
+                        }
+                    }
+                    LookupState::Done(i) => self.ui_info_body(ui, i),
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Open on QRZ.com").clicked() {
+                        open_in_browser(&lookup::qrz_url(&call));
+                    }
+                    if ui.button("HamQTH").clicked() {
+                        open_in_browser(&lookup::hamqth_url(&call));
+                    }
+                    if let LookupState::Done(i) = &state {
+                        ui.label(RichText::new(format!("via {}", i.sources.join(", "))).small().weak());
+                    }
+                });
+            });
+        if !open {
+            self.info_call = None;
+        }
+    }
+
+    fn ui_info_body(&self, ui: &mut egui::Ui, i: &lookup::CallInfo) {
+        ui.horizontal_top(|ui| {
+            if let Some(img) = &i.image {
+                let uri = format!("bytes://photo/{}", i.call);
+                ui.add(egui::Image::from_bytes(uri, egui::load::Bytes::Shared(img.clone())).max_size(Vec2::new(160.0, 200.0)).corner_radius(4.0));
+            }
+            ui.vertical(|ui| {
+                if !i.name.is_empty() {
+                    ui.label(RichText::new(&i.name).size(16.0).strong());
+                }
+                for l in &i.address {
+                    ui.label(l);
+                }
+                if !i.country.is_empty() {
+                    ui.label(&i.country);
+                }
+                ui.add_space(4.0);
+                egui::Grid::new("info_grid").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
+                    let mut row = |k: &str, v: String| {
+                        if !v.is_empty() {
+                            ui.label(RichText::new(k).weak());
+                            ui.label(v);
+                            ui.end_row();
+                        }
+                    };
+                    let pos = i.lat_lon.or_else(|| lookup::grid_pos(&i.grid));
+                    let grid = if i.grid.is_empty() { pos.map(|(a, b)| lookup::grid_of(a, b)).unwrap_or_default() } else { i.grid.clone() };
+                    row("Grid", grid);
+                    if let (Some(me), Some(them)) = (lookup::grid_pos(&self.s.my_grid), pos) {
+                        let (km, brg) = lookup::distance_bearing(me, them);
+                        row("Distance", format!("{km:.0} km / {:.0} mi", km * 0.621371));
+                        row("Beam heading", format!("{brg:.0}°  (long path {:.0}°)", (brg + 180.0) % 360.0));
+                    }
+                    row("Class", i.class.clone());
+                    row("QSL", i.qsl.clone());
+                    row("LoTW", if i.lotw { "yes".into() } else { String::new() });
+                    row("Email", i.email.clone());
+                });
+                if !i.web.is_empty() {
+                    let url = if i.web.starts_with("http") { i.web.clone() } else { format!("https://{}", i.web) };
+                    if ui.link(&i.web).clicked() {
+                        open_in_browser(&url);
+                    }
+                }
+            });
         });
     }
 }
@@ -1431,8 +1591,9 @@ impl App {
 /// Decoded CW text with abbreviations, Q-codes and prosigns highlighted.
 /// Hovering one shows its meaning; with `gloss` the meaning is also printed
 /// in small text underneath it (rows holding one get taller to make room).
+/// Callsigns are shown as links; the one clicked is returned.
 /// `hint` is the hover text elsewhere.
-fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, hint: &str) -> egui::Response {
+fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, hint: &str) -> (egui::Response, Option<String>) {
     use egui::text::{LayoutJob, TextFormat, TextWrapping};
     let mono = egui::FontId::monospace(size);
     let small_font = egui::FontId::proportional((size * 0.62).max(9.0));
@@ -1444,24 +1605,55 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, 
         line_height: gloss.then_some(text_h + small_h + 1.0),
         ..normal.clone()
     };
+    let link = TextFormat { color: CALL_COLOR, underline: Stroke::new(1.0f32, CALL_COLOR.gamma_multiply(0.5)), ..normal.clone() };
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
-    // Char ranges of the highlighted words, with their meanings.
+    // Highlighted words (byte ranges): abbreviations with their meaning, and callsigns.
+    let mut marks: Vec<(std::ops::Range<usize>, Option<String>)> = cwskimmer::abbrev::find(text).into_iter().map(|(r, m)| (r, Some(m))).collect();
+    let mut pos = 0;
+    for w in text.split_inclusive(char::is_whitespace) {
+        let word = w.trim_end();
+        let r = pos..pos + word.len();
+        pos += w.len();
+        if !word.is_empty() && cwskimmer::callsign::parse_callsign(word).is_some() && !marks.iter().any(|(m, _)| m.start < r.end && r.start < m.end) {
+            marks.push((r, None));
+        }
+    }
+    marks.sort_by_key(|(r, _)| r.start);
+    // Char ranges of the abbreviations with their meanings, and of the callsigns.
     let mut spans: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut calls: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let mut chars = 0;
     let mut last = 0;
-    for (r, m) in cwskimmer::abbrev::find(text) {
+    for (r, m) in marks {
         job.append(&text[last..r.start], 0.0, normal.clone());
         chars += text[last..r.start].chars().count();
         let n = text[r.clone()].chars().count();
-        job.append(&text[r.clone()], 0.0, abbr.clone());
-        spans.push((chars..chars + n, m));
+        match m {
+            Some(m) => {
+                job.append(&text[r.clone()], 0.0, abbr.clone());
+                spans.push((chars..chars + n, m));
+            }
+            None => {
+                job.append(&text[r.clone()], 0.0, link.clone());
+                calls.push((chars..chars + n, text[r.clone()].to_string()));
+            }
+        }
         chars += n;
         last = r.end;
     }
     job.append(&text[last..], 0.0, normal);
     let galley = ui.fonts(|f| f.layout_job(job));
-    let r = ui.add(egui::Label::new(galley.clone()).sense(sense));
+    let r = ui.add(egui::Label::new(galley.clone()).sense(sense.union(Sense::click())));
+    let char_at = |p: Pos2| galley.cursor_from_pos(p - r.rect.min).ccursor.index;
+    let on_call = |p: Pos2| {
+        let c = char_at(p);
+        calls.iter().find(|(s, _)| s.contains(&c)).map(|(_, call)| call.clone())
+    };
+    let clicked = if r.clicked() { r.interact_pointer_pos().and_then(on_call) } else { None };
+    if r.hover_pos().and_then(on_call).is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     let origin = r.rect.min.to_vec2();
     // Word boxes (galley coordinates): x range and row top.
     let boxes: Vec<(f32, f32, f32)> = spans
@@ -1500,16 +1692,42 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, 
         painter.galley(Pos2::new(x, top + text_h) + origin, g, Color32::GRAY);
     }
     let hit = r.hover_pos().and_then(|p| {
-        let c = galley.cursor_from_pos(p - r.rect.min).ccursor.index;
+        let c = char_at(p);
         spans.iter().find(|(s, _)| s.contains(&c) || s.end == c)
     });
-    match hit {
-        Some((s, m)) => {
+    let hover_call = r.hover_pos().and_then(on_call);
+    let r = match (hit, hover_call) {
+        (_, Some(call)) => r.clone().on_hover_text(format!("{call} — click for station info")),
+        (Some((s, m)), _) => {
             let word: String = galley.job.text.chars().skip(s.start).take(s.len()).collect();
-            r.on_hover_text(RichText::new(format!("{word} — {m}")).strong())
+            r.clone().on_hover_text(RichText::new(format!("{word} — {m}")).strong())
         }
-        None if !hint.is_empty() => r.on_hover_text(hint),
-        None => r,
+        _ if !hint.is_empty() => r.clone().on_hover_text(hint),
+        _ => r.clone(),
+    };
+    (r, clicked)
+}
+
+const CALL_COLOR: Color32 = Color32::from_rgb(255, 210, 90);
+
+/// A callsign drawn as a clickable link.
+fn call_link(ui: &mut egui::Ui, call: &str, size: f32) -> egui::Response {
+    let r = ui.add(egui::Label::new(RichText::new(call).monospace().size(size).strong().color(CALL_COLOR)).sense(Sense::click()));
+    if r.hovered() {
+        ui.painter().line_segment([r.rect.left_bottom(), r.rect.right_bottom()], Stroke::new(1.0f32, CALL_COLOR));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    r
+}
+
+fn open_in_browser(url: &str) {
+    let r = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else {
+        std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url).spawn()
+    };
+    if let Err(e) = r {
+        eprintln!("could not open {url}: {e}");
     }
 }
 
@@ -1548,6 +1766,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             self.ui_channels(ui);
         });
+        self.ui_call_info(ctx);
         if let (Some(rd), Some((_, started))) = (&mut self.rec_display, &self.recording) {
             let _ = &rd.log;
             let t = started.elapsed().as_secs_f32();

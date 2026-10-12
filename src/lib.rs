@@ -10,6 +10,7 @@ pub mod decoder;
 pub mod dsp;
 pub mod engine;
 pub mod lm;
+pub mod lookup;
 pub mod morse;
 pub mod skimmer;
 pub mod synth;
