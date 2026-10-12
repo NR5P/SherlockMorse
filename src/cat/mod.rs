@@ -1,0 +1,179 @@
+//! CAT (computer aided transceiver) radio control.
+//!
+//! Supported protocols:
+//! * Yaesu "new CAT" ASCII protocol – FTDX3000, FTDX5000, FTDX1200, FT-950,
+//!   FT-2000, FT-991(A), FT-891, FT-710, FTDX10, FTDX101 …
+//! * Kenwood / Elecraft ASCII protocol – TS-480/590/890/990, K3, K4, KX2/3 …
+//! * Icom CI-V – IC-7300, IC-7610, IC-705, IC-9700, IC-7100 …
+//! * Yaesu legacy 5-byte binary protocol – FT-817/818/857/897.
+//! * Hamlib `rigctld` network daemon – any radio Hamlib supports.
+
+pub mod controller;
+pub mod hamlib;
+pub mod icom;
+pub mod probe;
+pub mod textcat;
+pub mod yaesu_legacy;
+
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RigKind {
+    /// Yaesu ASCII CAT (FTDX3000 etc.)
+    Yaesu,
+    /// Kenwood / Elecraft ASCII CAT.
+    Kenwood,
+    /// Icom CI-V.
+    Icom,
+    /// Yaesu FT-817/818/857/897 binary CAT.
+    YaesuLegacy,
+    /// Hamlib rigctld over TCP.
+    Hamlib,
+}
+
+impl RigKind {
+    pub const ALL: [RigKind; 5] = [RigKind::Yaesu, RigKind::Kenwood, RigKind::Icom, RigKind::YaesuLegacy, RigKind::Hamlib];
+    pub fn label(self) -> &'static str {
+        match self {
+            RigKind::Yaesu => "Yaesu CAT (FTDX3000/FTDX101/FT-991/FT-891/FT-710…)",
+            RigKind::Kenwood => "Kenwood / Elecraft (TS-590/890, K3, K4, KX3…)",
+            RigKind::Icom => "Icom CI-V (IC-7300/7610/705/9700…)",
+            RigKind::YaesuLegacy => "Yaesu legacy (FT-817/818/857/897)",
+            RigKind::Hamlib => "Hamlib rigctld (network, any radio)",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Cw,
+    CwR,
+    Usb,
+    Lsb,
+    Am,
+    Fm,
+    Rtty,
+    Data,
+    Other(String),
+}
+
+impl Mode {
+    pub fn label(&self) -> String {
+        match self {
+            Mode::Cw => "CW".into(),
+            Mode::CwR => "CW-R".into(),
+            Mode::Usb => "USB".into(),
+            Mode::Lsb => "LSB".into(),
+            Mode::Am => "AM".into(),
+            Mode::Fm => "FM".into(),
+            Mode::Rtty => "RTTY".into(),
+            Mode::Data => "DATA".into(),
+            Mode::Other(s) => s.clone(),
+        }
+    }
+
+    /// Whether audio frequency increases with RF frequency in this mode.
+    /// (CW on Yaesu/Kenwood/Icom is upper sideband; CW-R is lower.)
+    pub fn is_upper(&self) -> bool {
+        !matches!(self, Mode::CwR | Mode::Lsb)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RigConfig {
+    pub kind: RigKind,
+    pub port: String,
+    pub baud: u32,
+    /// Icom CI-V address (e.g. 0x94 for IC-7300).
+    pub civ_addr: u8,
+    /// rigctld address, host:port.
+    pub host: String,
+    /// Assert RTS (needed by Yaesu radios with "CAT RTS" enabled).
+    pub rts: bool,
+    pub dtr: bool,
+    pub poll_ms: u64,
+}
+
+impl Default for RigConfig {
+    fn default() -> Self {
+        Self {
+            kind: RigKind::Yaesu,
+            port: default_port(),
+            baud: 38400,
+            civ_addr: 0x94,
+            host: "127.0.0.1:4532".into(),
+            rts: true,
+            dtr: false,
+            poll_ms: 300,
+        }
+    }
+}
+
+fn default_port() -> String {
+    if cfg!(windows) {
+        "COM3".into()
+    } else if cfg!(target_os = "macos") {
+        "/dev/cu.SLAB_USBtoUART".into()
+    } else {
+        "/dev/ttyUSB0".into()
+    }
+}
+
+pub trait Rig: Send {
+    fn name(&self) -> String;
+    fn get_freq(&mut self) -> Result<u64>;
+    fn set_freq(&mut self, hz: u64) -> Result<()>;
+    fn get_mode(&mut self) -> Result<Mode>;
+    fn set_mode(&mut self, mode: &Mode) -> Result<()>;
+}
+
+pub fn open_serial(cfg: &RigConfig, stop_bits_two: bool) -> Result<Box<dyn serialport::SerialPort>> {
+    let mut p = serialport::new(&cfg.port, cfg.baud)
+        .timeout(Duration::from_millis(250))
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(if stop_bits_two { serialport::StopBits::Two } else { serialport::StopBits::One })
+        .flow_control(serialport::FlowControl::None)
+        .open()
+        .map_err(|e| anyhow!("cannot open {}: {e}", cfg.port))?;
+    let _ = p.write_request_to_send(cfg.rts);
+    let _ = p.write_data_terminal_ready(cfg.dtr);
+    let _ = p.clear(serialport::ClearBuffer::All);
+    Ok(p)
+}
+
+/// Opens a radio according to the configuration.
+pub fn open(cfg: &RigConfig) -> Result<Box<dyn Rig>> {
+    Ok(match cfg.kind {
+        RigKind::Yaesu => Box::new(textcat::TextCat::open(cfg, textcat::Dialect::Yaesu)?),
+        RigKind::Kenwood => Box::new(textcat::TextCat::open(cfg, textcat::Dialect::Kenwood)?),
+        RigKind::Icom => Box::new(icom::Icom::open(cfg)?),
+        RigKind::YaesuLegacy => Box::new(yaesu_legacy::YaesuLegacy::open(cfg)?),
+        RigKind::Hamlib => Box::new(hamlib::Rigctld::open(cfg)?),
+    })
+}
+
+/// Lists serial ports, USB ones first, with a description.
+pub fn list_ports() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String, bool)> = serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| match &p.port_type {
+            serialport::SerialPortType::UsbPort(u) => {
+                let desc = format!(
+                    "{} {} [{:04x}:{:04x}]",
+                    u.manufacturer.clone().unwrap_or_default(),
+                    u.product.clone().unwrap_or_default(),
+                    u.vid,
+                    u.pid,
+                );
+                (p.port_name.clone(), desc.trim().to_string(), true)
+            }
+            _ => (p.port_name.clone(), String::new(), false),
+        })
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    v.into_iter().map(|(a, b, _)| (a, b)).collect()
+}
