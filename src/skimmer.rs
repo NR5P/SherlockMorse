@@ -218,6 +218,26 @@ pub fn text_plausibility(lm: &LanguageModel, text: &str) -> Option<f32> {
     (k.len() >= 30).then(|| lm.score(&format!(" {k} ")))
 }
 
+/// Splits a callsign sent twice with the word gap squeezed out
+/// ("K5ZDK5ZD" -> "K5ZD K5ZD"); calls are routinely sent twice.
+fn split_doubled_calls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 4);
+    for (i, w) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let h = w.len() / 2;
+        if w.len() >= 6 && w.len() % 2 == 0 && w.is_char_boundary(h) && w[..h] == w[h..] && parse_callsign(&w[..h]).is_some() {
+            out.push_str(&w[..h]);
+            out.push(' ');
+            out.push_str(&w[h..]);
+        } else {
+            out.push_str(w);
+        }
+    }
+    out
+}
+
 /// Replaces near-miss decodes of a callsign confirmed on this channel
 /// (a dit lost or gained in a fade) with the call itself.
 fn snap_calls(text: &str, calls: &HashMap<String, u32>) -> String {
@@ -633,7 +653,7 @@ impl Skimmer {
     /// Appends decoded text to a channel and publishes it once the channel
     /// looks like real Morse rather than noise or an artefact.
     fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, lm: &LanguageModel, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
-        let snapped = snap_calls(txt, &ch.call_counts);
+        let snapped = snap_calls(&split_doubled_calls(txt), &ch.call_counts);
         let txt = snapped.as_str();
         ch.text.push_str(txt);
         if ch.text.len() > 4000 {
@@ -1042,5 +1062,16 @@ impl Skimmer {
             .collect();
         v.sort_by(|a, b| a.freq.total_cmp(&b.freq));
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_doubled_calls_only() {
+        assert_eq!(split_doubled_calls("TEST K5ZDK5ZD TU"), "TEST K5ZD K5ZD TU");
+        assert_eq!(split_doubled_calls("HIHI TUTU 599599"), "HIHI TUTU 599599");
     }
 }

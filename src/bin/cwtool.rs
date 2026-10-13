@@ -442,6 +442,52 @@ fn cases() -> Vec<Case> {
 
 /// Runs a scene through the full skimmer (auto-detection on) and returns the
 /// CER for each signal: decoded text is gathered from channels within 25 Hz.
+/// Spot accounting across a bench run: callsigns in the sent texts, how
+/// many were spotted (confirmed), and spots that were not sent at all.
+static SPOT_TRUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_FOUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_ANY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_MISSED_TWICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_TWICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_WRONG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SPOT_WRONG_CONF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn count_spots(scene: &Scene, sk: &Skimmer, verbose: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let truth: std::collections::HashSet<String> =
+        scene.signals.iter().flat_map(|s| s.text.split_whitespace()).filter_map(cwskimmer::callsign::parse_callsign).collect();
+    SPOT_TRUE.fetch_add(truth.len(), Relaxed);
+    // Calls sent at least twice should end up confirmed.
+    for c in &truth {
+        let sent = scene.signals.iter().flat_map(|s| s.text.split_whitespace()).filter(|w| w == c).count();
+        if sent >= 2 {
+            SPOT_TWICE.fetch_add(1, Relaxed);
+            if !sk.spots.iter().any(|sp| &sp.call == c && sp.confirmed) {
+                SPOT_MISSED_TWICE.fetch_add(1, Relaxed);
+                if verbose {
+                    println!("    missed (sent {sent}x): {c}");
+                }
+            }
+        }
+    }
+    for sp in &sk.spots {
+        if truth.contains(&sp.call) {
+            SPOT_ANY.fetch_add(1, Relaxed);
+            if sp.confirmed {
+                SPOT_FOUND.fetch_add(1, Relaxed);
+            }
+        } else {
+            SPOT_WRONG.fetch_add(1, Relaxed);
+            if sp.confirmed {
+                SPOT_WRONG_CONF.fetch_add(1, Relaxed);
+            }
+            if verbose {
+                println!("    wrong spot: {}{}", sp.call, if sp.confirmed { " (confirmed)" } else { "" });
+            }
+        }
+    }
+}
+
 fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
     let samples = synth::render(scene);
     let detect_db = std::env::var("CWSK_DETECT_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(SkimmerConfig::default().detect_db);
@@ -451,6 +497,7 @@ fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
         sk.process(c);
     }
     sk.finish();
+    count_spots(scene, &sk, verbose);
     let events: Vec<_> = sk.events.drain(..).collect();
     scene
         .signals
@@ -512,4 +559,12 @@ fn bench(trials: u64, compare_lm: bool, only: Option<String>, verbose: bool) {
         }
     }
     println!("{:<20} {:>9.1}%", "MEAN", total / n.max(1) as f32 * 100.0);
+    use std::sync::atomic::Ordering::Relaxed;
+    let (t, f, w, wc) = (SPOT_TRUE.load(Relaxed), SPOT_FOUND.load(Relaxed), SPOT_WRONG.load(Relaxed), SPOT_WRONG_CONF.load(Relaxed));
+    let (a, tw, mt) = (SPOT_ANY.load(Relaxed), SPOT_TWICE.load(Relaxed), SPOT_MISSED_TWICE.load(Relaxed));
+    println!(
+        "SPOTS {a}/{t} calls spotted ({:.0}%), {f} confirmed; sent 2+ times: {}/{tw} confirmed; {w} wrong spots ({wc} confirmed)",
+        100.0 * a as f32 / t.max(1) as f32,
+        tw - mt
+    );
 }
