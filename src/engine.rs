@@ -178,6 +178,7 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
     let mut last_display = Instant::now();
     let mut rig_info: (Option<u64>, Option<String>, f32) = (None, None, 0.0);
     let mut recorder: Option<(PathBuf, hound::WavWriter<std::io::BufWriter<std::fs::File>>)> = None;
+    let mut last_rec_flush = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = cmd_rx.try_recv() {
             match c {
@@ -219,6 +220,12 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
                 if let Some((_, w)) = &mut recorder {
                     for &x in &chunk.samples {
                         let _ = w.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    }
+                    // Keep the header's sizes current, so a recording is
+                    // playable even if the program is killed mid-way.
+                    if last_rec_flush.elapsed() > Duration::from_secs(5) {
+                        let _ = w.flush();
+                        last_rec_flush = Instant::now();
                     }
                 }
                 if resampler.as_ref().map(|r| r.0) != Some(chunk.rate) {
