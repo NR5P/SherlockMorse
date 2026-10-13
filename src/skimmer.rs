@@ -178,15 +178,21 @@ const MIN_DASH_FRAC: f32 = 0.22;
 
 /// Below this plausibility a channel's text is junk and the channel is
 /// hidden; below `DOUBTFUL_PLAUS` it is shown dimmed. Measured on live
-/// logs: clean QSO text -1 to -2.5, garbled but real -2.4 to -3.1, noise
-/// decoded as text -2.8 to -3.6 (the bands overlap, so only clear junk is
+/// logs: clean QSO text -1 to -2.2, garbled but real -2.4 to -3.1, noise
+/// decoded as text -2.6 to -3.6 (the bands overlap, so only clear junk is
 /// hidden). Code groups (random characters, as in practice traffic) are
 /// implausible too but made of long characters, while noise decodes as
 /// short ones; only text below `JUNK_MAX_ELEMS` elements per character is
 /// hidden for implausibility.
 const MIN_PLAUS: f32 = -3.15;
 const JUNK_MAX_ELEMS: f32 = 3.3;
-const DOUBTFUL_PLAUS: f32 = -2.75;
+const DOUBTFUL_PLAUS: f32 = -2.45;
+/// Text made of very short characters (E I S T…, under this many elements
+/// per character; real text averages 2.5-3.3) that also reads poorly is
+/// what noise and other stations' clicks decode as: hidden too. Measured
+/// on 20 m recordings: junk -2.6 to -3.1 with 1.9-2.3 elements per character.
+const SHORT_JUNK_ELEMS: f32 = 2.3;
+const SHORT_JUNK_PLAUS: f32 = -2.55;
 
 /// Mean language-model log-probability per character of the last ~100
 /// characters, ignoring callsigns (random letter strings by nature). None
@@ -616,7 +622,8 @@ impl Skimmer {
         let (el, dash, n) = text_quality(&ch.text);
         ch.plaus = text_plausibility(lm, &ch.text);
         let text_ok = if n >= 8 {
-            el >= MIN_QUALITY && dash >= MIN_DASH_FRAC && (el >= JUNK_MAX_ELEMS || ch.plaus.is_none_or(|p| p >= MIN_PLAUS))
+            let junk = ch.plaus.is_some_and(|p| (p < MIN_PLAUS && el < JUNK_MAX_ELEMS) || (p < SHORT_JUNK_PLAUS && el < SHORT_JUNK_ELEMS));
+            el >= MIN_QUALITY && dash >= MIN_DASH_FRAC && !junk
         } else {
             n >= 3 && dash >= 0.2
         };
