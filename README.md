@@ -197,6 +197,9 @@ sound card / file ─► resampler (8 kHz) ─► FFT 512 ─► waterfall + sig
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE). You can use, copy, change and share
-this software for any noncommercial purpose. You can't sell it or use it
-commercially.
+Copyright (C) 2026 NR5P
+
+Sherlock Morse is free software: you can redistribute it and/or modify it
+under the terms of the [GNU General Public License](LICENSE) as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
