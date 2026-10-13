@@ -567,19 +567,25 @@ impl App {
                 self.push_wf_row(&r);
             }
             self.log_channel_notes(&notes);
-            // A strong station near the pitch drags along weak phantom
-            // channels (its clicks or sidebands) that decode as junk: when
-            // a channel there reads well, leave the dimmed ones out of the
-            // conversation. (Both sides of a real QSO normally read well.)
+            // The conversation is the station on the peak: the highlighted
+            // row when it is near the pitch (clicking a row tunes it there),
+            // otherwise the channel closest to the pitch, which is then
+            // highlighted if nothing else is. Text from other channels near
+            // the pitch (often junk beside a strong station) stays out.
             let pitch = self.pitch();
-            let near = |c: &&cwskimmer::skimmer::ChannelInfo| (c.freq - pitch).abs() <= 75.0;
-            let clean_near = self.snap.channels.iter().filter(near).any(|c| !c.doubtful);
-            for ev in &events {
-                let doubtful = self.snap.channels.iter().find(|c| c.id == ev.channel).is_some_and(|c| c.doubtful);
-                if clean_near && doubtful {
-                    continue;
+            let off = |c: &cwskimmer::skimmer::ChannelInfo| (c.freq - pitch).abs();
+            let selected_near = self.selected.and_then(|id| self.snap.channels.iter().find(|c| c.id == id)).filter(|c| off(c) <= 75.0).map(|c| c.id);
+            let nearest = self.snap.channels.iter().filter(|c| off(c) <= 75.0).min_by(|a, b| off(a).total_cmp(&off(b))).map(|c| c.id);
+            if self.selected.is_none_or(|id| !self.snap.channels.iter().any(|c| c.id == id)) {
+                if let Some(n) = nearest {
+                    self.selected = Some(n);
                 }
-                self.qso_feed(ev.freq, &ev.text);
+            }
+            let conv = selected_near.or(nearest);
+            for ev in &events {
+                if Some(ev.channel) == conv {
+                    self.qso_feed(ev.freq, &ev.text);
+                }
             }
             self.tag_channels(events.iter().map(|e| e.channel).collect());
             for ev in events {
