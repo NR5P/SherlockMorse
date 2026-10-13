@@ -3,6 +3,7 @@
 
 pub mod audio;
 pub mod abbrev;
+pub mod activity;
 pub mod audiofile;
 pub mod callsign;
 pub mod cty;
