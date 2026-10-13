@@ -408,10 +408,17 @@ impl App {
     /// precisely, tune it onto the pitch, then verify and correct.
     fn zero_beat(&mut self, audio: f32) {
         if self.rig.is_none() {
+            self.zb_status = "connect the radio to tune".into();
             return;
         }
-        self.zb = Some(ZeroBeat { stage: 0, req: None, wait_until: Instant::now(), near: audio, span: 30.0 });
-        self.zb_status = "zero-beat: measuring…".into();
+        if self.rig_state.freq.is_none() {
+            self.zb_status = "waiting for the radio's frequency…".into();
+            return;
+        }
+        // Move right away on the estimate, then measure and correct, so a
+        // station between transmissions still gets tuned.
+        self.tune_to_audio(audio);
+        self.zero_beat_verify();
     }
 
     /// After tuning to a known RF frequency (spot), verify it lands on pitch.
@@ -1207,8 +1214,10 @@ impl App {
         let text_w = ui.available_width() - 330.0;
         let char_w = 7.6;
         let max_chars = ((text_w / char_w) as usize).max(10);
+        let ui_ctx = ui.ctx().clone();
         TableBuilder::new(ui)
             .striped(true)
+            .sense(Sense::click())
             .stick_to_bottom(false)
             .column(Column::exact(86.0))
             .column(Column::exact(80.0))
@@ -1230,14 +1239,7 @@ impl App {
                         row.set_selected(sel);
                         row.col(|ui| {
                             let dot = if ch.is_mark { "●" } else { "○" };
-                            let r = ui.add(egui::Label::new(RichText::new(format!("{dot} {}", self.fmt_freq(ch.freq))).monospace()).sense(Sense::click()));
-                            if r.clicked() {
-                                self.selected = Some(ch.id);
-                            }
-                            if r.double_clicked() {
-                                tune = Some(ch.freq);
-                            }
-                            r.on_hover_text("Double-click to tune the radio here");
+                            ui.add(egui::Label::new(RichText::new(format!("{dot} {}", self.fmt_freq(ch.freq))).monospace()).selectable(false));
                         });
                         row.col(|ui| {
                             if let Some(c) = &ch.callsign {
@@ -1245,10 +1247,7 @@ impl App {
                                 if r.clicked() {
                                     self.info_call = Some(c.clone());
                                 }
-                                if r.double_clicked() {
-                                    tune = Some(ch.freq);
-                                }
-                                r.on_hover_text("Click: station info   Double-click: tune the radio here");
+                                r.on_hover_text("Click for station info");
                             }
                         });
                         row.col(|ui| {
@@ -1271,8 +1270,8 @@ impl App {
                             let col = if age < 5.0 { Color32::WHITE } else { Color32::GRAY };
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.label(RichText::new(a).monospace().color(col));
-                                ui.label(RichText::new(b).monospace().color(Color32::from_gray(130)));
+                                ui.add(egui::Label::new(RichText::new(a).monospace().color(col)).selectable(false));
+                                ui.add(egui::Label::new(RichText::new(b).monospace().color(Color32::from_gray(130))).selectable(false));
                             });
                         });
                         row.col(|ui| {
@@ -1280,6 +1279,17 @@ impl App {
                                 remove = Some(ch.id);
                             }
                         });
+                        // Clicking anywhere else on the row follows and tunes to it.
+                        let r = row.response();
+                        if r.clicked() && remove.is_none() {
+                            self.selected = Some(ch.id);
+                            self.bottom_tab = 1;
+                            tune = Some(ch.freq);
+                        }
+                        if r.hovered() {
+                            ui_ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        r.on_hover_text("Click to tune the radio to this station");
                     });
                 }
             });
