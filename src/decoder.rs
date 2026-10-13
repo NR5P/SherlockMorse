@@ -152,8 +152,12 @@ impl TimingModel {
         // Word gaps scale with character gaps (keeps Farnsworth consistent).
         (self.cgap * 7.0 / 3.0).max(self.dot * 5.0) * self.wscale
     }
+    /// Character speed. A dot plus the gap after it is two units whatever
+    /// the keying weight or the slicer's bias (which lengthens marks and
+    /// shortens gaps by the same amount: on ARRL practice files the dot
+    /// alone read ~17% slow).
     pub fn wpm(&self) -> f32 {
-        1200.0 / self.dot
+        2400.0 / (self.dot + self.egap)
     }
 }
 

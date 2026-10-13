@@ -167,6 +167,14 @@ fn main() -> Result<()> {
             }
             feed(&mut sk, &vec![0.0; rate as usize * 3]);
             sk.finish();
+            if std::env::var_os("CWSK_WPM").is_some() {
+                for c in sk.channel_info() {
+                    let t = sk.channels.iter().find(|ch| ch.id == c.id).and_then(|ch| ch.decoder.timing().cloned());
+                    if let Some(t) = t {
+                        eprintln!("WPM {:7.1} Hz: {:.1} wpm (dot {:.0} ms, egap {:.0} ms, dash/dot {:.2}, char gap {:.1} dots, word gap {:.1} dots)", c.freq, t.wpm(), t.dot, t.egap, t.dash / t.dot, t.cgap / t.dot, t.wgap() / t.dot);
+                    }
+                }
+            }
             for e in sk.events.drain(..) {
                 let ent = log.entry(e.channel).or_insert((e.freq, String::new()));
                 ent.0 = e.freq;
