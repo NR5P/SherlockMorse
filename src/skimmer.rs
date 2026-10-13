@@ -62,6 +62,8 @@ pub struct Channel {
     pub active: bool,
     /// Recent mark/space decisions (one per frame) for artefact detection.
     marks: VecDeque<bool>,
+    /// Recent envelope (one per frame), same span as `marks`.
+    amps: VecDeque<f32>,
     /// Text not yet published (held until the channel qualifies).
     pending_out: String,
     /// The decoded text looks like real Morse (see [`text_quality`]).
@@ -311,6 +313,45 @@ struct Retired {
     call_counts: HashMap<String, u32>,
 }
 
+/// Pearson correlation of two envelope histories (log amplitude) while the
+/// first channel is keying (a mark within ±0.6 s per `marks_a`): the band
+/// noise the receiver's AGC pumps moves against a strong signal, an
+/// unrelated station does not. (Over the whole span, two stations simply
+/// taking turns would look anti-correlated too.)
+fn amp_corr(a: &VecDeque<f32>, b: &VecDeque<f32>, marks_a: &VecDeque<bool>) -> f32 {
+    let n = a.len().min(b.len()).min(marks_a.len());
+    if n < 500 {
+        return 0.0;
+    }
+    let (oa, ob, om) = (a.len() - n, b.len() - n, marks_a.len() - n);
+    let mut pre = vec![0u32; n + 1];
+    for i in 0..n {
+        pre[i + 1] = pre[i] + u32::from(marks_a[om + i]);
+    }
+    let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut cnt = 0usize;
+    for i in 0..n {
+        if pre[(i + 301).min(n)] == pre[i.saturating_sub(300)] {
+            continue;
+        }
+        cnt += 1;
+        let x = f64::from(a[oa + i].max(1e-9).ln());
+        let y = f64::from(b[ob + i].max(1e-9).ln());
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+    }
+    if cnt < 500 {
+        return 0.0;
+    }
+    let nf = cnt as f64;
+    let cov = sxy / nf - (sx / nf) * (sy / nf);
+    let var = (sxx / nf - (sx / nf).powi(2)) * (syy / nf - (sy / nf).powi(2));
+    if var <= 1e-12 { 0.0 } else { (cov / var.sqrt()) as f32 }
+}
+
 /// Maximum |Pearson correlation| between two mark histories over lags of
 /// ±100 ms, computed only where both channels are keying (so two stations
 /// taking turns are not mistaken for an echo).
@@ -434,6 +475,7 @@ impl Skimmer {
             level_db: -200.0,
             active: true,
             marks: VecDeque::with_capacity(MARK_HIST),
+            amps: VecDeque::with_capacity(MARK_HIST),
             pending_out: String::new(),
             qualified: pinned || was_revived,
             last_good: self.time,
@@ -587,8 +629,10 @@ impl Skimmer {
                 ch.demod.afc(z, ch.decoder.is_mark() && strong);
                 if ch.marks.len() >= MARK_HIST {
                     ch.marks.pop_front();
+                    ch.amps.pop_front();
                 }
                 ch.marks.push_back(ch.decoder.is_mark());
+                ch.amps.push_back(z.norm());
             }
             if ch.decoder.is_mark() {
                 ch.last_mark = now;
@@ -966,22 +1010,32 @@ impl Skimmer {
                 let mut tot = 0u32;
                 let mut inside = 0u32;
                 for i in 0..wl {
+                    let c = dil(so + i);
                     if weak.marks[wo + i] {
                         tot += 1;
-                        if dil(so + i) {
+                        if c {
                             inside += 1;
                         }
                     }
                 }
+
                 if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
-                    eprintln!("t={:.0} weak {:.0}Hz ({:.0}dB) vs strong {:.0}Hz ({:.0}dB): {}/{} = {:.2}", self.time, weak.demod.freq, weak.level_db, strong.demod.freq, strong.level_db, inside, tot, inside as f32 / tot as f32);
+                    eprintln!("ART t={:.0} weak {:.0}Hz ({:.0}dB) vs strong {:.0}Hz ({:.0}dB): inside {:.2} ampcorr {:.2}", self.time, weak.demod.freq, weak.level_db, strong.demod.freq, strong.level_db, inside as f32 / tot as f32, amp_corr(&strong.amps, &weak.amps, &strong.marks));
                 }
                 let corr = if tot >= 100 { lagged_corr(&strong.marks, &weak.marks) } else { 0.0 };
                 if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
                     eprintln!("    corr {corr:.2}");
                 }
                 let much_stronger = strong.level_db >= weak.level_db + 10.0;
-                if tot >= 100 && ((much_stronger && (inside as f32 > 0.92 * tot as f32 || corr > 0.5)) || (twin && corr > 0.7)) {
+                let inside_frac = inside as f32 / tot.max(1) as f32;
+                // The receiver's AGC turns the gain down while the strong
+                // station keys, so band noise elsewhere dips in step with
+                // it: inverted "keying" that decodes as junk. Its envelope
+                // moves against the strong one's; a real weak station's own
+                // keying dominates its envelope instead. (On 40 m at night
+                // next to W1AW: dozens of junk channels, all -0.24..-0.45.)
+                let agc = much_stronger && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
+                if tot >= 100 && ((much_stronger && (inside_frac > 0.92 || corr > 0.5)) || (twin && corr > 0.7) || agc) {
                     dead[wi] = true;
                 }
             }

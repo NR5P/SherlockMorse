@@ -567,7 +567,18 @@ impl App {
                 self.push_wf_row(&r);
             }
             self.log_channel_notes(&notes);
+            // A strong station near the pitch drags along weak phantom
+            // channels (its clicks or sidebands) that decode as junk: when
+            // a channel there reads well, leave the dimmed ones out of the
+            // conversation. (Both sides of a real QSO normally read well.)
+            let pitch = self.pitch();
+            let near = |c: &&cwskimmer::skimmer::ChannelInfo| (c.freq - pitch).abs() <= 75.0;
+            let clean_near = self.snap.channels.iter().filter(near).any(|c| !c.doubtful);
             for ev in &events {
+                let doubtful = self.snap.channels.iter().find(|c| c.id == ev.channel).is_some_and(|c| c.doubtful);
+                if clean_near && doubtful {
+                    continue;
+                }
                 self.qso_feed(ev.freq, &ev.text);
             }
             self.tag_channels(events.iter().map(|e| e.channel).collect());
