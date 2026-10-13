@@ -2,7 +2,7 @@
 name = "cwskimmer"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-channel CW (Morse) skimmer with probabilistic decoding and CAT radio control"
+description = "CW (Morse) skimmer with probabilistic decoding and CAT radio control"
 license = "GPL-3.0-or-later"
 default-run = "cwskimmer"
 
