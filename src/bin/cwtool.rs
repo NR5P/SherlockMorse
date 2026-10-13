@@ -187,7 +187,8 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(r) = reference {
-                let r = String::from_utf8_lossy(&std::fs::read(r)?).into_owned();
+                // ARRL transcripts are Windows-1252 with 0x89 for the "=" (BT).
+                let r: String = std::fs::read(r)?.iter().map(|&b| if b == 0x89 { '=' } else { b as char }).collect();
                 let r = normalize_ref(&r);
                 let c = synth::cer(&r, &best);
                 println!("\nCER vs reference (longest channel): {:.1}%", c * 100.0);

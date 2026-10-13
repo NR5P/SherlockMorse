@@ -669,7 +669,7 @@ impl BeamDecoder {
                     t.cgap += a * (s - t.cgap);
                 }
                 t.egap = t.egap.clamp(t.dot * 0.5, t.dot * 2.0);
-                t.cgap = t.cgap.clamp(t.dot * 2.0, t.dot * 15.0);
+                t.cgap = t.cgap.clamp(t.dot * 2.0, t.dot * 25.0);
             }
             Run::Flush => {}
         }
@@ -842,7 +842,7 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     // with Farnsworth spacing where gaps are far longer than 3 dots.
     let mut long: Vec<f32> = spaces.iter().copied().filter(|&s| s >= 2.0 * tm.egap.max(dot)).collect();
     if let Some(v) = early_cgap(&mut long, tm.dot) {
-        tm.cgap = v.clamp(tm.dot * 2.0, tm.dot * 15.0);
+        tm.cgap = v.clamp(tm.dot * 2.0, tm.dot * 25.0);
     }
     Some(tm)
 }
@@ -1370,7 +1370,7 @@ impl CwDecoder {
                     // (Farnsworth); trust the spacing statistics.
                     let rc = tm.cgap / b.timing.cgap;
                     if !(0.75..=1.33).contains(&rc) {
-                        b.timing.cgap = tm.cgap.clamp(b.timing.dot * 2.0, b.timing.dot * 15.0);
+                        b.timing.cgap = tm.cgap.clamp(b.timing.dot * 2.0, b.timing.dot * 25.0);
                     }
                 }
             }
@@ -1407,7 +1407,7 @@ impl CwDecoder {
             // with a heavy fist), as long as the lower cluster is not
             // just element gaps.
             if c > 1.5 * t.egap.max(0.7 * t.dot) {
-                t.cgap = c.clamp(t.dot * 2.0, t.dot * 15.0);
+                t.cgap = c.clamp(t.dot * 2.0, t.dot * 25.0);
             }
             let nominal = t.wgap() / t.wscale;
             t.wscale = (w / nominal).clamp(0.55, 1.6);

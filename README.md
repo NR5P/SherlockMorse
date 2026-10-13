@@ -169,9 +169,10 @@ signals from about 0 % to about 20 %, so the text prediction matters. At
 
 | Recording | Result |
 |---|---|
-| ARRL W1AW code practice, 15 WPM (published transcript) | 1.8 % CER |
-| ARRL W1AW code practice, 20 WPM | 0.0 % CER |
-| ARRL W1AW code practice, 25 WPM | 0.0 % CER |
+| ARRL W1AW code practice, 20 / 25 / 30 / 35 / 40 WPM (published transcripts) | 0.0 % CER at every speed |
+| ARRL W1AW code practice, 5 / 7.5 / 10 / 13 / 15 / 18 WPM (Farnsworth) | 2.1 / 1.8 / 1.1 / 0.9 / 0.4 / 0.1 % CER, nearly all of it `<AS>`/`<AR>` prosigns that are sent but missing from the transcripts |
+| W1AW fast code practice received off the air on 20 m (30-35 WPM) | ~1,400 characters copied with a handful of errors |
+| 49 WPM ragchew received on 40 m | nearly perfect; remaining "errors" are the operator's own keying slips |
 | DARC "Morse class on the air" (real HF reception, several stations) | main text copied, e.g. "…NASAL BONES WERE A UNIQUE FEATURE OF TYRANNOSAURIDS…"; some noise channels remain in the hiss |
 
 W1AW files come from <https://www.arrl.org/code-practice-files>. To check
