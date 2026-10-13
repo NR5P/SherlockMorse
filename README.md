@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo/sherlock-morse-logo.svg" alt="Sherlock Morse: CW skimmer" width="720"></p>
 
-# CW Skimmer (Rust)
+# Sherlock Morse
 
 A cross-platform, multi-channel CW (Morse code) skimmer in the spirit of
 VE3NEA's CW Skimmer. It finds **every CW signal in your receiver's audio
