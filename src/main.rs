@@ -1902,11 +1902,27 @@ fn colormap(v: f32) -> Color32 {
     Color32::WHITE
 }
 
+/// The Sherlock Morse window icon (rendered from docs/logo/sherlock-morse-icon-strong.svg).
+fn app_icon() -> Option<egui::IconData> {
+    let mut reader = png::Decoder::new(&include_bytes!("../assets/icon-256.png")[..]).read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Some(egui::IconData { rgba: buf, width: info.width, height: info.height })
+}
+
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_min_inner_size([800.0, 500.0]).with_title("CW Skimmer"),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]).with_min_inner_size([800.0, 500.0]).with_title("Sherlock Morse")
+        // Wayland ignores window icons and takes the one from cwskimmer.desktop, matched by
+        // this id. It is also eframe's settings key; "cwskimmer" keeps the existing settings.
+        .with_app_id("cwskimmer");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("CW Skimmer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 

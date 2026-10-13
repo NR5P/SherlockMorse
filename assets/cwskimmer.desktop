@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sherlock Morse
+Comment=Multi-channel CW skimmer
+Exec=/home/thinkpad/CwSkimmer/target/release/cwskimmer
+Path=/home/thinkpad/CwSkimmer
+Icon=sherlock-morse
+Terminal=false
+Categories=HamRadio;AudioVideo;
+StartupWMClass=cwskimmer
