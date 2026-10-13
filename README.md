@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo/sherlock-morse-logo.svg" alt="Sherlock Morse: CW skimmer" width="720"></p>
+
 # CW Skimmer (Rust)
 
 A cross-platform, multi-channel CW (Morse code) skimmer in the spirit of
