@@ -2,11 +2,12 @@
 
 # Sherlock Morse
 
-A cross-platform CW (Morse code) skimmer. It finds **every CW signal in your receiver's audio
+A CW (Morse code) skimmer for Linux. It finds **every CW signal in your receiver's audio
 passband**, decodes them all at the same time, pulls out callsigns, and can
 retune your radio over CAT with a click.
 
-Runs on Linux, Windows and macOS (single native binary, no runtime needed).
+Runs on Linux as a single native binary, no runtime needed. It has only been
+tested on Linux so far.
 
 ## Features
 
@@ -66,10 +67,7 @@ Runs on Linux, Windows and macOS (single native binary, no runtime needed).
 
 1. Connect the radio's rear **USB** port to the computer. That one cable
    carries both the sound card and the CAT port.
-   - **Windows**: install the Yaesu "Virtual COM Port" (Silicon Labs
-     CP210x) driver. Two COM ports appear; use the **Enhanced** COM port
-     for CAT.
-   - **Linux**: you get `/dev/ttyUSB0` (Enhanced/CAT) and `/dev/ttyUSB1`.
+   - You get `/dev/ttyUSB0` (Enhanced/CAT) and `/dev/ttyUSB1`.
      Add yourself to the `dialout` group (`sudo usermod -aG dialout $USER`,
      then log out and back in).
 2. Radio menus (press and hold MENU):
@@ -97,14 +95,12 @@ Runs on Linux, Windows and macOS (single native binary, no runtime needed).
 Install Rust from <https://rustup.rs>, then:
 
 ```bash
-# Linux only: system libraries
+# system libraries
 sudo apt install build-essential pkg-config libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
 
 cargo build --release
 ./target/release/cwskimmer
 ```
-
-On Windows and macOS, `cargo build --release` is all you need.
 
 ## Command-line tool
 
