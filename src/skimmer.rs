@@ -76,10 +76,17 @@ pub struct Channel {
     call_counts: HashMap<String, u32>,
     prev_word: String,
     frames: Vec<Complex32>,
-    /// Baseband frames since the channel was created, kept until the
-    /// decoder knows the speed: then they are decoded again through the
-    /// narrow speed-matched filter (see `redecode_start`).
+    /// Speed-matched filter (I, Q, bandwidth) applied after the fixed
+    /// 100 Hz demodulator, so the unfiltered frames stay available.
+    post: Option<(Lowpass4, Lowpass4, f32)>,
+    /// Baseband frames (before the speed-matched filter) since the channel
+    /// was created, kept until it is shown: whenever the measured speed
+    /// changes, the start is decoded again with it (see `redecode_start`).
     start_frames: Option<Vec<Complex32>>,
+    /// Dot length the start was last decoded with.
+    start_dot: Option<f32>,
+    /// Length of `text` when the channel was created (revived text).
+    start_text_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -386,7 +393,7 @@ impl Skimmer {
             id,
             demod,
             decoder,
-            text: rtext,
+            text: rtext.clone(),
             created: self.time,
             last_mark: self.time,
             pinned,
@@ -397,6 +404,9 @@ impl Skimmer {
             qualified: pinned || was_revived,
             last_good: self.time,
             words: String::new(),
+            post: None,
+            start_dot: None,
+            start_text_len: rtext.len(),
             plaus: None,
             call_counts: rcalls,
             prev_word: String::new(),
@@ -516,19 +526,24 @@ impl Skimmer {
             ch.demod.process(samples, &mut ch.frames);
             ch.decoder.set_erasure(self.burst && (5..60).contains(&self.burst_hops));
             for i in 0..ch.frames.len() {
-                let z = ch.frames[i];
-                let had_speed = ch.decoder.timing().is_some();
+                let raw = ch.frames[i];
+                let z = match &mut ch.post {
+                    Some((li, lq, _)) => Complex32::new(li.process(raw.re), lq.process(raw.im)),
+                    None => raw,
+                };
                 ch.decoder.push_frame(z.norm());
                 if let Some(f) = &mut ch.start_frames {
-                    f.push(z);
-                    // Give up on very long starts (nothing that looks like
-                    // Morse for 20 s).
-                    if f.len() as f32 * ch.demod.frame_ms() > 20_000.0 {
+                    f.push(raw);
+                    // Keep the start only until the channel is shown, and
+                    // at most 20 s.
+                    if ch.qualified || f.len() as f32 * ch.demod.frame_ms() > 20_000.0 {
                         ch.start_frames = None;
                     }
                 }
-                if !had_speed && ch.decoder.timing().is_some() {
-                    Self::redecode_start(ch, params, lm);
+                if let (Some(t), Some(_)) = (ch.decoder.timing(), &ch.start_frames) {
+                    if ch.start_dot.is_none_or(|d| !(0.8..=1.25).contains(&(t.dot / d))) {
+                        Self::redecode_start(ch, params, lm);
+                    }
                 }
                 // AFC only on clean marks so it cannot wander off onto
                 // a neighbour.
@@ -555,7 +570,16 @@ impl Skimmer {
             if let Some(t) = ch.decoder.timing() {
                 // Match the filter to the keying speed.
                 let bw = (ch.decoder.params().bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);
-                ch.demod.set_bandwidth(bw);
+                let fs = 1000.0 / ch.demod.frame_ms();
+                match &mut ch.post {
+                    Some((li, lq, b)) if (bw - *b).abs() > 1.0 => {
+                        li.retune(fs, bw / 2.0);
+                        lq.retune(fs, bw / 2.0);
+                        *b = bw;
+                    }
+                    Some(_) => {}
+                    None => ch.post = Some((Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0), bw)),
+                }
             }
             let txt = ch.decoder.take_text();
             if !txt.is_empty() {
@@ -575,19 +599,16 @@ impl Skimmer {
         }
     }
 
-    /// The decoder has just measured the speed: decode the channel's start
-    /// again through the speed-matched filter. Until now it was filtered
-    /// wide (the speed was unknown), so the first characters of every
-    /// transmission were copied through several dB more noise. Nothing has
-    /// been shown yet (text starts once the speed is known), so the fresh
-    /// decoder simply replaces the old one.
+    /// The decoder has measured the speed (for the first time, or found it
+    /// different): decode the channel's start again through the filter
+    /// matched to it. Until the speed was known the start was filtered wide
+    /// (100 Hz), so the first characters of every transmission were copied
+    /// through several dB more noise, and an early speed estimate from that
+    /// noisy start can be well off. Nothing of the channel has been shown
+    /// yet, so its text so far is simply replaced.
     fn redecode_start(ch: &mut Channel, params: &DecoderParams, lm: &Arc<LanguageModel>) {
-        let Some(frames) = ch.start_frames.take() else { return };
-        let Some(t) = ch.decoder.timing() else { return };
+        let (Some(t), Some(frames)) = (ch.decoder.timing().cloned(), &ch.start_frames) else { return };
         let bw = (params.bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);
-        if bw > 0.8 * ch.demod.bandwidth {
-            return;
-        }
         let fs = 1000.0 / ch.demod.frame_ms();
         let (mut li, mut lq) = (Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0));
         let amps: Vec<f32> = frames.iter().map(|z| Complex32::new(li.process(z.re), lq.process(z.im)).norm()).collect();
@@ -598,7 +619,11 @@ impl Skimmer {
         d.seed_timing(t.clone());
         d.warmup(&amps);
         ch.decoder = d;
-        ch.demod.set_bandwidth(bw);
+        // The filter carries on from the end of the replayed start.
+        ch.post = Some((li, lq, bw));
+        ch.start_dot = Some(t.dot);
+        ch.text.truncate(ch.start_text_len);
+        ch.pending_out.clear();
     }
 
     /// Appends decoded text to a channel and publishes it once the channel
