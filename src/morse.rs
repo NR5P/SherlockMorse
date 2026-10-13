@@ -57,7 +57,12 @@ pub const TABLE: &[(u8, &str)] = &[
     (b'\'', ".----."),
     (b':', "---..."),
     (b'@', ".--.-."),
+    (BK, "-...-.-"),
 ];
+
+/// "BK" sent run together as one character (common in ragchews), stored
+/// as a control byte; the decoder emits it as the two letters.
+pub const BK: u8 = 0x02;
 
 /// Maximum number of elements in any character we decode.
 pub const MAX_ELEMS: u8 = 7;

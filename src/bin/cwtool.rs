@@ -381,6 +381,26 @@ fn cases() -> Vec<Case> {
             name: "qrn-crashes",
             make: |s| Scene { qrn_rate: 4.0, qrn_amp: 15.0, ..one(SignalSpec { text: text(s), wpm: 20.0, snr_db: 8.0, ..Default::default() }, s) },
         },
+        Case {
+            name: "rayleigh-snr0-16wpm",
+            make: |s| one(SignalSpec { text: text(s), wpm: 16.0, snr_db: 0.0, jitter: 0.08, fade_hz: 1.0, qsb_depth: 0.9, ..Default::default() }, s),
+        },
+        Case {
+            name: "rayleigh-snr-3-20wpm",
+            make: |s| one(SignalSpec { text: text(s), wpm: 20.0, snr_db: -3.0, fade_hz: 0.5, qsb_depth: 0.7, ..Default::default() }, s),
+        },
+        Case {
+            name: "rayleigh-handkey",
+            make: |s| one(SignalSpec { text: text(s), wpm: 16.0, snr_db: 2.0, jitter: 0.15, dash_ratio: 3.4, fade_hz: 2.0, qsb_depth: 0.8, ..Default::default() }, s),
+        },
+        Case {
+            name: "tight-wordgaps",
+            make: |s| one(SignalSpec { text: text(s), wpm: 20.0, snr_db: 8.0, jitter: 0.12, word_gap: 4.5, ..Default::default() }, s),
+        },
+        Case {
+            name: "wide-chargaps",
+            make: |s| one(SignalSpec { text: text(s), wpm: 22.0, snr_db: 8.0, jitter: 0.12, char_gap: 4.5, word_gap: 9.0, ..Default::default() }, s),
+        },
         Case { name: "drift+40%", make: |s| one(SignalSpec { text: text(s), wpm: 18.0, drift: 0.4, snr_db: 10.0, ..Default::default() }, s) },
         Case { name: "fast-40wpm", make: |s| one(SignalSpec { text: text(s), wpm: 40.0, snr_db: 10.0, ..Default::default() }, s) },
         Case { name: "slow-10wpm", make: |s| one(SignalSpec { text: text(s), wpm: 10.0, snr_db: 5.0, ..Default::default() }, s) },

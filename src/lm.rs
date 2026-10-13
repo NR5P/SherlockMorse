@@ -4,10 +4,15 @@
 //! ambiguous mark/space is resolved toward text that looks like real CW
 //! traffic (QSOs, contest exchanges, callsigns, plain English).
 //!
-//! The model is trained at start-up from a procedurally generated corpus so no
-//! data files need to ship with the program.
+//! The model is trained at start-up from text compiled into the program:
+//! on-air QSO traffic and plain English (`data/corpus/`), plus a
+//! procedurally generated corpus for callsigns and exchanges. A dense
+//! character trigram is extended to 5-grams (interpolated Witten-Bell
+//! smoothing) for the contexts seen in training. A vocabulary of common
+//! words is available for judging decoded text.
 
 use rand::rngs::StdRng;
+use std::collections::{HashMap, HashSet};
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
@@ -28,6 +33,45 @@ pub struct LanguageModel {
     /// log P(c | a, b), indexed [a][b][c]
     tri: Vec<f32>,
     lut: [u8; 256],
+    /// Higher orders, keyed by `key(context, c)`: log P(c | 3 or 4
+    /// preceding symbols) for continuations seen in training, and per
+    /// context the log weight given to the lower order for unseen ones.
+    hi: HashMap<u32, f32>,
+    backoff: HashMap<u32, f32>,
+    /// Known words (English, abbreviations, Q-codes, names).
+    vocab: HashSet<Vec<u8>>,
+}
+
+/// Packs up to 4 context symbols (oldest first) and the predicted symbol.
+/// Symbols are < 64; the order is in the top bits so orders cannot collide.
+#[inline]
+fn key(ctx: &[usize], c: usize) -> u32 {
+    let mut k = ctx.len() as u32;
+    for &s in ctx {
+        k = (k << 6) | s as u32;
+    }
+    (k << 6) | c as u32
+}
+
+const QSO_TEXT: &str = include_str!("../data/corpus/qso.txt");
+const ENGLISH_TEXT: &str = include_str!("../data/corpus/english.txt");
+const WORDS: &str = include_str!("../data/corpus/words.txt");
+
+/// Training text from the built-in corpora, with punctuation that is rarely
+/// keyed removed: periods become the break sign in QSOs and disappear from
+/// prose, as do commas and apostrophes.
+fn corpus_lines() -> Vec<String> {
+    let mut v = Vec::new();
+    for l in QSO_TEXT.lines() {
+        v.push(l.replace(". ", " = ").replace('.', " ").replace('\'', ""));
+    }
+    for l in ENGLISH_TEXT.lines() {
+        v.push(l.replace(['.', ',', '\''], " "));
+    }
+    v.into_iter()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 impl Default for LanguageModel {
@@ -39,15 +83,33 @@ impl Default for LanguageModel {
 impl LanguageModel {
     /// Builds the model from the built-in corpus.
     pub fn new() -> Self {
-        let corpus = generate_corpus(400_000, 0xC0FFEE);
-        Self::train(&corpus)
+        let mut train = generate_corpus(300_000, 0xC0FFEE);
+        let mut held = generate_corpus(20_000, 0xBEEF);
+        for (i, l) in corpus_lines().iter().enumerate() {
+            // Every 20th line is held out to measure the per-character cost.
+            let t = if i % 20 == 7 { &mut held } else { &mut train };
+            t.push(' ');
+            t.push_str(l);
+        }
+        let mut m = Self::train(&train);
+        m.char_bonus = m.cross_entropy(&held);
+        m.vocab = WORDS.lines().map(|w| w.trim().as_bytes().to_vec()).filter(|w| !w.is_empty()).collect();
+        m
     }
 
     /// A model that assigns uniform probabilities (disables prediction).
     pub fn uniform() -> Self {
         let n = ALPHABET.len();
         let v = -(n as f32).ln();
-        Self { n, char_bonus: -v, tri: vec![v; n * n * n], lut: make_lut() }
+        Self {
+            n,
+            char_bonus: -v,
+            tri: vec![v; n * n * n],
+            lut: make_lut(),
+            hi: HashMap::new(),
+            backoff: HashMap::new(),
+            vocab: HashSet::new(),
+        }
     }
 
     pub fn train(corpus: &str) -> Self {
@@ -88,12 +150,102 @@ impl LanguageModel {
                 }
             }
         }
-        let mut ce = 0.0f64;
-        for i in 2..bytes.len() {
-            ce -= out[(bytes[i - 2] * n + bytes[i - 1]) * n + bytes[i]] as f64;
+        let mut m = Self { n, char_bonus: 0.0, tri: out, lut, hi: HashMap::new(), backoff: HashMap::new(), vocab: HashSet::new() };
+        m.train_high(&bytes);
+        m.char_bonus = m.cross_entropy(corpus);
+        m
+    }
+
+    /// Adds orders 4 and 5 by interpolated Witten-Bell smoothing over the
+    /// trigram: P(c|h) = (C(h c) + T(h) P(c|h')) / (C(h) + T(h)), where
+    /// T(h) is the number of distinct symbols seen after h.
+    fn train_high(&mut self, bytes: &[usize]) {
+        for order in 3..=4usize {
+            let mut counts: HashMap<u32, u32> = HashMap::new();
+            let mut ctx_tot: HashMap<u32, (u32, u32)> = HashMap::new();
+            for i in order..bytes.len() {
+                let k = key(&bytes[i - order..i], bytes[i]);
+                let e = counts.entry(k).or_insert(0);
+                *e += 1;
+                let t = ctx_tot.entry(key(&bytes[i - order..i], 0)).or_insert((0, 0));
+                t.0 += 1;
+                if *e == 1 {
+                    t.1 += 1;
+                }
+            }
+            let mut probs = Vec::with_capacity(counts.len());
+            for (&k, &c) in &counts {
+                let sym = (k & 63) as usize;
+                let ctx = unpack(k >> 6, order);
+                let (tot, types) = ctx_tot[&key(&ctx, 0)];
+                let lower = self.logp_ctx(&ctx[1..], sym).exp() as f64;
+                let p = (c as f64 + types as f64 * lower) / (tot + types) as f64;
+                probs.push((k, p.ln() as f32));
+            }
+            for (k, lp) in probs {
+                self.hi.insert(k, lp);
+            }
+            for (k, (tot, types)) in ctx_tot {
+                self.backoff.insert(k, (types as f64 / (tot + types) as f64).ln() as f32);
+            }
         }
-        let char_bonus = (ce / (bytes.len().max(3) - 2) as f64) as f32;
-        Self { n, char_bonus, tri: out, lut }
+    }
+
+    /// log P(c | ctx) for up to 4 context symbols (oldest first).
+    fn logp_ctx(&self, ctx: &[usize], c: usize) -> f32 {
+        if ctx.len() <= 2 {
+            let (a, b) = match ctx {
+                [a, b] => (*a, *b),
+                [b] => (0, *b),
+                _ => (0, 0),
+            };
+            return self.tri[(a * self.n + b) * self.n + c];
+        }
+        if let Some(&lp) = self.hi.get(&key(ctx, c)) {
+            return lp;
+        }
+        let bo = self.backoff.get(&key(ctx, 0)).copied().unwrap_or(0.0);
+        bo + self.logp_ctx(&ctx[1..], c)
+    }
+
+    /// log P(c | the four preceding characters, oldest first). The 5-gram
+    /// is mixed half and half with the trigram: the corpus is small and
+    /// repetitive, so on its own it is far too sure that text it has not
+    /// seen (an unusual name, a callsign) is wrong.
+    #[inline]
+    pub fn logp4(&self, ctx: &[u8; 4], c: u8) -> f32 {
+        let l = |x: u8| self.lut[x as usize] as usize;
+        let (a, b) = (l(ctx[2]), l(ctx[3]));
+        let p3 = self.tri[(a * self.n + b) * self.n + l(c)];
+        if self.hi.is_empty() {
+            return p3;
+        }
+        let p5 = self.logp_ctx(&[l(ctx[0]), l(ctx[1]), a, b], l(c));
+        let (hi, lo) = if p5 > p3 { (p5, p3) } else { (p3, p5) };
+        hi + (0.5 + 0.5 * (lo - hi).exp()).ln()
+    }
+
+    /// Average -log P per character of a text under the full model.
+    fn cross_entropy(&self, text: &str) -> f32 {
+        let b = text.as_bytes();
+        let mut ctx = [b' '; 4];
+        let mut ce = 0.0f64;
+        for &c in b {
+            let c = c.to_ascii_uppercase();
+            ce -= self.logp4(&ctx, c) as f64;
+            ctx = [ctx[1], ctx[2], ctx[3], c];
+        }
+        (ce / b.len().max(1) as f64) as f32
+    }
+
+    /// True if the word is in the vocabulary.
+    pub fn is_word(&self, w: &[u8]) -> bool {
+        self.vocab.contains(w)
+    }
+
+    /// True if a model with a vocabulary was loaded.
+    pub fn has_vocab(&self) -> bool {
+        !self.vocab.is_empty()
     }
 
     /// log P(c | a b) where a, b, c are ASCII characters.
@@ -105,18 +257,19 @@ impl LanguageModel {
         self.tri[(ia * self.n + ib) * self.n + ic]
     }
 
-    /// Average log-probability per character of a string (for diagnostics).
+    /// Average log-probability per character of a string.
     pub fn score(&self, text: &str) -> f32 {
-        let b = text.as_bytes();
-        let mut tot = 0.0;
-        let (mut a, mut p) = (b' ', b' ');
-        for &c in b {
-            tot += self.logp(a, p, c);
-            a = p;
-            p = c;
-        }
-        tot / b.len().max(1) as f32
+        -self.cross_entropy(text)
     }
+}
+
+fn unpack(mut k: u32, order: usize) -> Vec<usize> {
+    let mut v = vec![0usize; order];
+    for i in (0..order).rev() {
+        v[i] = (k & 63) as usize;
+        k >>= 6;
+    }
+    v
 }
 
 fn make_lut() -> [u8; 256] {

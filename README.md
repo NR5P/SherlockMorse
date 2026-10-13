@@ -21,16 +21,27 @@ tested on Linux so far.
     a robust maximum-likelihood search and is then tracked adaptively, which
     handles hand-key "fists", odd weighting, Farnsworth spacing and speed drift.
   - A **beam search** keeps dozens of competing interpretations alive. It
-    includes hypotheses that a mark was a static crash, or that a gap was a
-    QSB dropout in the middle of a dash.
-  - A **character trigram language model** of amateur traffic (QSOs, contest
-    exchanges, callsigns, plain English) picks the most plausible text. Text
-    is only committed once all surviving hypotheses agree on it.
+    includes hypotheses that a mark was a static crash, that a gap was a
+    QSB dropout in the middle of a dash, and that a gap hides a dit too
+    faded to cross the threshold.
+  - **Soft decisions:** every mark and gap carries its amplitude evidence,
+    so those hypotheses are cheap when the envelope was ambiguous and
+    expensive when it was clear.
+  - Each sender's **word spacing** is learned from their gaps, so operators
+    who run words together or spread letters apart are followed.
+  - A **character 5-gram language model** of amateur traffic (QSOs, contest
+    exchanges, callsigns, plain English), trained on built-in text in
+    `data/corpus/`, picks the most plausible text. Text is only committed
+    once all surviving hypotheses agree on it. Run-together `BK` is
+    recognised.
 - **Waterfall** with callsign labels on each signal. Click a signal to follow
   it; double-click or right-click to tune the radio to it; the mouse wheel
   tunes ±50 Hz.
 - **Spots list** of callsigns heard (after `DE`/`CQ`, or seen twice), with RF
-  frequency, speed and SNR. Click a spot's frequency to tune to it.
+  frequency, speed and SNR. Click a spot's frequency to tune to it. Calls
+  need a valid DXCC prefix; calls heard only once are dimmed until
+  confirmed. A near miss of a call already confirmed on that signal (a dit
+  lost in a fade, e.g. T8AE for N8AE) is corrected to that call.
 - **Country of every spot**, from AD1C's `cty.dat` (the file loggers use),
   built in so it works offline. Hover a spot's country for continent, CQ/ITU
   zone, local time and beam heading. Portable calls are handled (`DL/W1ABC`,
@@ -123,23 +134,31 @@ cwtool cty DL/W1ABC VP8LP           # DXCC country, zones and position of calls
 
 `cwtool bench` runs the full skimmer (detection plus decoding) on synthetic
 signals with realistic impairments. The score is character error rate
-(Levenshtein distance); SNR is measured in a 2500 Hz bandwidth.
+(Levenshtein distance), averaged over 24 trials; SNR is measured in a
+2500 Hz bandwidth. "Rayleigh" scenarios use random multipath fading like
+real skywave QSB (deep, irregular fades), not a slow sine.
 
 | Scenario | CER |
 |---|---|
 | Clean, 20 WPM | 0.0 % |
-| SNR +5 dB, 25 WPM | 0.0 % |
-| SNR 0 dB, 22 WPM | 0.8 % |
-| SNR −4 dB, 18 WPM | ~15 % |
-| Hand key, 15 % timing jitter | 0.7 % |
-| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 7.3 % |
-| Farnsworth 18/8 WPM | 3.3 % |
-| Deep QSB (−16 dB fades) | 22 % |
-| Static crashes (QRN) | 1.6 % |
+| SNR +5 dB, 25 WPM | 0.2 % |
+| SNR 0 dB, 22 WPM | 0.6 % |
+| SNR −4 dB, 18 WPM | 2.1 % |
+| SNR −8 dB, 18 WPM | 47 % |
+| Hand key, 15 % timing jitter | 0.6 % |
+| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 18 % |
+| Farnsworth 18/8 WPM | 5.1 % |
+| Deep periodic QSB | 1.8 % |
+| Rayleigh fading, SNR 0 dB, 16 WPM, 1 Hz | 5.7 % |
+| Rayleigh fading, SNR −3 dB, 20 WPM | 5.8 % |
+| Rayleigh fading + hand key | 1.4 % |
+| Words run together (4.5-dot word gaps) | 2.9 % |
+| Letters spread apart (4.5-dot character gaps) | 0.3 % |
+| Static crashes (QRN) | 0.6 % |
 | Speed drifting +40 % | 0.0 % |
 | 40 WPM / 10 WPM | 0.0 % / 0.0 % |
-| Random 5-letter groups (LM can't help) | 0.0 % |
-| 5-station pileup, 80–240 Hz apart | 0.4 % |
+| Random 5-letter groups (LM can't help) | 1.7 % |
+| 5-station pileup, 80–240 Hz apart | 1.7 % |
 
 Turning the language model off (`--compare-lm`) raises the error rate on clean
 signals from about 0 % to about 20 %, so the text prediction matters. At
@@ -150,8 +169,8 @@ signals from about 0 % to about 20 %, so the text prediction matters. At
 | Recording | Result |
 |---|---|
 | ARRL W1AW code practice, 15 WPM (published transcript) | 1.8 % CER |
-| ARRL W1AW code practice, 20 WPM | 0.1 % CER |
-| ARRL W1AW code practice, 25 WPM | 0.1 % CER |
+| ARRL W1AW code practice, 20 WPM | 0.0 % CER |
+| ARRL W1AW code practice, 25 WPM | 0.0 % CER |
 | DARC "Morse class on the air" (real HF reception, several stations) | main text copied, e.g. "…NASAL BONES WERE A UNIQUE FEATURE OF TYRANNOSAURIDS…"; some noise channels remain in the hiss |
 
 W1AW files come from <https://www.arrl.org/code-practice-files>. To check
@@ -164,7 +183,12 @@ them yourself, run `cwtool decode <mp3> --reference <txt>`.
 - Long broadband static crashes are treated as erasures, not as keying.
 - A channel only shows text once it looks like Morse rather than noise:
   enough elements per character and enough dashes, since noise decodes as
-  E/I/S/H.
+  E/I/S/H. Text the language model finds implausible is shown dimmed;
+  only text that is both implausible and made of short characters (the
+  signature of noise) is hidden, so weak real signals and code groups stay
+  visible.
+- Two channels of similar strength close together that key in step are
+  the same signal picked up twice; the weaker one is dropped.
 - A station that pauses and comes back on the same frequency continues in
   the same row.
 
@@ -174,14 +198,14 @@ them yourself, run `cwtool decode <mp3> --reference <txt>`.
 sound card / file ─► resampler (8 kHz) ─► FFT 512 ─► waterfall + signal detector
                                      │
                                      └─► per signal: mixer ─► 4th-order LPF (matched to speed, AFC)
-                                              ─► envelope ─► adaptive slicer ─► mark/space runs
-                                              ─► timing model + beam search + trigram LM ─► text ─► callsigns
+                                              ─► envelope ─► adaptive slicer ─► mark/space runs + amplitude evidence
+                                              ─► timing model + beam search + 5-gram LM ─► text ─► callsigns
 ```
 
 | Module | Purpose |
 |---|---|
 | `src/decoder.rs` | slicer, timing model, beam-search decoder |
-| `src/lm.rs` | trigram language model (trained at start-up from a generated corpus) |
+| `src/lm.rs` | 5-gram language model (trained at start-up from `data/corpus/` and a generated corpus) |
 | `src/cty.rs` | DXCC country lookup from `data/cty.dat` |
 | `src/skimmer.rs` | signal detection, channel lifecycle, spots |
 | `src/dsp/` | resampler, channel demodulator, spectrum |

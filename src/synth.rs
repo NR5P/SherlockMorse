@@ -19,6 +19,10 @@ pub struct SignalSpec {
     pub jitter: f32,
     /// Dash length in dots (3.0 nominal).
     pub dash_ratio: f32,
+    /// Character and word gaps in dots (3 and 7 nominal; hand senders
+    /// often squeeze words together or spread letters apart).
+    pub char_gap: f32,
+    pub word_gap: f32,
     /// Mark weighting: >1 lengthens marks and shortens spaces.
     pub weight: f32,
     /// Farnsworth overall speed (stretches character/word gaps).
@@ -28,6 +32,10 @@ pub struct SignalSpec {
     /// Fading depth 0..1 and rate in Hz.
     pub qsb_depth: f32,
     pub qsb_hz: f32,
+    /// Random (Rayleigh) fading Doppler spread in Hz; 0 = periodic QSB
+    /// above. With it, `qsb_depth` is the scattered fraction of the power
+    /// (1 = pure Rayleigh, deep random fades as on real skywave paths).
+    pub fade_hz: f32,
     /// Start time in seconds.
     pub start: f32,
     /// Rise/fall time (ms).
@@ -43,11 +51,14 @@ impl Default for SignalSpec {
             snr_db: 10.0,
             jitter: 0.0,
             dash_ratio: 3.0,
+            char_gap: 3.0,
+            word_gap: 7.0,
             weight: 1.0,
             farnsworth_wpm: None,
             drift: 0.0,
             qsb_depth: 0.0,
             qsb_hz: 0.2,
+            fade_hz: 0.0,
             start: 0.5,
             rise_ms: 5.0,
         }
@@ -99,9 +110,9 @@ pub fn timeline(spec: &SignalSpec, rng: &mut StdRng) -> Vec<(bool, f32)> {
             };
             let wshift = (spec.weight - 1.0) * dot * 0.5;
             if ci > 0 {
-                out.push((false, (3.0 * gap_unit - wshift) * j(rng)));
+                out.push((false, (spec.char_gap * gap_unit - wshift) * j(rng)));
             } else if wi > 0 {
-                out.push((false, (7.0 * gap_unit - wshift) * j(rng)));
+                out.push((false, (spec.word_gap * gap_unit - wshift) * j(rng)));
             }
             let Some(pat) = pattern_for(c) else { continue };
             for (ei, e) in pat.bytes().enumerate() {
@@ -168,12 +179,28 @@ pub fn render(scene: &Scene) -> Vec<f32> {
         }
         let phase0: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
         let qsb_phase: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+        // Sum-of-sinusoids Rayleigh fading (Jakes): random arrival angles
+        // and phases give a complex gain with unit mean power.
+        let paths: Vec<(f32, f32, f32)> = (0..16)
+            .map(|_| {
+                let ang: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+                (s.fade_hz * ang.cos(), rng.gen_range(0.0..std::f32::consts::TAU), rng.gen_range(0.0..std::f32::consts::TAU))
+            })
+            .collect();
         for i in 0..n {
             if acc[i] == 0.0 {
                 continue;
             }
             let tt = i as f32 / fs;
-            let fade = if s.qsb_depth > 0.0 {
+            let fade = if s.fade_hz > 0.0 {
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                for &(f, p1, p2) in &paths {
+                    re += (std::f32::consts::TAU * f * tt + p1).cos();
+                    im += (std::f32::consts::TAU * f * tt + p2).cos();
+                }
+                let scat = (re * re + im * im) / (2.0 * paths.len() as f32 / 2.0);
+                ((1.0 - s.qsb_depth) + s.qsb_depth * scat).sqrt()
+            } else if s.qsb_depth > 0.0 {
                 1.0 - s.qsb_depth * (0.5 + 0.5 * (std::f32::consts::TAU * s.qsb_hz * tt + qsb_phase).sin())
             } else {
                 1.0

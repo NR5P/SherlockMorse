@@ -69,6 +69,9 @@ pub struct Channel {
     /// fresh, so lifetime is based on this instead).
     last_good: f64,
     words: String,
+    /// Language-model plausibility of the recent text (see
+    /// [`text_plausibility`]), once there is enough of it.
+    plaus: Option<f32>,
     call_counts: HashMap<String, u32>,
     prev_word: String,
     frames: Vec<Complex32>,
@@ -88,6 +91,8 @@ pub struct ChannelInfo {
     pub callsign: Option<String>,
     /// Timing-fit score (0..1): how well the keying matches Morse timing.
     pub fit: f32,
+    /// The text reads poorly (likely weak or garbled): shown dimmed.
+    pub doubtful: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +104,9 @@ pub struct Spot {
     pub time: f64,
     pub channel: u64,
     pub count: u32,
+    /// Heard at least twice on its channel (a single sighting, even after
+    /// DE, may be a decoding error).
+    pub confirmed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +170,59 @@ const MIN_QUALITY: f32 = 1.8;
 /// short, so noise decodes almost entirely as dots (E I S H 5); real text
 /// is ~35-45 % dashes.
 const MIN_DASH_FRAC: f32 = 0.22;
+
+/// Below this plausibility a channel's text is junk and the channel is
+/// hidden; below `DOUBTFUL_PLAUS` it is shown dimmed. Measured on live
+/// logs: clean QSO text -1 to -2.5, garbled but real -2.4 to -3.1, noise
+/// decoded as text -2.8 to -3.6 (the bands overlap, so only clear junk is
+/// hidden). Code groups (random characters, as in practice traffic) are
+/// implausible too but made of long characters, while noise decodes as
+/// short ones; only text below `JUNK_MAX_ELEMS` elements per character is
+/// hidden for implausibility.
+const MIN_PLAUS: f32 = -3.15;
+const JUNK_MAX_ELEMS: f32 = 3.3;
+const DOUBTFUL_PLAUS: f32 = -2.75;
+
+/// Mean language-model log-probability per character of the last ~100
+/// characters, ignoring callsigns (random letter strings by nature). None
+/// until there are 30 characters to judge.
+pub fn text_plausibility(lm: &LanguageModel, text: &str) -> Option<f32> {
+    let start = text.len().saturating_sub(100);
+    let tail = text.get(start..).unwrap_or(text);
+    // The first word may be cut.
+    let mut words = tail.split_whitespace();
+    if start > 0 {
+        words.next();
+    }
+    let kept: Vec<&str> = words.filter(|w| parse_callsign(w).is_none()).collect();
+    let k = kept.join(" ");
+    (k.len() >= 30).then(|| lm.score(&format!(" {k} ")))
+}
+
+/// Replaces near-miss decodes of a callsign confirmed on this channel
+/// (a dit lost or gained in a fade) with the call itself.
+fn snap_calls(text: &str, calls: &HashMap<String, u32>) -> String {
+    let confirmed: Vec<&String> = calls.iter().filter(|(_, &n)| n >= 2).map(|(c, _)| c).collect();
+    if confirmed.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, w) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let near: Vec<&&String> = if w.len() >= 3 && !confirmed.iter().any(|c| c.as_str() == w) {
+            confirmed.iter().filter(|c| crate::callsign::morse_distance(c, w) == 1).collect()
+        } else {
+            Vec::new()
+        };
+        match near.as_slice() {
+            [c] => out.push_str(c),
+            _ => out.push_str(w),
+        }
+    }
+    out
+}
 
 /// Text statistics over the last 40 characters (ignoring spaces): mean Morse
 /// elements per character, fraction of dashes, and characters considered.
@@ -324,6 +385,7 @@ impl Skimmer {
             qualified: pinned || was_revived,
             last_good: self.time,
             words: String::new(),
+            plaus: None,
             call_counts: rcalls,
             prev_word: String::new(),
             frames: Vec::new(),
@@ -461,7 +523,7 @@ impl Skimmer {
             }
             let txt = ch.decoder.take_text();
             if !txt.is_empty() {
-                Self::deliver(ch, &txt, now, false, &mut self.events, &mut self.spots);
+                Self::deliver(ch, &txt, now, false, &self.lm, &mut self.events, &mut self.spots);
             }
         }
         self.time += samples.len() as f64 / RATE as f64;
@@ -473,13 +535,15 @@ impl Skimmer {
         for ch in &mut self.channels {
             ch.decoder.finish();
             let txt = ch.decoder.take_text();
-            Self::deliver(ch, &txt, self.time, true, &mut self.events, &mut self.spots);
+            Self::deliver(ch, &txt, self.time, true, &self.lm, &mut self.events, &mut self.spots);
         }
     }
 
     /// Appends decoded text to a channel and publishes it once the channel
     /// looks like real Morse rather than noise or an artefact.
-    fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+    fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, lm: &LanguageModel, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+        let snapped = snap_calls(txt, &ch.call_counts);
+        let txt = snapped.as_str();
         ch.text.push_str(txt);
         if ch.text.len() > 4000 {
             let cut = ch.text.len() - 3000;
@@ -494,8 +558,9 @@ impl Skimmer {
         // rather than noise, which decodes as dot-only characters (E I S H 5).
         let (fit, runs) = ch.decoder.fit();
         let (el, dash, n) = text_quality(&ch.text);
+        ch.plaus = text_plausibility(lm, &ch.text);
         let text_ok = if n >= 8 {
-            el >= MIN_QUALITY && dash >= MIN_DASH_FRAC
+            el >= MIN_QUALITY && dash >= MIN_DASH_FRAC && (el >= JUNK_MAX_ELEMS || ch.plaus.is_none_or(|p| p >= MIN_PLAUS))
         } else {
             n >= 3 && dash >= 0.2
         };
@@ -551,9 +616,21 @@ impl Skimmer {
             if w.is_empty() {
                 continue;
             }
-            if let Some(call) = parse_callsign(&w) {
+            if let Some(call) = parse_callsign(&w).filter(|c| crate::callsign::valid_prefix(c)) {
+                // A near miss of a call already confirmed here, or spotted
+                // elsewhere, counts toward that call.
+                let near = |c: &str| c != call && crate::callsign::morse_distance(c, &call) == 1;
+                let call = ch
+                    .call_counts
+                    .iter()
+                    .filter(|(c, &n)| n >= 2 && near(c))
+                    .max_by_key(|(_, &n)| n)
+                    .map(|(c, _)| c.clone())
+                    .or_else(|| spots.iter().filter(|s| s.confirmed && near(&s.call)).max_by_key(|s| s.count).map(|s| s.call.clone()))
+                    .unwrap_or(call);
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
+                let confirmed = *n >= 2;
                 let strong_ctx = matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
                 if *n >= 2 || strong_ctx {
                     let wpm = ch.decoder.wpm().unwrap_or(0.0);
@@ -566,8 +643,9 @@ impl Skimmer {
                         s.time = now;
                         s.channel = ch.id;
                         s.count += 1;
+                        s.confirmed |= confirmed;
                     } else {
-                        spots.push(Spot { call, freq: f, wpm, snr_db: snr, time: now, channel: ch.id, count: 1 });
+                        spots.push(Spot { call, freq: f, wpm, snr_db: snr, time: now, channel: ch.id, count: 1, confirmed });
                     }
                 }
             }
@@ -704,7 +782,7 @@ impl Skimmer {
         let mut dead = vec![false; n];
         for (si, strong) in self.channels.iter().enumerate() {
             let len = strong.marks.len();
-            if len < 500 {
+            if len < 500 || dead[si] {
                 continue;
             }
             // Dilate the strong channel's marks by ±20 ms (key-click edges).
@@ -715,7 +793,12 @@ impl Skimmer {
             let r = 10usize;
             let dil = |i: usize| pre[(i + r + 1).min(len)] > pre[i.saturating_sub(r)];
             for (wi, weak) in self.channels.iter().enumerate() {
-                if wi == si || dead[wi] || weak.pinned || strong.level_db < weak.level_db + 10.0 {
+                // A nearby channel of similar strength may be the same signal
+                // picked up twice (both inside its skirt); it must then key
+                // in step with it.
+                let df = (strong.demod.freq - weak.demod.freq).abs() as f32;
+                let twin = df < 80.0 && strong.level_db >= weak.level_db;
+                if wi == si || dead[wi] || weak.pinned || (!twin && strong.level_db < weak.level_db + 10.0) {
                     continue;
                 }
                 let wl = weak.marks.len().min(len);
@@ -737,7 +820,8 @@ impl Skimmer {
                 if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
                     eprintln!("    corr {corr:.2}");
                 }
-                if tot >= 100 && (inside as f32 > 0.92 * tot as f32 || corr > 0.5) {
+                let much_stronger = strong.level_db >= weak.level_db + 10.0;
+                if tot >= 100 && ((much_stronger && (inside as f32 > 0.92 * tot as f32 || corr > 0.5)) || (twin && corr > 0.7)) {
                     dead[wi] = true;
                 }
             }
@@ -857,6 +941,7 @@ impl Skimmer {
                     last_mark_age: (self.time - c.last_mark) as f32,
                     callsign,
                     fit: c.decoder.fit().0,
+                    doubtful: c.plaus.is_some_and(|p| p < DOUBTFUL_PLAUS),
                 }
             })
             .collect();

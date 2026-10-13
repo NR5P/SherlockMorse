@@ -19,7 +19,7 @@
 //!    once all surviving hypotheses agree on it.
 
 use crate::lm::LanguageModel;
-use crate::morse::{can_extend, MorseLookup, ERROR};
+use crate::morse::{can_extend, MorseLookup, BK, ERROR};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -51,6 +51,15 @@ pub struct DecoderParams {
     /// Flicker shorter than this fraction of a dot is ignored (once the
     /// speed is known).
     pub debounce: f32,
+    /// Weight of the amplitude evidence of a run (soft decision): the cost
+    /// of calling a mark noise, or a space a fade inside an element, is
+    /// this times how far (in noise standard deviations, integrated over
+    /// the run in dot units) the envelope sat on the run's side of the
+    /// threshold.
+    pub soft_weight: f32,
+    /// Log-probability penalty for finding an element hidden in a space
+    /// (a dit too faded to cross the threshold), before its evidence.
+    pub insert_penalty: f32,
 }
 
 impl DecoderParams {
@@ -77,6 +86,8 @@ impl DecoderParams {
                     "sig_track" => p.sig_track = v,
                     "sig_attack" => p.sig_attack = v,
                     "debounce" => p.debounce = v,
+                    "soft_weight" => p.soft_weight = v,
+                    "insert_penalty" => p.insert_penalty = v,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -88,12 +99,12 @@ impl DecoderParams {
 impl Default for DecoderParams {
     fn default() -> Self {
         Self {
-            lm_weight: 0.7,
+            lm_weight: 0.5,
             beam_width: 48,
             sigma_mark: 0.30,
             sigma_space: 0.38,
-            blip_penalty: -5.0,
-            dropout_penalty: -5.0,
+            blip_penalty: -2.0,
+            dropout_penalty: -2.0,
             squelch_open: 2.3,
             squelch_close: 1.9,
             threshold: 0.5,
@@ -102,6 +113,8 @@ impl Default for DecoderParams {
             sig_track: 0.02,
             sig_attack: 0.01,
             debounce: 0.24,
+            soft_weight: 0.7,
+            insert_penalty: -4.0,
         }
     }
 }
@@ -113,15 +126,19 @@ pub struct TimingModel {
     pub dash: f32,
     pub egap: f32,
     pub cgap: f32,
+    /// This sender's word gap relative to the nominal one (7/3 of the
+    /// character gap), learned from the gaps read as word gaps. Hand
+    /// senders often run words together or spread them apart.
+    pub wscale: f32,
 }
 
 impl TimingModel {
     fn from_dot(dot: f32) -> Self {
-        Self { dot, dash: 3.0 * dot, egap: dot, cgap: 3.0 * dot }
+        Self { dot, dash: 3.0 * dot, egap: dot, cgap: 3.0 * dot, wscale: 1.0 }
     }
     pub fn wgap(&self) -> f32 {
         // Word gaps scale with character gaps (keeps Farnsworth consistent).
-        (self.cgap * 7.0 / 3.0).max(self.dot * 5.0)
+        (self.cgap * 7.0 / 3.0).max(self.dot * 5.0) * self.wscale
     }
     pub fn wpm(&self) -> f32 {
         1200.0 / self.dot
@@ -149,12 +166,12 @@ struct Hyp {
     len: u8,
     pend_mark: f32,
     pend_space: f32,
-    ctx: [u8; 2],
+    ctx: [u8; 4],
     out: Vec<u8>,
 }
 
 impl Hyp {
-    fn key(&self) -> (u8, u8, u16, u16, [u8; 2]) {
+    fn key(&self) -> (u8, u8, u16, u16, [u8; 4]) {
         (
             self.bits,
             self.len,
@@ -195,7 +212,7 @@ impl BeamDecoder {
     }
 
     fn root() -> Hyp {
-        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' ', b' '], out: Vec::new() }
+        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' '; 4], out: Vec::new() }
     }
 
     /// Takes text committed so far.
@@ -233,13 +250,13 @@ impl BeamDecoder {
             // Not in the language model: a fixed, fairly rare cost. It ends
             // the word, and the next word starts with fresh context.
             h.score += self.params.lm_weight * (-4.0 + self.lm.char_bonus);
-            h.ctx = [b' ', b' '];
+            h.ctx = [b' '; 4];
             h.out.extend_from_slice(&[ERROR, b' ']);
             return;
         }
-        let lp = self.lm.logp(h.ctx[0], h.ctx[1], c);
+        let lp = self.lm.logp4(&h.ctx, c);
         h.score += self.params.lm_weight * (lp + self.lm.char_bonus);
-        h.ctx = [h.ctx[1], c];
+        h.ctx = [h.ctx[1], h.ctx[2], h.ctx[3], c];
         h.out.push(c);
     }
 
@@ -247,22 +264,179 @@ impl BeamDecoder {
     fn end_char(&self, h: &mut Hyp, word: bool) -> bool {
         if h.len > 0 {
             match self.morse.get(h.bits, h.len) {
+                Some(BK) => {
+                    self.emit(h, b'B');
+                    self.emit(h, b'K');
+                }
                 Some(c) => self.emit(h, c),
                 None => return false,
             }
             h.bits = 0;
             h.len = 0;
         }
-        if word && h.ctx[1] != b' ' {
+        if word && h.ctx[3] != b' ' {
             self.emit(h, b' ');
         }
         true
     }
 
+    /// Pushes a run with no amplitude information (as if strong).
     pub fn push(&mut self, run: Run) {
+        self.push_soft(run, None);
+    }
+
+    /// Cost (log-probability) of explaining away a run whose amplitude
+    /// evidence is `ev` (noise-sigma x ms): a mark as a noise burst, or a
+    /// space as a fade inside an element. Without evidence, falls back to
+    /// a duration-based penalty for short runs only.
+    fn explain_away(&self, base: f32, len: f32, ev: Option<f32>) -> Option<f32> {
+        let dot = self.timing.dot;
+        let ev = ev.filter(|_| self.params.soft_weight > 0.0);
+        match ev {
+            Some(e) if len < 2.0 * dot => Some(base - self.params.soft_weight * e.max(0.0) / dot),
+            None if len < 0.6 * dot => Some(base + 2.0 * (len / dot)),
+            _ => None,
+        }
+    }
+
+    /// Ways to explain a space as gap + faded element + gap: for each kind
+    /// of the gap before (element/character/word) and element (dot/dash),
+    /// the best placement as (score, length of the gap after). The score
+    /// adds the timing likelihoods to the amplitude evidence in the window
+    /// (see `prefix_above_median`: partly relative to the rest of the gap,
+    /// since in a fade the threshold lags high above a dit that is still
+    /// clearly out of the noise).
+    fn hidden_elements(&self, sp: f32, prof: &[f32]) -> Vec<(usize, bool, f32, f32)> {
+        let mut out = Vec::new();
+        let t = &self.timing;
+        let w = self.params.soft_weight;
+        if w <= 0.0 || prof.len() < 4 || sp < 2.2 * t.dot {
+            return out;
+        }
+        let fm = sp / prof.len() as f32;
+        let pre = prefix_above_median(prof);
+        for dash in [false, true] {
+            let len = if dash { t.dash } else { t.dot };
+            let wf = ((len / fm).round() as usize).max(1);
+            let min_gap = 0.5 * t.egap;
+            if sp < len + 2.0 * min_gap {
+                continue;
+            }
+            let mark_ll = self.mark_options(len)[usize::from(dash)].1;
+            let step = (wf / 4).max(1);
+            let mut best = [(f32::NEG_INFINITY, 0.0f32); 3];
+            let mut i = (min_gap / fm).ceil() as usize;
+            while i + wf <= prof.len() {
+                let s1 = i as f32 * fm;
+                let s2 = sp - s1 - len;
+                if s2 < min_gap {
+                    break;
+                }
+                let ev = w * (pre[i + wf] - pre[i]) / t.dot;
+                let after = self.space_options(s2).into_iter().fold(f32::NEG_INFINITY, f32::max);
+                let before = self.space_options(s1);
+                for k in 0..3 {
+                    let sc = before[k] + mark_ll + ev + after;
+                    if sc > best[k].0 {
+                        best[k] = (sc, s2);
+                    }
+                }
+                i += step;
+            }
+            for (k, &(sc, s2)) in best.iter().enumerate() {
+                if sc.is_finite() {
+                    // `after` is scored again when the gap completes.
+                    let after = self.space_options(s2).into_iter().fold(f32::NEG_INFINITY, f32::max);
+                    out.push((k, dash, s2, sc - after + self.params.insert_penalty));
+                }
+            }
+        }
+        out
+    }
+
+    /// Ways to explain a long mark as element + short gap + element, the
+    /// gap filled in by noise: for each kind of the first element, the best
+    /// split as (score, length of the remaining mark). Mirror image of
+    /// `hidden_elements`, with the evidence of a dip in the envelope.
+    fn hidden_gaps(&self, m: f32, prof: &[f32]) -> Vec<(bool, f32, f32)> {
+        let mut out = Vec::new();
+        let t = &self.timing;
+        let w = self.params.soft_weight;
+        if w <= 0.0 || prof.len() < 4 || m < 2.2 * t.dot {
+            return out;
+        }
+        let fm = m / prof.len() as f32;
+        let pre = prefix_above_median(prof);
+        let wf = ((t.egap / fm).round() as usize).max(1);
+        let gap_ll = self.space_options(t.egap)[0];
+        let min_mark = 0.5 * t.dot;
+        let step = (wf / 4).max(1);
+        let mut best = [(f32::NEG_INFINITY, 0.0f32); 2];
+        let mut i = (min_mark / fm).ceil() as usize;
+        while i + wf <= prof.len() {
+            let m1 = i as f32 * fm;
+            let m2 = m - m1 - t.egap;
+            if m2 < min_mark {
+                break;
+            }
+            let ev = -w * (pre[i + wf] - pre[i]) / t.dot;
+            let after = self.mark_options(m2).into_iter().map(|o| o.1).fold(f32::NEG_INFINITY, f32::max);
+            for (d, ll) in self.mark_options(m1) {
+                let sc = ll + gap_ll + ev + after;
+                let k = usize::from(d);
+                if sc > best[k].0 {
+                    best[k] = (sc, m2);
+                }
+            }
+            i += step;
+        }
+        for (k, &(sc, m2)) in best.iter().enumerate() {
+            if sc.is_finite() {
+                let after = self.mark_options(m2).into_iter().map(|o| o.1).fold(f32::NEG_INFINITY, f32::max);
+                out.push((k == 1, m2, sc - after + self.params.insert_penalty));
+            }
+        }
+        out
+    }
+
+    /// Classifies a completed space for a hypothesis: 0 = element gap,
+    /// 1 = character gap, 2 = word gap. False if that makes it invalid.
+    fn apply_space(&self, n: &mut Hyp, k: usize) -> bool {
+        match k {
+            0 => can_extend(n.bits, n.len),
+            1 => self.end_char(n, false),
+            _ => self.end_char(n, true),
+        }
+    }
+
+    /// Appends an element; false if no character starts that way.
+    fn apply_mark(&self, n: &mut Hyp, dash: bool) -> bool {
+        if !can_extend(n.bits, n.len) {
+            return false;
+        }
+        n.bits = (n.bits << 1) | u8::from(dash);
+        n.len += 1;
+        self.morse.is_prefix(n.bits, n.len)
+    }
+
+    /// Pushes a run with its per-frame amplitude evidence `prof` (noise
+    /// sigma x ms above the threshold), if known.
+    pub fn push_soft(&mut self, run: Run, prof: Option<&[f32]>) {
+        let total: Option<f32> = prof.map(|p| p.iter().sum());
+        let ev = match run {
+            Run::Mark(_) => total,
+            _ => total.map(|t| -t),
+        };
+        let hidden = match (run, prof) {
+            (Run::Space(sp), Some(p)) => self.hidden_elements(sp, p),
+            _ => Vec::new(),
+        };
+        let gaps = match (run, prof) {
+            (Run::Mark(m), Some(p)) => self.hidden_gaps(m, p),
+            _ => Vec::new(),
+        };
         let mut next = std::mem::take(&mut self.scratch);
         next.clear();
-        let dot = self.timing.dot;
         match run {
             Run::Mark(m) => {
                 for h in &self.hyps {
@@ -271,22 +445,25 @@ impl BeamDecoder {
                         for (k, &ll) in opts.iter().enumerate() {
                             let mut n = h.clone();
                             n.score += ll;
-                            let ok = match k {
-                                0 => can_extend(n.bits, n.len),
-                                1 => self.end_char(&mut n, false),
-                                _ => self.end_char(&mut n, true),
-                            };
-                            if !ok {
+                            if !self.apply_space(&mut n, k) {
                                 continue;
                             }
                             n.pend_space = 0.0;
                             n.pend_mark = m;
+                            for &(d1, m2, sc) in &gaps {
+                                let mut g = n.clone();
+                                if self.apply_mark(&mut g, d1) && can_extend(g.bits, g.len) {
+                                    g.score += sc;
+                                    g.pend_mark = m2;
+                                    next.push(g);
+                                }
+                            }
                             next.push(n);
                         }
-                        if m < 0.6 * dot {
+                        if let Some(c) = self.explain_away(self.params.blip_penalty, m, ev) {
                             let mut n = h.clone();
                             n.pend_space += m;
-                            n.score += self.params.blip_penalty + 2.0 * (m / dot);
+                            n.score += c;
                             next.push(n);
                         }
                     } else {
@@ -300,24 +477,27 @@ impl BeamDecoder {
                 for h in &self.hyps {
                     if h.pend_mark > 0.0 {
                         for (dash, ll) in self.mark_options(h.pend_mark) {
-                            if !can_extend(h.bits, h.len) {
-                                continue;
-                            }
                             let mut n = h.clone();
-                            n.bits = (n.bits << 1) | u8::from(dash);
-                            n.len += 1;
-                            if !self.morse.is_prefix(n.bits, n.len) {
+                            if !self.apply_mark(&mut n, dash) {
                                 continue;
                             }
                             n.score += ll;
                             n.pend_mark = 0.0;
                             n.pend_space = sp;
+                            for &(k, hdash, s2, sc) in &hidden {
+                                let mut m = n.clone();
+                                if self.apply_space(&mut m, k) && self.apply_mark(&mut m, hdash) {
+                                    m.score += sc;
+                                    m.pend_space = s2;
+                                    next.push(m);
+                                }
+                            }
                             next.push(n);
                         }
-                        if sp < 0.6 * dot {
+                        if let Some(c) = self.explain_away(self.params.dropout_penalty, sp, ev) {
                             let mut n = h.clone();
                             n.pend_mark += sp;
-                            n.score += self.params.dropout_penalty + 2.0 * (sp / dot);
+                            n.score += c;
                             next.push(n);
                         }
                     } else {
@@ -481,6 +661,21 @@ impl BeamDecoder {
     }
 }
 
+/// Prefix sums of a run's evidence profile measured halfway between the
+/// threshold and the run's median, so a window sum rewards both standing
+/// out from the rest of the run and coming close to the threshold.
+fn prefix_above_median(prof: &[f32]) -> Vec<f32> {
+    let mut sorted = prof.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let med = sorted[sorted.len() / 2];
+    let mut pre = Vec::with_capacity(prof.len() + 1);
+    pre.push(0.0f32);
+    for &z in prof {
+        pre.push(pre.last().unwrap() + z - 0.5 * med);
+    }
+    pre
+}
+
 /// Log-likelihood of mark/space durations under a dot length `d` (ms),
 /// with outliers capped, plus a mild prior toward common speeds.
 fn model_score(d: f32, marks: &[f32], spaces: &[f32]) -> f32 {
@@ -598,6 +793,34 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     Some(tm)
 }
 
+/// Splits the long gaps of a sender (character and word gaps) into two
+/// clusters by 1-D k-means on log durations. Returns (character gap, word
+/// gap) when they are clearly distinct and both common enough to trust.
+pub fn gap_clusters(gaps: &[f32]) -> Option<(f32, f32)> {
+    if gaps.len() < 16 {
+        return None;
+    }
+    let mut v: Vec<f32> = gaps.iter().map(|g| g.max(1.0).ln()).collect();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let (mut lo, mut hi) = (v[v.len() / 4], v[v.len() * 9 / 10]);
+    let mut split = 0;
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        split = v.partition_point(|&x| x < mid);
+        if split == 0 || split == v.len() {
+            return None;
+        }
+        lo = v[..split].iter().sum::<f32>() / split as f32;
+        hi = v[split..].iter().sum::<f32>() / (v.len() - split) as f32;
+    }
+    let frac_hi = (v.len() - split) as f32 / v.len() as f32;
+    // Word gaps are roughly 1 in 4-5 of the long gaps in text.
+    if hi - lo < (1.3f32).ln() || !(0.08..=0.55).contains(&frac_hi) {
+        return None;
+    }
+    Some((lo.exp(), hi.exp()))
+}
+
 /// Words made only of E and T (single dots/dashes) are what noise and
 /// interference decode as; real traffic almost never contains them.
 /// How long (ms) a finished word is held back waiting for a possible error
@@ -654,10 +877,17 @@ pub struct CwDecoder {
     state: bool,
     run_frames: u32,
     cand: u32,
+    /// Per-frame amplitude evidence (noise-sigma x ms above the threshold)
+    /// of the current run, including its trailing candidate (debounce)
+    /// frames.
+    run_z: Vec<f32>,
     flushed: bool,
     // timing
     boot: Vec<Run>,
+    boot_prof: Vec<Option<Vec<f32>>>,
     history: std::collections::VecDeque<Run>,
+    /// Recent character/word gaps (not pauses), for `gap_clusters`.
+    long_gaps: std::collections::VecDeque<f32>,
     marks_since_check: u32,
     beam: Option<BeamDecoder>,
     text: Vec<u8>,
@@ -690,9 +920,12 @@ impl CwDecoder {
             state: false,
             run_frames: 0,
             cand: 0,
+            run_z: Vec::new(),
             flushed: true,
             boot: Vec::new(),
+            boot_prof: Vec::new(),
             history: Default::default(),
+            long_gaps: Default::default(),
             marks_since_check: 0,
             beam: None,
             text: Vec::new(),
@@ -874,14 +1107,14 @@ impl CwDecoder {
     pub fn push_frame(&mut self, x: f32) {
         let x = x.max(1e-12);
         if self.erasure {
-            self.slice(false);
+            self.slice(false, 0.0);
             return;
         }
         // Noise floor: 25th-percentile tracker. Signal: fast attack on peaks,
         // slower tracking during marks, decay toward the noise floor.
         self.track_levels(x);
         if self.noise_q <= 0.0 {
-            self.slice(false);
+            self.slice(false, 0.0);
             return;
         }
         let nm = self.noise_q * 1.65;
@@ -907,7 +1140,13 @@ impl CwDecoder {
             use std::io::Write;
             let _ = writeln!(d, "{:.5e},{:.5e},{:.5e},{:.5e},{}", x, nm, self.sig, thr, u8::from(self.state));
         }
-        self.slice(want);
+        // Soft evidence: distance from the threshold in units of the noise
+        // envelope's standard deviation (~0.52 x its mean for Rayleigh
+        // noise), capped so a strong signal does not swamp the timing.
+        // Computed even while the squelch or activity gate holds the slicer
+        // off: a deep fade is exactly when a faded dit must still be found.
+        let z = ((x - thr) / (0.52 * nm)).clamp(-8.0, 8.0);
+        self.slice(want, z * self.frame_ms);
     }
 
     fn confirm_frames(&self) -> u32 {
@@ -918,7 +1157,13 @@ impl CwDecoder {
         ((frac * dot / self.frame_ms).round() as u32).clamp(1, 20)
     }
 
-    fn slice(&mut self, want: bool) {
+    fn slice(&mut self, want: bool, ev: f32) {
+        self.run_z.push(ev);
+        // A silence after a flush is never reported: keep only what a
+        // pending transition could need.
+        if self.flushed && self.run_z.len() > 256 {
+            self.run_z.drain(..self.run_z.len() - 32);
+        }
         self.run_frames += 1;
         self.held_frames = self.held_frames.saturating_add(1);
         if self.state {
@@ -933,15 +1178,17 @@ impl CwDecoder {
         }
         if self.cand >= self.confirm_frames() {
             let dur = (self.run_frames - self.cand) as f32 * self.frame_ms;
+            let tail = self.run_z.split_off(self.run_z.len().saturating_sub(self.cand as usize));
+            let prof = std::mem::replace(&mut self.run_z, tail);
             let was_mark = self.state;
             self.state = want;
             self.run_frames = self.cand;
             self.cand = 0;
             if was_mark {
                 self.total_marks += 1;
-                self.on_run(Run::Mark(dur));
+                self.on_run(Run::Mark(dur), Some(prof));
             } else if !self.flushed {
-                self.on_run(Run::Space(dur));
+                self.on_run(Run::Space(dur), Some(prof));
             }
             self.flushed = false;
         } else if !self.state && !self.flushed {
@@ -950,14 +1197,19 @@ impl CwDecoder {
             let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(1000.0);
             let dur = self.run_frames as f32 * self.frame_ms;
             if dur > (wg * 1.6).max(250.0) {
-                self.on_run(Run::Space(dur));
-                self.on_run(Run::Flush);
+                self.run_z.clear();
+                self.on_run(Run::Space(dur), None);
+                self.on_run(Run::Flush, None);
                 self.flushed = true;
             }
         }
     }
 
-    fn on_run(&mut self, run: Run) {
+    fn on_run(&mut self, run: Run, prof: Option<Vec<f32>>) {
+        if std::env::var_os("CWSK_RUNS").is_some() {
+            let dot = self.beam.as_ref().map(|b| b.timing.dot).unwrap_or(0.0);
+            eprintln!("RUN {:?} ev={:.1} dot={:.0} tent={:?}", run, prof.as_ref().map(|p| p.iter().sum::<f32>() / dot.max(1.0)).unwrap_or(f32::NAN), dot, self.beam.as_ref().map(|b| b.tentative()));
+        }
         if !matches!(run, Run::Flush) {
             self.history.push_back(run);
             if self.history.len() > 64 {
@@ -967,6 +1219,7 @@ impl CwDecoder {
         if self.beam.is_none() {
             if !matches!(run, Run::Flush) {
                 self.boot.push(run);
+                self.boot_prof.push(prof);
             }
             let nmarks = self.boot.iter().filter(|r| matches!(r, Run::Mark(_))).count();
             if nmarks >= 8 || (matches!(run, Run::Flush) && nmarks >= 4) {
@@ -975,9 +1228,10 @@ impl CwDecoder {
                         eprintln!("boot: {:?} wpm={:.1} snr={:.1}dB runs={:?}", tm, tm.wpm(), self.snr_db(), &self.boot);
                     }
                     let mut b = BeamDecoder::new(self.params.clone(), self.lm.clone(), tm);
-                    for r in std::mem::take(&mut self.boot) {
+                    let profs = std::mem::take(&mut self.boot_prof);
+                    for (r, p) in std::mem::take(&mut self.boot).into_iter().zip(profs) {
                         b.adapt(r);
-                        b.push(r);
+                        b.push_soft(r, p.as_deref());
                     }
                     if matches!(run, Run::Flush) {
                         b.push(Run::Flush);
@@ -985,11 +1239,13 @@ impl CwDecoder {
                     self.beam = Some(b);
                 } else if matches!(run, Run::Flush) {
                     self.boot.clear();
+                    self.boot_prof.clear();
                 }
             } else if matches!(run, Run::Flush) && nmarks < 4 {
                 // Too little to estimate speed; drop to avoid stale bootstrap.
                 if self.boot.len() > 40 {
                     self.boot.clear();
+                    self.boot_prof.clear();
                 }
             }
             return;
@@ -1024,25 +1280,45 @@ impl CwDecoder {
                     }
                 }
             }
+            // This sender's word spacing, from the two clusters of gaps.
+            let lg: Vec<f32> = self.long_gaps.iter().copied().collect();
+            if let Some((c, w)) = gap_clusters(&lg) {
+                let t = &mut self.beam.as_mut().unwrap().timing;
+                if (c / t.cgap - 1.0).abs() < 0.4 {
+                    t.cgap = c.clamp(t.dot * 2.0, t.dot * 15.0);
+                }
+                let nominal = t.wgap() / t.wscale;
+                t.wscale = (w / nominal).clamp(0.55, 1.6);
+            }
         }
         let b = self.beam.as_mut().unwrap();
+        if let Run::Space(sp) = run {
+            let t = &b.timing;
+            let nominal = t.wgap() / t.wscale;
+            if sp > 2.0 * t.egap.max(t.dot) && sp < 2.5 * nominal {
+                self.long_gaps.push_back(sp);
+                if self.long_gaps.len() > 48 {
+                    self.long_gaps.pop_front();
+                }
+            }
+        }
         b.adapt(run);
-        b.push(run);
+        b.push_soft(run, prof.as_deref());
     }
 
     /// Forces out any pending text (e.g. at end of a file).
     pub fn finish(&mut self) {
         if self.beam.is_none() && !self.boot.is_empty() {
-            self.on_run(Run::Flush);
+            self.on_run(Run::Flush, None);
         }
         if !self.flushed {
             let dur = self.run_frames as f32 * self.frame_ms;
             if self.state {
-                self.on_run(Run::Mark(dur));
+                self.on_run(Run::Mark(dur), None);
             } else {
-                self.on_run(Run::Space(dur));
+                self.on_run(Run::Space(dur), None);
             }
-            self.on_run(Run::Flush);
+            self.on_run(Run::Flush, None);
             self.flushed = true;
         }
         if let Some(b) = &mut self.beam {
@@ -1122,6 +1398,94 @@ mod tests {
         }
         v.push(Run::Flush);
         v
+    }
+
+    /// Per-frame evidence profile for a run: `z` noise sigmas for its
+    /// whole length, at `fm` ms per frame.
+    fn flat(len: f32, z: f32, fm: f32) -> Vec<f32> {
+        vec![z * fm; (len / fm).round() as usize]
+    }
+
+    #[test]
+    fn faded_dit_is_recovered() {
+        // "AN" with the dit of the A missed by the slicer: it sees a long
+        // gap then a dash, i.e. "TN"-like timing; the gap holds a bump at
+        // the right place.
+        let lm = Arc::new(LanguageModel::uniform());
+        let dot = 60.0;
+        let fm = 2.0;
+        let tm = TimingModel::from_dot(dot);
+        let mut b = BeamDecoder::new(DecoderParams::default(), lm, tm);
+        // Leading context: "E " (a dit and a word gap).
+        b.push_soft(Run::Mark(dot), Some(&flat(dot, 3.0, fm)));
+        // Word gap, a dit the squelch held off (z=+3 vs -1.5 noise),
+        // element gap.
+        let mut gap = flat(7.0 * dot, -1.5, fm);
+        gap.extend(flat(dot, 3.0, fm));
+        gap.extend(flat(dot, -1.5, fm));
+        b.push_soft(Run::Space(9.0 * dot), Some(&gap));
+        b.push_soft(Run::Mark(3.0 * dot), Some(&flat(3.0 * dot, 3.0, fm)));
+        b.push_soft(Run::Space(3.0 * dot), Some(&flat(3.0 * dot, -1.5, fm)));
+        b.push_soft(Run::Mark(3.0 * dot), Some(&flat(3.0 * dot, 3.0, fm)));
+        b.push_soft(Run::Space(dot), Some(&flat(dot, -1.5, fm)));
+        b.push_soft(Run::Mark(dot), Some(&flat(dot, 3.0, fm)));
+        b.push(Run::Space(10.0 * dot));
+        b.push(Run::Flush);
+        let out = String::from_utf8(b.take_committed()).unwrap();
+        assert_eq!(out.trim(), "E AN");
+        // Without the bump (flat noise), no dit is invented.
+        let mut b = BeamDecoder::new(DecoderParams::default(), Arc::new(LanguageModel::uniform()), TimingModel::from_dot(dot));
+        b.push_soft(Run::Mark(dot), Some(&flat(dot, 3.0, fm)));
+        b.push_soft(Run::Space(9.0 * dot), Some(&flat(9.0 * dot, -1.5, fm)));
+        b.push_soft(Run::Mark(3.0 * dot), Some(&flat(3.0 * dot, 3.0, fm)));
+        b.push_soft(Run::Space(3.0 * dot), Some(&flat(3.0 * dot, -1.5, fm)));
+        b.push_soft(Run::Mark(3.0 * dot), Some(&flat(3.0 * dot, 3.0, fm)));
+        b.push_soft(Run::Space(dot), Some(&flat(dot, -1.5, fm)));
+        b.push_soft(Run::Mark(dot), Some(&flat(dot, 3.0, fm)));
+        b.push(Run::Space(10.0 * dot));
+        b.push(Run::Flush);
+        let out = String::from_utf8(b.take_committed()).unwrap();
+        assert_eq!(out.trim(), "E TN");
+    }
+
+    #[test]
+    fn word_gap_clusters() {
+        // Character gaps ~3 dots, squeezed word gaps ~4.5 dots.
+        let mut g = Vec::new();
+        for i in 0..30 {
+            g.push(180.0 + (i % 5) as f32 * 8.0);
+            if i % 4 == 0 {
+                g.push(270.0 + (i % 3) as f32 * 10.0);
+            }
+        }
+        let (c, w) = gap_clusters(&g).unwrap();
+        assert!((c - 196.0).abs() < 15.0 && (w - 280.0).abs() < 20.0, "{c} {w}");
+        // One cluster only: no split.
+        assert!(gap_clusters(&vec![180.0; 30]).is_none());
+    }
+
+    #[test]
+    fn run_together_bk() {
+        let lm = Arc::new(LanguageModel::new());
+        let dot = 60.0;
+        let mut runs = runs_for("TNX", dot);
+        runs.pop();
+        runs.pop();
+        runs.push(Run::Space(7.0 * dot));
+        // -...-.- with element gaps only.
+        for (i, e) in "-...-.-".bytes().enumerate() {
+            if i > 0 {
+                runs.push(Run::Space(dot));
+            }
+            runs.push(Run::Mark(if e == b'-' { 3.0 * dot } else { dot }));
+        }
+        runs.push(Run::Space(10.0 * dot));
+        runs.push(Run::Flush);
+        let mut b = BeamDecoder::new(DecoderParams::default(), lm, TimingModel::from_dot(dot));
+        for r in runs {
+            b.push(r);
+        }
+        assert_eq!(String::from_utf8(b.take_committed()).unwrap().trim(), "TNX BK");
     }
 
     #[test]

@@ -90,6 +90,8 @@ struct SpotRow {
     snr: f32,
     last: Instant,
     count: u32,
+    /// Heard at least twice; a single sighting is shown dimmed.
+    confirmed: bool,
     country: Option<Country>,
     /// Activities heard on its channel: (flag name, what was sent).
     tags: Vec<(String, String)>,
@@ -608,8 +610,9 @@ impl App {
             let rf = self.rf_of(sp.freq);
             match self.spots.iter_mut().find(|r| r.call == sp.call) {
                 Some(r) => {
-                    if sp.count != r.count {
+                    if sp.count != r.count || sp.confirmed != r.confirmed {
                         r.count = sp.count;
+                        r.confirmed = sp.confirmed;
                         r.last = Instant::now();
                         r.audio = sp.freq;
                         r.wpm = sp.wpm;
@@ -621,7 +624,7 @@ impl App {
                 }
                 None => {
                     let country = self.cty.lookup(&sp.call);
-                    self.spots.push(SpotRow { call: sp.call.clone(), rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count, country, tags: vec![] })
+                    self.spots.push(SpotRow { call: sp.call.clone(), rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count, confirmed: sp.confirmed, country, tags: vec![] })
                 }
             }
             if let (Some(tags), Some(r)) = (self.chan_tags.get(&sp.channel), self.spots.iter_mut().find(|r| r.call == sp.call)) {
@@ -742,9 +745,13 @@ impl App {
         q.text.push_str(&to_display(text));
         q.last_text = now;
         q.away_since = None;
+        // Only calls that are confirmed (spotted twice) or heard twice in
+        // this conversation: a single garbled sighting is often noise.
         for w in text.split_whitespace() {
             if let Some(c) = cwskimmer::callsign::parse_callsign(w) {
-                if !q.calls.contains(&c) {
+                let spotted = self.spots.iter().any(|r| r.confirmed && r.call == c);
+                let twice = q.text.split_whitespace().filter(|x| *x == c).count() >= 2;
+                if !q.calls.contains(&c) && cwskimmer::callsign::valid_prefix(&c) && (spotted || twice) {
                     q.calls.push(c);
                 }
             }
@@ -1429,7 +1436,8 @@ impl App {
                                 (full[skip..].to_string(), tent)
                             };
                             let age = ch.last_mark_age;
-                            let col = if age < 5.0 { Color32::WHITE } else { Color32::GRAY };
+                            // Text that reads poorly (weak or garbled) is dimmed, not hidden.
+                            let col = if ch.doubtful { Color32::from_gray(150) } else if age < 5.0 { Color32::WHITE } else { Color32::GRAY };
                             ui.horizontal(|ui| {
                                 for (act, heard) in &flags {
                                     flag_badge(ui, act, heard);
@@ -1514,8 +1522,10 @@ impl App {
             })
             .body(|mut body| {
                 for s in &spots {
+                    let dim = if s.confirmed { 1.0 } else { 0.5 };
                     body.row(18.0, |mut row| {
                         row.col(|ui| {
+                            ui.multiply_opacity(dim);
                             let r = call_link(ui, &s.call, 13.0);
                             if r.clicked() {
                                 self.info_call = Some(s.call.clone());
@@ -1526,7 +1536,8 @@ impl App {
                                     None => tune_audio = Some(s.audio),
                                 }
                             }
-                            r.on_hover_text("Click: station info   Double-click: tune");
+                            let hint = if s.confirmed { "" } else { "Heard once so far (may be a decoding error)\n" };
+                            r.on_hover_text(format!("{hint}Click: station info   Double-click: tune"));
                         });
                         row.col(|ui| {
                             let f = match s.rf {
@@ -1696,7 +1707,13 @@ impl App {
             }
         });
         let gloss = self.s.explain_abbrev;
+        if ch.doubtful {
+            ui.label(RichText::new("Text reads poorly (weak or garbled signal): shown dimmed").small().weak());
+        }
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            if ch.doubtful {
+                ui.multiply_opacity(0.6);
+            }
             let (_, call) = cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), 15.0, gloss, Sense::hover(), "");
             if call.is_some() {
                 self.info_call = call;
