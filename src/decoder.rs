@@ -1328,6 +1328,10 @@ impl CwDecoder {
                     }
                 }
             }
+            if std::env::var_os("CWSK_TIMING").is_some() {
+                let t = &self.beam.as_ref().unwrap().timing;
+                eprintln!("TIMING dot {:.0} dash {:.0} egap {:.0} cgap {:.0} wgap {:.0} clusters {:?}", t.dot, t.dash, t.egap, t.cgap, t.wgap(), gap_clusters(&self.long_gaps.iter().copied().collect::<Vec<_>>()));
+            }
             // This sender's word spacing, from the two clusters of gaps.
             let lg: Vec<f32> = self.long_gaps.iter().copied().collect();
             if let Some((c, w)) = gap_clusters(&lg) {
