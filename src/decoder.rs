@@ -60,6 +60,14 @@ pub struct DecoderParams {
     /// Log-probability penalty for finding an element hidden in a space
     /// (a dit too faded to cross the threshold), before its evidence.
     pub insert_penalty: f32,
+    /// Floor on the log-likelihood of a mark far shorter than a dot being a
+    /// dot: senders clip dits (rushed keying, a dash running into the next
+    /// element), and the language model should get a say instead of the
+    /// timing ruling it out.
+    pub clipped_dit: f32,
+    /// Correct finished words that are one Morse element away from exactly
+    /// one known word (see `LanguageModel::correct`); 0 turns it off.
+    pub word_fix: f32,
 }
 
 impl DecoderParams {
@@ -88,6 +96,8 @@ impl DecoderParams {
                     "debounce" => p.debounce = v,
                     "soft_weight" => p.soft_weight = v,
                     "insert_penalty" => p.insert_penalty = v,
+                    "clipped_dit" => p.clipped_dit = v,
+                    "word_fix" => p.word_fix = v,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -115,6 +125,8 @@ impl Default for DecoderParams {
             debounce: 0.24,
             soft_weight: 0.7,
             insert_penalty: -4.0,
+            clipped_dit: -4.5,
+            word_fix: 1.0,
         }
     }
 }
@@ -228,7 +240,10 @@ impl BeamDecoder {
     fn mark_options(&self, m: f32) -> [(bool, f32); 2] {
         let t = &self.timing;
         let s = self.params.sigma_mark;
-        let dot = lognorm(m, t.dot, s);
+        let mut dot = lognorm(m, t.dot, s);
+        if m < t.dot {
+            dot = dot.max(self.params.clipped_dit);
+        }
         // Over-long dashes are common with hand keys: widen the upper tail.
         let dash = if m > t.dash { lognorm(m, t.dash, s * 1.8) + (1.8f32).ln() } else { lognorm(m, t.dash, s) };
         [(false, dot), (true, dash)]
@@ -1023,7 +1038,13 @@ impl CwDecoder {
                 }
             } else if !is_noise_word(body) {
                 self.text.append(&mut self.held);
-                self.held = w;
+                // A human copying fills in a garbled letter from the word;
+                // do the same when the fix is unambiguous.
+                let fixed = if self.params.word_fix > 0.0 { self.lm.correct(body) } else { None };
+                self.held = match fixed {
+                    Some(f) => [f, b" "].concat(),
+                    None => w,
+                };
                 self.held_frames = 0;
             }
         }

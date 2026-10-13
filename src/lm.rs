@@ -40,6 +40,10 @@ pub struct LanguageModel {
     backoff: HashMap<u32, f32>,
     /// Known words (English, abbreviations, Q-codes, names).
     vocab: HashSet<Vec<u8>>,
+    /// Longer known words with their Morse renderings, for `correct`.
+    vocab_morse: Vec<(Vec<u8>, Vec<u8>)>,
+    /// A large English dictionary: words in it are never corrected.
+    dict: HashSet<&'static [u8]>,
 }
 
 /// Packs up to 4 context symbols (oldest first) and the predicted symbol.
@@ -56,6 +60,9 @@ fn key(ctx: &[usize], c: usize) -> u32 {
 const QSO_TEXT: &str = include_str!("../data/corpus/qso.txt");
 const ENGLISH_TEXT: &str = include_str!("../data/corpus/english.txt");
 const WORDS: &str = include_str!("../data/corpus/words.txt");
+/// English words of 5+ letters (SCOWL, see data/corpus/LICENSE-SCOWL.txt):
+/// real words that `correct` must never change.
+const DICT: &str = include_str!("../data/corpus/dict.txt");
 
 /// Training text from the built-in corpora, with punctuation that is rarely
 /// keyed removed: periods become the break sign in QSOs and disappear from
@@ -94,6 +101,8 @@ impl LanguageModel {
         let mut m = Self::train(&train);
         m.char_bonus = m.cross_entropy(&held);
         m.vocab = WORDS.lines().map(|w| w.trim().as_bytes().to_vec()).filter(|w| !w.is_empty()).collect();
+        m.dict = DICT.lines().map(str::as_bytes).collect();
+        m.vocab_morse = m.vocab.iter().filter(|w| w.len() >= 4 && w.iter().all(u8::is_ascii_uppercase)).map(|w| (w.clone(), morse_render(w))).collect();
         m
     }
 
@@ -109,6 +118,8 @@ impl LanguageModel {
             hi: HashMap::new(),
             backoff: HashMap::new(),
             vocab: HashSet::new(),
+            vocab_morse: Vec::new(),
+            dict: HashSet::new(),
         }
     }
 
@@ -150,7 +161,7 @@ impl LanguageModel {
                 }
             }
         }
-        let mut m = Self { n, char_bonus: 0.0, tri: out, lut, hi: HashMap::new(), backoff: HashMap::new(), vocab: HashSet::new() };
+        let mut m = Self { n, char_bonus: 0.0, tri: out, lut, hi: HashMap::new(), backoff: HashMap::new(), vocab: HashSet::new(), vocab_morse: Vec::new(), dict: HashSet::new() };
         m.train_high(&bytes);
         m.char_bonus = m.cross_entropy(corpus);
         m
@@ -248,6 +259,37 @@ impl LanguageModel {
         !self.vocab.is_empty()
     }
 
+    /// The known word a garbled one most likely was, if exactly one known
+    /// word is the garbled one plus a single lost dit: a dit missing inside
+    /// a letter, or where two letters join into one (TM + dit = Y). That is
+    /// the commonest error in fades and with clipped keying; other single
+    /// edits (an extra dit, a dash for a dot) proved ambiguous on real
+    /// signals. Only plain words of 5+ letters that are not known
+    /// themselves are considered, so callsigns, numbers, abbreviations and
+    /// short words are left alone.
+    pub fn correct(&self, w: &[u8]) -> Option<&[u8]> {
+        if w.len() < 5 || !w.iter().all(u8::is_ascii_uppercase) || self.vocab.contains(w) || self.dict.contains(w) {
+            return None;
+        }
+        // Two known words run together (a squeezed word gap, "U EVER") is
+        // as likely as a lost dit: leave those alone.
+        let known = |p: &[u8]| self.vocab.contains(p) || matches!(p, b"A" | b"I" | b"U" | b"R");
+        if (1..w.len()).any(|i| known(&w[..i]) && known(&w[i..])) {
+            return None;
+        }
+        let m = morse_render(w);
+        let mut found: Option<&[u8]> = None;
+        for (word, wm) in &self.vocab_morse {
+            if wm.len().abs_diff(m.len()) <= 1 && lost_dit(&m, wm) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(word);
+            }
+        }
+        found
+    }
+
     /// log P(c | a b) where a, b, c are ASCII characters.
     #[inline]
     pub fn logp(&self, a: u8, b: u8, c: u8) -> f32 {
@@ -260,6 +302,34 @@ impl LanguageModel {
     /// Average log-probability per character of a string.
     pub fn score(&self, text: &str) -> f32 {
         -self.cross_entropy(text)
+    }
+}
+
+/// Morse elements of a word, characters separated by spaces.
+fn morse_render(w: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for &c in w {
+        if !v.is_empty() {
+            v.push(b' ');
+        }
+        v.extend_from_slice(crate::morse::pattern_for(c).unwrap_or("#").as_bytes());
+    }
+    v
+}
+
+/// True if Morse rendering `word` is `got` with one dit restored: a '.'
+/// inserted, or a character break (' ') that was really a '.'.
+fn lost_dit(got: &[u8], word: &[u8]) -> bool {
+    let pre = got.iter().zip(word).take_while(|(x, y)| x == y).count();
+    if pre >= word.len() || word[pre] != b'.' {
+        return false;
+    }
+    if word.len() == got.len() + 1 {
+        got[pre..] == word[pre + 1..]
+    } else if word.len() == got.len() {
+        got[pre] == b' ' && got[pre + 1..] == word[pre + 1..]
+    } else {
+        false
     }
 }
 
@@ -462,6 +532,18 @@ pub fn generate_corpus(target_len: usize, seed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrects_lost_dits_only() {
+        let lm = LanguageModel::new();
+        assert_eq!(lm.correct(b"TMESTERDAY"), Some(&b"YESTERDAY"[..]));
+        // Other single edits are not corrected, nor known words.
+        assert_eq!(lm.correct(b"UEVER"), None);
+        assert_eq!(lm.correct(b"ETHAT"), None);
+        assert_eq!(lm.correct(b"WEATHER"), None);
+        // A real word outside the common vocabulary is left alone.
+        assert_eq!(lm.correct(b"STACK"), None);
+    }
 
     #[test]
     fn lm_prefers_plausible_text() {
