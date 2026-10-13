@@ -1588,7 +1588,7 @@ mod tests {
         let (c, w) = gap_clusters(&g).unwrap();
         assert!((c - 196.0).abs() < 15.0 && (w - 280.0).abs() < 20.0, "{c} {w}");
         // One cluster only: no split.
-        assert!(gap_clusters(&vec![180.0; 30]).is_none());
+        assert!(gap_clusters(&[180.0; 30]).is_none());
     }
 
     #[test]
