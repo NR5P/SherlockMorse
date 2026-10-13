@@ -124,7 +124,7 @@ impl Default for DecoderParams {
             sig_attack: 0.01,
             debounce: 0.24,
             soft_weight: 0.7,
-            insert_penalty: -4.0,
+            insert_penalty: -3.0,
             clipped_dit: -4.5,
             word_fix: 1.0,
         }
