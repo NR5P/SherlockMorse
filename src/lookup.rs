@@ -316,7 +316,7 @@ pub fn distance_bearing(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     (d, (y.atan2(x).to_degrees() + 360.0) % 360.0)
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).user_agent(concat!("CwSkimmer/", env!("CARGO_PKG_VERSION"))).build()
 }
 

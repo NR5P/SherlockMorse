@@ -3,6 +3,7 @@
 use cwskimmer::audio::{self, ChannelSel, DeviceInfo};
 use cwskimmer::cat::controller::{RigController, RigState};
 use cwskimmer::cat::{self, Mode, RigConfig, RigKind};
+use cwskimmer::cty::{self, Country, Cty};
 use cwskimmer::engine::{Engine, EngineCmd, Snapshot, Source};
 use cwskimmer::lm::LanguageModel;
 use cwskimmer::lookup::{self, Credentials, Lookup, LookupState};
@@ -82,6 +83,7 @@ struct SpotRow {
     snr: f32,
     last: Instant,
     count: u32,
+    country: Option<Country>,
 }
 
 struct App {
@@ -127,6 +129,10 @@ struct App {
     probe_status: String,
     show_settings: bool,
     lookup: Lookup,
+    /// DXCC country file, and a download in progress.
+    cty: Arc<Cty>,
+    cty_status: String,
+    cty_rx: Option<crossbeam_channel::Receiver<Result<Cty, String>>>,
     /// Callsign shown in the station-info window.
     info_call: Option<String>,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
@@ -284,10 +290,14 @@ impl App {
             probe_status: String::new(),
             show_settings: false,
             lookup: Lookup::default(),
+            cty: Arc::new(Cty::built_in()),
+            cty_status: String::new(),
+            cty_rx: None,
             info_call: None,
             screenshot: None,
             s,
         };
+        app.load_cty();
         let args: Vec<String> = std::env::args().collect();
         let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
         if let Some(p) = arg("--screenshot") {
@@ -596,10 +606,23 @@ impl App {
                         }
                     }
                 }
-                None => self.spots.push(SpotRow { call: sp.call, rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count }),
+                None => {
+                    let country = self.cty.lookup(&sp.call);
+                    self.spots.push(SpotRow { call: sp.call, rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count, country })
+                }
             }
         }
         self.spots.retain(|r| r.last.elapsed() < Duration::from_secs(1800));
+        if let Some(r) = self.cty_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.cty_rx = None;
+            match r {
+                Ok(c) => {
+                    self.cty_status = format!("Updated: {} countries", c.len());
+                    self.set_cty(c);
+                }
+                Err(e) => self.cty_status = format!("Update failed: {e}"),
+            }
+        }
         if let Some(rx) = &self.probe_rx {
             while let Ok(m) = rx.try_recv() {
                 match m {
@@ -722,8 +745,9 @@ impl App {
         }
     }
 
-    /// Ends the conversation when we have moved off frequency for 30 s, or
-    /// after 10 minutes without text.
+    /// Ends the conversation when we have moved off frequency for 30 s. While
+    /// we stay on frequency it stays up; only without CAT (frequency unknown)
+    /// does 10 minutes without text end it.
     fn qso_tick(&mut self) {
         let vfo_rf = self.rf_of(self.pitch());
         let Some(q) = &mut self.qso else { return };
@@ -736,7 +760,7 @@ impl App {
         } else {
             q.away_since = None;
         }
-        if self.qso.as_ref().is_some_and(|q| q.last_text.elapsed() > Duration::from_secs(600)) {
+        if self.qso.as_ref().is_some_and(|q| (q.rf.is_none() || vfo_rf.is_none()) && q.last_text.elapsed() > Duration::from_secs(600)) {
             self.qso_finish();
         }
     }
@@ -791,6 +815,41 @@ impl App {
             *p = colormap(v);
         }
         self.wf_dirty = true;
+    }
+
+    /// Uses a downloaded country file if there is a good one, else the built-in copy.
+    fn load_cty(&mut self) {
+        self.cty_status = match cty_path().filter(|p| p.exists()) {
+            Some(p) => match Cty::load(&p) {
+                Ok(c) => {
+                    let date = std::fs::metadata(&p).and_then(|m| m.modified()).ok().map(date_of).unwrap_or_default();
+                    self.cty = Arc::new(c);
+                    format!("Downloaded {date}")
+                }
+                Err(e) => format!("Built-in (downloaded file unreadable: {e})"),
+            },
+            None => "Built-in".into(),
+        };
+    }
+
+    fn set_cty(&mut self, c: Cty) {
+        for r in &mut self.spots {
+            r.country = c.lookup(&r.call);
+        }
+        self.cty = Arc::new(c);
+    }
+
+    fn start_cty_update(&mut self) {
+        let Some(dest) = cty_path() else {
+            self.cty_status = "No settings directory to save to".into();
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(Cty::download(&dest).map_err(|e| e.to_string()));
+        });
+        self.cty_rx = Some(rx);
+        self.cty_status = "Downloading…".into();
     }
 
     fn start_probe(&mut self) {
@@ -1089,6 +1148,19 @@ impl App {
             }
         });
         ui.label(RichText::new("Passwords are stored unencrypted in the app's settings file.").small().weak());
+        ui.add_space(6.0);
+        ui.strong("Country file");
+        ui.horizontal(|ui| {
+            ui.label(format!("{} countries", self.cty.len()));
+            let busy = self.cty_rx.is_some();
+            if ui.add_enabled(!busy, egui::Button::new("Update")).on_hover_text(format!("Download the latest AD1C cty.dat from {}", cty::URL)).clicked() {
+                self.start_cty_update();
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+        ui.label(RichText::new(&self.cty_status).small().weak());
         if self.s.lookup != before {
             self.lookup.clear();
         }
@@ -1313,9 +1385,10 @@ impl App {
             .column(Column::exact(72.0))
             .column(Column::exact(30.0))
             .column(Column::exact(30.0))
-            .column(Column::remainder())
+            .column(Column::exact(34.0))
+            .column(Column::remainder().at_least(40.0).clip(true))
             .header(18.0, |mut h| {
-                for t in ["Call", "Freq", "WPM", "SNR", "Age"] {
+                for t in ["Call", "Freq", "WPM", "SNR", "Age", "Country"] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -1360,6 +1433,11 @@ impl App {
                         row.col(|ui| {
                             let a = s.last.elapsed().as_secs();
                             ui.label(if a < 60 { format!("{a}s") } else { format!("{}m", a / 60) });
+                        });
+                        row.col(|ui| {
+                            if let Some(c) = &s.country {
+                                ui.add(egui::Label::new(&c.name).truncate()).on_hover_text(self.country_summary(c));
+                            }
                         });
                     });
                 }
@@ -1503,10 +1581,29 @@ impl App {
         });
     }
 
+    /// "Fed. Rep. of Germany (DL)  EU  CQ 14  ITU 28", plus the local time and,
+    /// with the operator's grid set, the beam heading.
+    fn country_summary(&self, c: &Country) -> String {
+        let mut t = format!("{} ({})   {}   CQ {}   ITU {}\nLocal time {}", c.name, c.prefix, c.cont, c.cq, c.itu, time_at(c.utc_offset));
+        if let Some((km, brg)) = self.path_to((c.lat, c.lon)) {
+            t += &format!("\nAbout {km:.0} km, beam {brg:.0}°");
+        }
+        if !c.dxcc {
+            t += "\nCounts for WAE only, not DXCC";
+        }
+        t
+    }
+
+    /// Distance (km) and beam heading from the operator's grid.
+    fn path_to(&self, pos: (f64, f64)) -> Option<(f64, f64)> {
+        lookup::grid_pos(&self.s.my_grid).map(|me| lookup::distance_bearing(me, pos))
+    }
+
     /// Station-info window for the clicked callsign.
     fn ui_call_info(&mut self, ctx: &egui::Context) {
         let Some(call) = self.info_call.clone() else { return };
         let state = self.lookup.get(&call, &self.s.lookup);
+        let country = self.cty.lookup(&call);
         let mut open = true;
         egui::Window::new(RichText::new(&call).monospace().strong().color(CALL_COLOR))
             .id(egui::Id::new("call_info"))
@@ -1515,6 +1612,16 @@ impl App {
             .resizable(false)
             .default_width(380.0)
             .show(ctx, |ui| {
+                if let Some(c) = &country {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&c.name).strong());
+                        ui.label(RichText::new(format!("{}   {}   CQ {}   ITU {}   local {}", c.prefix, c.cont, c.cq, c.itu, time_at(c.utc_offset))).weak());
+                    });
+                    if !c.dxcc {
+                        ui.label(RichText::new("Counts for WAE only, not DXCC").small().weak());
+                    }
+                    ui.add_space(2.0);
+                }
                 match &state {
                     LookupState::Pending => {
                         ui.horizontal(|ui| {
@@ -1529,7 +1636,12 @@ impl App {
                             ui.label(RichText::new("Without a login only US and Canadian calls can be looked up. Add a free QRZ.com or HamQTH login in Settings.").small());
                         }
                     }
-                    LookupState::Done(i) => self.ui_info_body(ui, i),
+                    LookupState::Done(i) => self.ui_info_body(ui, i, country.as_ref()),
+                }
+                // Without a station position, aim at the country instead.
+                let located = matches!(&state, LookupState::Done(i) if i.lat_lon.is_some() || lookup::grid_pos(&i.grid).is_some());
+                if let (false, Some((km, brg))) = (located, country.as_ref().and_then(|c| self.path_to((c.lat, c.lon)))) {
+                    ui.label(format!("Country centre: about {km:.0} km / {:.0} mi, beam {brg:.0}° (long path {:.0}°)", km * 0.621371, (brg + 180.0) % 360.0));
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1549,7 +1661,7 @@ impl App {
         }
     }
 
-    fn ui_info_body(&self, ui: &mut egui::Ui, i: &lookup::CallInfo) {
+    fn ui_info_body(&self, ui: &mut egui::Ui, i: &lookup::CallInfo, country: Option<&Country>) {
         ui.horizontal_top(|ui| {
             if let Some(img) = &i.image {
                 let uri = format!("bytes://photo/{}", i.call);
@@ -1562,7 +1674,8 @@ impl App {
                 for l in &i.address {
                     ui.label(l);
                 }
-                if !i.country.is_empty() {
+                // Shown already from the country file unless the lookup says otherwise.
+                if !i.country.is_empty() && country.is_none_or(|c| !c.name.eq_ignore_ascii_case(&i.country)) {
                     ui.label(&i.country);
                 }
                 ui.add_space(4.0);
@@ -1577,8 +1690,7 @@ impl App {
                     let pos = i.lat_lon.or_else(|| lookup::grid_pos(&i.grid));
                     let grid = if i.grid.is_empty() { pos.map(|(a, b)| lookup::grid_of(a, b)).unwrap_or_default() } else { i.grid.clone() };
                     row("Grid", grid);
-                    if let (Some(me), Some(them)) = (lookup::grid_pos(&self.s.my_grid), pos) {
-                        let (km, brg) = lookup::distance_bearing(me, them);
+                    if let Some((km, brg)) = pos.and_then(|p| self.path_to(p)) {
                         row("Distance", format!("{km:.0} km / {:.0} mi", km * 0.621371));
                         row("Beam heading", format!("{brg:.0}°  (long path {:.0}°)", (brg + 180.0) % 360.0));
                     }
@@ -1768,7 +1880,7 @@ impl eframe::App for App {
                 self.ui_settings(ui);
             });
         }
-        egui::SidePanel::right("spots").default_width(280.0).resizable(true).show(ctx, |ui| self.ui_spots(ui));
+        egui::SidePanel::right("spots").default_width(370.0).resizable(true).show(ctx, |ui| self.ui_spots(ui));
         egui::TopBottomPanel::bottom("selected").resizable(true).default_height(150.0).show(ctx, |ui| self.ui_bottom(ui));
         egui::CentralPanel::default().show(ctx, |ui| {
             let h = (ui.available_height() * 0.42).clamp(120.0, 420.0);
@@ -1853,6 +1965,25 @@ fn save_png(path: &std::path::Path, img: &ColorImage) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where an updated country file is kept (next to the settings).
+fn cty_path() -> Option<std::path::PathBuf> {
+    eframe::storage_dir("cwskimmer").map(|d| d.join("cty.dat"))
+}
+
+/// "YYYY-MM-DD" of a file time.
+fn date_of(t: std::time::SystemTime) -> String {
+    let days = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64 / 86400;
+    let (y, m, d) = civil(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Local time "HH:MM" at a UTC offset in hours.
+fn time_at(offset_h: f32) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let t = (secs + (offset_h * 3600.0) as i64).rem_euclid(86400);
+    format!("{:02}:{:02}", t / 3600, t % 3600 / 60)
+}
+
 fn log_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_else(|| ".".into());
     std::path::PathBuf::from(home).join("CwSkimmer-logs")
@@ -1862,7 +1993,12 @@ fn log_dir() -> std::path::PathBuf {
 fn utc_now() -> (String, String) {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
-    // Civil-from-days (H. Hinnant).
+    let (y, m, d) = civil(days);
+    (format!("{y:04}-{m:02}-{d:02}"), format!("{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60))
+}
+
+/// (year, month, day) of a day count since 1970-01-01 (civil-from-days, H. Hinnant).
+fn civil(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -1871,8 +2007,7 @@ fn utc_now() -> (String, String) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (format!("{y:04}-{m:02}-{d:02}"), format!("{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60))
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 fn fmt_vfo(hz: u64) -> String {

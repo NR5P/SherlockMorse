@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cwskimmer::cat::{self, RigConfig, RigKind};
+use cwskimmer::cty::Cty;
 use cwskimmer::decoder::DecoderParams;
 use cwskimmer::dsp::resample::Resampler;
 use cwskimmer::lm::LanguageModel;
@@ -111,6 +112,12 @@ enum Cmd {
         /// Frequency to set, Hz.
         #[arg(long)]
         set: Option<u64>,
+    },
+    /// Look up the DXCC country of callsigns (built-in cty.dat, or --file).
+    Cty {
+        calls: Vec<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -245,6 +252,21 @@ fn main() -> Result<()> {
             for d in &devs {
                 let mark = if Some(&d.name) == pick.as_ref() { "*" } else { " " };
                 println!("{mark} [{:4}] {}{}", d.score, d.name, if d.is_default { " (default)" } else { "" });
+            }
+        }
+        Cmd::Cty { calls, file } => {
+            let cty = match file {
+                Some(f) => Cty::load(&f)?,
+                None => Cty::built_in(),
+            };
+            for call in calls {
+                match cty.lookup(&call) {
+                    Some(c) => println!(
+                        "{call:<12} {} ({})  {}  CQ {}  ITU {}  {:.2},{:.2}  UTC{:+}{}",
+                        c.name, c.prefix, c.cont, c.cq, c.itu, c.lat, c.lon, c.utc_offset, if c.dxcc { "" } else { "  (WAE only)" }
+                    ),
+                    None => println!("{call:<12} unknown"),
+                }
             }
         }
         Cmd::Ports => {

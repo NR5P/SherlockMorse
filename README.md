@@ -31,6 +31,11 @@ Runs on Linux, Windows and macOS (single native binary, no runtime needed).
   tunes ±50 Hz.
 - **Spots list** of callsigns heard (after `DE`/`CQ`, or seen twice), with RF
   frequency, speed and SNR. Click a spot's frequency to tune to it.
+- **Country of every spot**, from AD1C's `cty.dat` (the file loggers use),
+  built in so it works offline. Hover a spot's country for continent, CQ/ITU
+  zone, local time and beam heading. Portable calls are handled (`DL/W1ABC`,
+  `W1ABC/KH6`, `UA9ABC/1`). Settings → Country file → **Update** downloads
+  the latest copy.
 - **Station info.** Click any callsign (spots, decoder list, decoded text)
   for a popup with name, address, grid, distance and beam heading, and photo,
   plus buttons to open the call on QRZ.com or HamQTH. US and Canadian calls
@@ -116,6 +121,7 @@ cwtool decode recording.mp3         # decode every signal in a recording
 cwtool decode w1aw.mp3 --reference w1aw.txt   # measure character error rate
 cwtool synth --pileup -o band.wav   # generate a 6-station test scene
 cwtool bench --compare-lm           # synthetic benchmark suite
+cwtool cty DL/W1ABC VP8LP           # DXCC country, zones and position of calls
 ```
 
 ## How well it decodes
@@ -181,6 +187,7 @@ sound card / file ─► resampler (8 kHz) ─► FFT 512 ─► waterfall + sig
 |---|---|
 | `src/decoder.rs` | slicer, timing model, beam-search decoder |
 | `src/lm.rs` | trigram language model (trained at start-up from a generated corpus) |
+| `src/cty.rs` | DXCC country lookup from `data/cty.dat` |
 | `src/skimmer.rs` | signal detection, channel lifecycle, spots |
 | `src/dsp/` | resampler, channel demodulator, spectrum |
 | `src/cat/` | radio protocols, auto-detect, polling thread |

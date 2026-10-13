@@ -5,6 +5,7 @@ pub mod audio;
 pub mod abbrev;
 pub mod audiofile;
 pub mod callsign;
+pub mod cty;
 pub mod cat;
 pub mod decoder;
 pub mod dsp;
