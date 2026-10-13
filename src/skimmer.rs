@@ -630,7 +630,10 @@ impl Skimmer {
                     .unwrap_or(call);
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
-                let confirmed = *n >= 2;
+                // Twice on this channel, or already spotted earlier (a net
+                // control is heard every few minutes, longer than a
+                // channel remembers its calls).
+                let confirmed = *n >= 2 || spots.iter().any(|s| s.call == call);
                 let strong_ctx = matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
                 if *n >= 2 || strong_ctx {
                     let wpm = ch.decoder.wpm().unwrap_or(0.0);

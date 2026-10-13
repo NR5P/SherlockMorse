@@ -898,6 +898,9 @@ pub struct CwDecoder {
     held_frames: u32,
     pub frames_since_mark: u64,
     pub total_marks: u64,
+    /// A long pause preceded the current run: likely a different station
+    /// starting its over (nets, QSOs on one frequency).
+    after_pause: bool,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
     dump: Option<std::io::BufWriter<std::fs::File>>,
 }
@@ -934,6 +937,7 @@ impl CwDecoder {
             held_frames: 0,
             frames_since_mark: 0,
             total_marks: 0,
+            after_pause: false,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
         }
     }
@@ -1181,6 +1185,14 @@ impl CwDecoder {
             let tail = self.run_z.split_off(self.run_z.len().saturating_sub(self.cand as usize));
             let prof = std::mem::replace(&mut self.run_z, tail);
             let was_mark = self.state;
+            if !was_mark && self.flushed {
+                // A silence after a flush is not reported as a space: note a
+                // long one here, for `new_over`.
+                let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(0.0);
+                if self.frames_since_mark as f32 * self.frame_ms >= (3.0 * wg).max(2500.0) {
+                    self.after_pause = true;
+                }
+            }
             self.state = want;
             self.run_frames = self.cand;
             self.cand = 0;
@@ -1250,6 +1262,21 @@ impl CwDecoder {
             }
             return;
         }
+        if self.new_over(run) {
+            // Finish the previous over's text, then measure the new
+            // sender's speed and spacing from scratch (the bootstrap path
+            // above), instead of reading them with the old sender's.
+            let mut b = self.beam.take().unwrap();
+            b.push(Run::Flush);
+            self.word.extend_from_slice(&b.take_committed());
+            self.long_gaps.clear();
+            self.boot.clear();
+            self.boot_prof.clear();
+            if std::env::var_os("CWSK_DEBUG").is_some() {
+                eprintln!("new over: re-measuring timing");
+            }
+            return self.on_run(run, prof);
+        }
         if let Run::Mark(_) = run {
             self.marks_since_check += 1;
         }
@@ -1304,6 +1331,21 @@ impl CwDecoder {
         }
         b.adapt(run);
         b.push_soft(run, prof.as_deref());
+    }
+
+    /// True when this run starts a different sender's over: the first mark
+    /// after a long pause. (A change of signal level would catch quick
+    /// handovers too, but QSB changes the level as much and was worse.)
+    fn new_over(&mut self, run: Run) -> bool {
+        let Some(b) = &self.beam else { return false };
+        match run {
+            Run::Space(sp) => {
+                self.after_pause |= sp >= (3.0 * b.timing.wgap()).max(2500.0);
+                false
+            }
+            Run::Mark(_) => std::mem::take(&mut self.after_pause) && b.fit_n > 0,
+            Run::Flush => false,
+        }
     }
 
     /// Forces out any pending text (e.g. at end of a file).
