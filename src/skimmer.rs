@@ -127,6 +127,9 @@ pub struct TextEvent {
     pub channel: u64,
     pub freq: f32,
     pub text: String,
+    /// Instead of text: why a channel was shown, hidden or removed, with
+    /// its measurements at the time (for the channel log).
+    pub note: Option<String>,
 }
 
 pub struct Skimmer {
@@ -173,6 +176,11 @@ pub fn bin_hz() -> f32 {
 /// Minimum timing-fit score for a channel to be shown (real CW measured
 /// 0.8-0.97 on live recordings; noise 0.35-0.68).
 const MIN_FIT: f32 = 0.78;
+
+/// Timing fit above which keying is certainly real CW (live recordings:
+/// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
+/// text.
+const STRONG_FIT: f32 = 0.85;
 
 /// Minimum mean Morse elements per character for a channel to be shown.
 /// Noise and artefacts decode as short characters (E T I A N M S, ~1.6
@@ -501,7 +509,7 @@ impl Skimmer {
         self.channels.retain_mut(|c| {
             let keep = (c.demod.freq as f32) > lo - 20.0 && (c.demod.freq as f32) < hi + 20.0;
             if !keep {
-                Self::dropping(c, now, events, spots);
+                Self::dropping(c, now, events, spots, "out of the passband after tuning");
             }
             keep
         });
@@ -681,13 +689,25 @@ impl Skimmer {
         } else {
             n >= 3 && dash >= 0.2
         };
+        // Clearly real keying (noise never fits Morse timing this well) is
+        // a real station even when its text is garbled (a handover, QRM, a
+        // sloppy fist): show it, dimmed, rather than hide it.
+        // (Echoes and other artefacts of strong signals are keyed too, but
+        // decode as runs of E I S T; real text averages 2.5-3.3 elements per
+        // character.)
+        let text_ok = text_ok || (fit >= STRONG_FIT && ch.decoder.snr_db() >= 12.0 && (n < 8 || el >= SHORT_JUNK_ELEMS));
         if ch.pinned {
             ch.qualified = true;
         } else if runs >= 20 || (final_ && runs >= 10) {
             if fit >= MIN_FIT && text_ok {
+                if !ch.qualified {
+                    Self::note(ch, now, events, "shown");
+                }
                 ch.qualified = true;
             } else if fit < MIN_FIT - 0.13 || (n >= 8 && !text_ok) {
                 if ch.qualified {
+                    let why = if fit < MIN_FIT - 0.13 { "hidden: keying no longer fits Morse timing" } else { "hidden: text looks like noise" };
+                    Self::note(ch, now, events, why);
                     Self::hide(ch, now, events, spots);
                 }
                 ch.qualified = false;
@@ -704,7 +724,7 @@ impl Skimmer {
     fn publish(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
         let out = std::mem::take(&mut ch.pending_out);
         if !out.is_empty() {
-            events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: out.clone() });
+            events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: out.clone(), note: None });
             Self::scan_calls(ch, &out, now, spots);
         }
     }
@@ -718,11 +738,31 @@ impl Skimmer {
         Self::publish(ch, now, events, spots);
     }
 
-    /// Called before a channel is removed: keeps its held-back last word.
-    fn dropping(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+    /// Called before a channel is removed: keeps its held-back last word,
+    /// and notes why a shown channel went away.
+    fn dropping(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>, why: &str) {
         if ch.qualified {
+            Self::note(ch, now, events, &format!("removed: {why}"));
             Self::hide(ch, now, events, spots);
         }
+    }
+
+    /// Records a change in a channel's visibility with its measurements.
+    fn note(ch: &Channel, now: f64, events: &mut Vec<TextEvent>, what: &str) {
+        let (fit, runs) = ch.decoder.fit();
+        let (el, dash, _) = text_quality(&ch.text);
+        let tail: String = ch.text.chars().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+        let note = format!(
+            "{what} | fit {fit:.2} ({runs} runs), snr {:.0} dB, {} wpm, {el:.2} el/char, dash {dash:.2}, plaus {}, age {:.0} s, last mark {:.0} s ago, last good keying {:.0} s ago | ...{}",
+            ch.decoder.snr_db(),
+            ch.decoder.wpm().map(|w| format!("{w:.0}")).unwrap_or("-".into()),
+            ch.plaus.map(|p| format!("{p:.2}")).unwrap_or("-".into()),
+            now - ch.created,
+            now - ch.last_mark,
+            now - ch.last_good,
+            crate::morse::to_display(tail.trim()),
+        );
+        events.push(TextEvent { channel: ch.id, freq: ch.demod.freq as f32, text: String::new(), note: Some(note) });
     }
 
     fn scan_calls(ch: &mut Channel, txt: &str, now: f64, spots: &mut Vec<Spot>) {
@@ -885,7 +925,7 @@ impl Skimmer {
                 match weakest {
                     Some((i, l)) if l + 6.0 < lvl => {
                         let mut c = self.channels.remove(i);
-                        Self::dropping(&mut c, self.time, &mut self.events, &mut self.spots);
+                        Self::dropping(&mut c, self.time, &mut self.events, &mut self.spots, "replaced by a stronger signal (channel limit)");
                     }
                     _ => continue,
                 }
@@ -953,7 +993,7 @@ impl Skimmer {
             let keep = !dead[i];
             i += 1;
             if !keep {
-                Self::dropping(c, now, events, spots);
+                Self::dropping(c, now, events, spots, "artifact or duplicate of a stronger signal");
                 self.suppressed.push((c.demod.freq as f32, until));
             }
             keep
@@ -975,6 +1015,7 @@ impl Skimmer {
                 c.last_good = now;
             }
             if !c.pinned && c.qualified && runs >= 20 && fit < MIN_FIT - 0.13 {
+                Self::note(c, now, &mut self.events, "hidden: keying no longer fits Morse timing (housekeeping)");
                 Self::hide(c, now, &mut self.events, &mut self.spots);
                 c.qualified = false;
             }
@@ -985,7 +1026,7 @@ impl Skimmer {
         self.channels.retain_mut(|c| {
             let keep = c.pinned || (now - c.last_mark < timeout && now - c.last_good < timeout);
             if !keep {
-                Self::dropping(c, now, events, spots);
+                Self::dropping(c, now, events, spots, "timed out");
             }
             if !keep && c.qualified {
                 retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone() });
@@ -1006,7 +1047,7 @@ impl Skimmer {
                     let drop_j = b.pinned <= a.pinned && (a.pinned || a.decoder.total_marks >= b.decoder.total_marks);
                     let k = if drop_j { j } else { i };
                     let mut c = self.channels.remove(k);
-                    Self::dropping(&mut c, now, &mut self.events, &mut self.spots);
+                    Self::dropping(&mut c, now, &mut self.events, &mut self.spots, "merged with a channel on the same signal");
                     if drop_j {
                         continue;
                     } else {

@@ -544,7 +544,7 @@ impl App {
         if let Some(e) = &self.engine {
             let mut s = e.snap.lock();
             let rows = std::mem::take(&mut s.new_rows);
-            let events = std::mem::take(&mut s.events);
+            let (notes, events): (Vec<_>, Vec<_>) = std::mem::take(&mut s.events).into_iter().partition(|e| e.note.is_some());
             self.snap.channels = s.channels.clone();
             self.snap.spots = s.spots.clone();
             self.snap.noise_floor_db = s.noise_floor_db;
@@ -566,6 +566,7 @@ impl App {
             for r in rows {
                 self.push_wf_row(&r);
             }
+            self.log_channel_notes(&notes);
             for ev in &events {
                 self.qso_feed(ev.freq, &ev.text);
             }
@@ -693,6 +694,30 @@ impl App {
             if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let _ = fh.write_all(line.as_bytes());
             }
+        }
+    }
+
+    /// Appends channel visibility changes (shown / hidden / removed, with
+    /// the reason and measurements) to channels-<date>.txt, to diagnose
+    /// stations disappearing from the list.
+    fn log_channel_notes(&self, notes: &[cwskimmer::skimmer::TextEvent]) {
+        if notes.is_empty() {
+            return;
+        }
+        let (date, time) = utc_now();
+        let dir = log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut out = String::new();
+        for n in notes {
+            let f = match self.rf_of(n.freq) {
+                Some(rf) => format!("{:>10.2} kHz", rf as f64 / 1000.0),
+                None => format!("{:>7.0} Hz audio", n.freq),
+            };
+            out.push_str(&format!("{date} {time}Z  {f}  #{}  {}\n", n.channel, n.note.as_deref().unwrap_or("")));
+        }
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("channels-{date}.txt"))) {
+            let _ = fh.write_all(out.as_bytes());
         }
     }
 

@@ -176,6 +176,12 @@ fn main() -> Result<()> {
                 }
             }
             for e in sk.events.drain(..) {
+                if let Some(n) = &e.note {
+                    if std::env::var_os("CWSK_NOTES").is_some() {
+                        eprintln!("NOTE {:7.1} Hz #{}: {n}", e.freq, e.channel);
+                    }
+                    continue;
+                }
                 let ent = log.entry(e.channel).or_insert((e.freq, String::new()));
                 ent.0 = e.freq;
                 ent.1.push_str(&e.text);
