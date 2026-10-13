@@ -2,8 +2,7 @@
 
 # Sherlock Morse
 
-A cross-platform CW (Morse code) skimmer in the spirit of
-VE3NEA's CW Skimmer. It finds **every CW signal in your receiver's audio
+A cross-platform CW (Morse code) skimmer. It finds **every CW signal in your receiver's audio
 passband**, decodes them all at the same time, pulls out callsigns, and can
 retune your radio over CAT with a click.
 
