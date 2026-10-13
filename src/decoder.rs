@@ -697,11 +697,17 @@ fn model_score(d: f32, marks: &[f32], spaces: &[f32]) -> f32 {
     let sm = 0.30f32;
     let ss = 0.40f32;
     const FLOOR: f32 = -3.0;
-    let mut score = 0.0;
-    for &m in marks {
-        let a = lognorm(m, d, sm);
-        let b = lognorm(m, 3.0 * d, sm);
-        score += a.max(b).max(FLOOR);
+    // Dash/dot ratio: 3 nominally, but hand senders range widely; fit it
+    // too (with a prior toward 3) so a heavy dash does not inflate the dot.
+    let mut score = f32::NEG_INFINITY;
+    for r in [2.6f32, 3.0, 3.4, 3.8, 4.3] {
+        let mut sc = -0.5 * ((r / 3.0).ln() / 0.15).powi(2);
+        for &m in marks {
+            let a = lognorm(m, d, sm);
+            let b = lognorm(m, r * d, sm);
+            sc += a.max(b).max(FLOOR);
+        }
+        score = score.max(sc);
     }
     for &s in spaces {
         if s > 15.0 * d {
@@ -812,7 +818,7 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
 /// clusters by 1-D k-means on log durations. Returns (character gap, word
 /// gap) when they are clearly distinct and both common enough to trust.
 pub fn gap_clusters(gaps: &[f32]) -> Option<(f32, f32)> {
-    if gaps.len() < 16 {
+    if gaps.len() < 10 {
         return None;
     }
     let mut v: Vec<f32> = gaps.iter().map(|g| g.max(1.0).ln()).collect();
@@ -1332,19 +1338,8 @@ impl CwDecoder {
                 let t = &self.beam.as_ref().unwrap().timing;
                 eprintln!("TIMING dot {:.0} dash {:.0} egap {:.0} cgap {:.0} wgap {:.0} clusters {:?}", t.dot, t.dash, t.egap, t.cgap, t.wgap(), gap_clusters(&self.long_gaps.iter().copied().collect::<Vec<_>>()));
             }
-            // This sender's word spacing, from the two clusters of gaps.
-            let lg: Vec<f32> = self.long_gaps.iter().copied().collect();
-            if let Some((c, w)) = gap_clusters(&lg) {
-                let t = &mut self.beam.as_mut().unwrap().timing;
-                if (c / t.cgap - 1.0).abs() < 0.4 {
-                    t.cgap = c.clamp(t.dot * 2.0, t.dot * 15.0);
-                }
-                let nominal = t.wgap() / t.wscale;
-                t.wscale = (w / nominal).clamp(0.55, 1.6);
-            }
         }
-        let b = self.beam.as_mut().unwrap();
-        if let Run::Space(sp) = run {
+        if let (Run::Space(sp), Some(b)) = (run, &self.beam) {
             let t = &b.timing;
             let nominal = t.wgap() / t.wscale;
             if sp > 2.0 * t.egap.max(t.dot) && sp < 2.5 * nominal {
@@ -1352,10 +1347,31 @@ impl CwDecoder {
                 if self.long_gaps.len() > 48 {
                     self.long_gaps.pop_front();
                 }
+                self.update_spacing();
             }
         }
+        let b = self.beam.as_mut().unwrap();
         b.adapt(run);
         b.push_soft(run, prof.as_deref());
+    }
+
+    /// This sender's character and word spacing, from the two clusters of
+    /// recent long gaps.
+    fn update_spacing(&mut self) {
+        let lg: Vec<f32> = self.long_gaps.iter().copied().collect();
+        if let Some((c, w)) = gap_clusters(&lg) {
+            let Some(b) = self.beam.as_mut() else { return };
+            let t = &mut b.timing;
+            // The clusters are robust: trust them even when the tracked
+            // character gap has drifted far off (it can absorb word gaps
+            // with a heavy fist), as long as the lower cluster is not
+            // just element gaps.
+            if c > 1.5 * t.egap.max(0.7 * t.dot) {
+                t.cgap = c.clamp(t.dot * 2.0, t.dot * 15.0);
+            }
+            let nominal = t.wgap() / t.wscale;
+            t.wscale = (w / nominal).clamp(0.55, 1.6);
+        }
     }
 
     /// True when this run starts a different sender's over: the first mark
