@@ -142,7 +142,8 @@ fn main() -> Result<()> {
             }
             eprintln!("{}: {:.1} s at {} Hz", file.display(), samples.len() as f32 / rate as f32, rate);
             let lm = Arc::new(if no_lm { LanguageModel::uniform() } else { LanguageModel::new() });
-            let cfg = SkimmerConfig { min_freq, max_freq, auto_detect: freq.is_none(), params: DecoderParams::from_env(), ..Default::default() };
+            let detect_db = std::env::var("CWSK_DETECT_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(SkimmerConfig::default().detect_db);
+            let cfg = SkimmerConfig { min_freq, max_freq, auto_detect: freq.is_none(), params: DecoderParams::from_env(), detect_db, ..Default::default() };
             let mut sk = Skimmer::new(cfg, lm);
             if let Some(f) = freq {
                 sk.add_channel(f, true);
@@ -434,7 +435,8 @@ fn cases() -> Vec<Case> {
 /// CER for each signal: decoded text is gathered from channels within 25 Hz.
 fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
     let samples = synth::render(scene);
-    let mut sk = Skimmer::new(SkimmerConfig { params: DecoderParams::from_env(), ..Default::default() }, lm);
+    let detect_db = std::env::var("CWSK_DETECT_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(SkimmerConfig::default().detect_db);
+    let mut sk = Skimmer::new(SkimmerConfig { params: DecoderParams::from_env(), detect_db, ..Default::default() }, lm);
     // 20 ms chunks, like live sound-card capture.
     for c in samples.chunks(160) {
         sk.process(c);
