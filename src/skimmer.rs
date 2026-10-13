@@ -83,8 +83,9 @@ pub struct Channel {
     /// was created, kept until it is shown: whenever the measured speed
     /// changes, the start is decoded again with it (see `redecode_start`).
     start_frames: Option<Vec<Complex32>>,
-    /// Dot length the start was last decoded with.
+    /// Dot length the start was last decoded with, and how many times.
     start_dot: Option<f32>,
+    start_redecodes: u8,
     /// Length of `text` when the channel was created (revived text).
     start_text_len: usize,
 }
@@ -406,6 +407,7 @@ impl Skimmer {
             words: String::new(),
             post: None,
             start_dot: None,
+            start_redecodes: 0,
             start_text_len: rtext.len(),
             plaus: None,
             call_counts: rcalls,
@@ -541,7 +543,8 @@ impl Skimmer {
                     }
                 }
                 if let (Some(t), Some(_)) = (ch.decoder.timing(), &ch.start_frames) {
-                    if ch.start_dot.is_none_or(|d| !(0.8..=1.25).contains(&(t.dot / d))) {
+                    // A few times at most: noise channels' speed wanders.
+                    if ch.start_redecodes < 3 && ch.start_dot.is_none_or(|d| !(0.8..=1.25).contains(&(t.dot / d))) {
                         Self::redecode_start(ch, params, lm);
                     }
                 }
@@ -622,6 +625,7 @@ impl Skimmer {
         // The filter carries on from the end of the replayed start.
         ch.post = Some((li, lq, bw));
         ch.start_dot = Some(t.dot);
+        ch.start_redecodes += 1;
         ch.text.truncate(ch.start_text_len);
         ch.pending_out.clear();
     }
