@@ -16,6 +16,8 @@ pub struct ChannelDemod {
     prev: Complex32,
     afc_err: f32,
     afc_n: u32,
+    /// Consecutive mark frames so far (AFC skips the keying edges).
+    mark_run: u32,
     pub afc_limit: (f64, f64),
 }
 
@@ -34,6 +36,7 @@ impl ChannelDemod {
             prev: Complex32::new(0.0, 0.0),
             afc_err: 0.0,
             afc_n: 0,
+            mark_run: 0,
             afc_limit: (freq - 12.0, freq + 12.0),
         }
     }
@@ -76,7 +79,10 @@ impl ChannelDemod {
 
     /// Feeds a frame for AFC while a mark is present.
     pub fn afc(&mut self, z: Complex32, is_mark: bool) {
-        if is_mark && self.prev.norm_sqr() > 0.0 {
+        self.mark_run = if is_mark { self.mark_run + 1 } else { 0 };
+        // The phase jumps at the keying edges (filter transients): measure
+        // only well inside a mark.
+        if is_mark && self.mark_run > 6 && self.prev.norm_sqr() > 0.0 {
             let d = z * self.prev.conj();
             let hz = d.arg() / (std::f32::consts::TAU * self.frame_ms() / 1000.0);
             self.afc_err += hz;
@@ -84,6 +90,7 @@ impl ChannelDemod {
             if self.afc_n >= 50 {
                 let err = (self.afc_err / self.afc_n as f32) as f64;
                 let nf = (self.freq + 0.3 * err).clamp(self.afc_limit.0, self.afc_limit.1);
+
                 self.freq = nf;
                 self.afc_err = 0.0;
                 self.afc_n = 0;

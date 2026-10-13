@@ -36,6 +36,8 @@ pub struct SignalSpec {
     /// above. With it, `qsb_depth` is the scattered fraction of the power
     /// (1 = pure Rayleigh, deep random fades as on real skywave paths).
     pub fade_hz: f32,
+    /// Carrier frequency drift over the signal (Hz, linear).
+    pub freq_drift: f32,
     /// Start time in seconds.
     pub start: f32,
     /// Rise/fall time (ms).
@@ -59,6 +61,7 @@ impl Default for SignalSpec {
             qsb_depth: 0.0,
             qsb_hz: 0.2,
             fade_hz: 0.0,
+            freq_drift: 0.0,
             start: 0.5,
             rise_ms: 5.0,
         }
@@ -178,6 +181,8 @@ pub fn render(scene: &Scene) -> Vec<f32> {
             }
         }
         let phase0: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+        // Linear frequency drift: chirp rate in Hz/s over the signal.
+        let drift_rate = s.freq_drift / tl.iter().map(|x| x.1).sum::<f32>().max(1.0);
         let qsb_phase: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
         // Sum-of-sinusoids Rayleigh fading (Jakes): random arrival angles
         // and phases give a complex gain with unit mean power.
@@ -205,7 +210,9 @@ pub fn render(scene: &Scene) -> Vec<f32> {
             } else {
                 1.0
             };
-            out[i] += a * fade * acc[i] * (std::f32::consts::TAU * s.freq * tt + phase0).sin();
+            let dt = tt - s.start;
+            let ph = std::f32::consts::TAU * (s.freq * tt + 0.5 * drift_rate * dt * dt) as f64 as f32;
+            out[i] += a * fade * acc[i] * (ph + phase0).sin();
         }
     }
     let normal = Normal::new(0.0f32, sigma).unwrap();

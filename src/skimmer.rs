@@ -536,6 +536,16 @@ impl Skimmer {
             if ch.decoder.is_mark() {
                 ch.last_mark = now;
             }
+            // While the channel decodes well, let the AFC window follow the
+            // signal so a drifting transmitter is tracked.
+            // Slowly (over ~3 s), so AFC measurement noise cannot random-walk
+            // the channel away.
+            if ch.decoder.fit().0 >= MIN_FIT {
+                let (lo, hi) = ch.demod.afc_limit;
+                let c = 0.5 * (lo + hi);
+                let c = c + 0.005 * (ch.demod.freq - c);
+                ch.demod.afc_limit = (c - 12.0, c + 12.0);
+            }
             if let Some(t) = ch.decoder.timing() {
                 // Match the filter to the keying speed.
                 let bw = (ch.decoder.params().bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);

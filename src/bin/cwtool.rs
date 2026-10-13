@@ -401,6 +401,10 @@ fn cases() -> Vec<Case> {
             name: "wide-chargaps",
             make: |s| one(SignalSpec { text: text(s), wpm: 22.0, snr_db: 8.0, jitter: 0.12, char_gap: 4.5, word_gap: 9.0, ..Default::default() }, s),
         },
+        Case {
+            name: "freq-drift-40hz",
+            make: |s| one(SignalSpec { text: text(s), wpm: 16.0, snr_db: 3.0, jitter: 0.08, freq_drift: 40.0, ..Default::default() }, s),
+        },
         Case { name: "drift+40%", make: |s| one(SignalSpec { text: text(s), wpm: 18.0, drift: 0.4, snr_db: 10.0, ..Default::default() }, s) },
         Case { name: "fast-40wpm", make: |s| one(SignalSpec { text: text(s), wpm: 40.0, snr_db: 10.0, ..Default::default() }, s) },
         Case { name: "slow-10wpm", make: |s| one(SignalSpec { text: text(s), wpm: 10.0, snr_db: 5.0, ..Default::default() }, s) },
@@ -442,10 +446,11 @@ fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
         .iter()
         .map(|sig| {
             let mut txt = String::new();
-            // Use the channel (within 25 Hz) that produced the most text.
+            // Use the channel (within 25 Hz, plus any drift) that produced
+            // the most text.
             let mut per: std::collections::HashMap<u64, String> = Default::default();
             for e in &events {
-                if (e.freq - sig.freq).abs() < 25.0 {
+                if (e.freq - sig.freq).abs() < 25.0 + sig.freq_drift.abs() {
                     per.entry(e.channel).or_default().push_str(&e.text);
                 }
             }
