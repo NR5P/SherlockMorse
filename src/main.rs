@@ -1,6 +1,5 @@
 //! CW Skimmer – multi-channel Morse decoder with waterfall and CAT control.
 
-use cwskimmer::activity::{self, Activity};
 use cwskimmer::audio::{self, ChannelSel, DeviceInfo};
 use cwskimmer::cat::controller::{RigController, RigState};
 use cwskimmer::cat::{self, Mode, RigConfig, RigKind};
@@ -46,8 +45,6 @@ struct Settings {
     lookup: Credentials,
     /// Operator's own locator, for distance and bearing to stations.
     my_grid: String,
-    /// Flags shown on stations heard in a contest or on-air program.
-    activities: Vec<Activity>,
 }
 
 impl Default for Settings {
@@ -73,7 +70,6 @@ impl Default for Settings {
             explain_abbrev: true,
             lookup: Credentials::default(),
             my_grid: String::new(),
-            activities: activity::defaults(),
         }
     }
 }
@@ -88,8 +84,6 @@ struct SpotRow {
     last: Instant,
     count: u32,
     country: Option<Country>,
-    /// Activities heard on its channel: (flag name, what was sent).
-    tags: Vec<(String, String)>,
 }
 
 struct App {
@@ -134,8 +128,6 @@ struct App {
     probe_rx: Option<crossbeam_channel::Receiver<ProbeMsg>>,
     probe_status: String,
     show_settings: bool,
-    /// Activities recognised on each decoder channel, kept while it lives.
-    chan_tags: std::collections::HashMap<u64, Vec<(String, String)>>,
     lookup: Lookup,
     /// DXCC country file, and a download in progress.
     cty: Arc<Cty>,
@@ -297,7 +289,6 @@ impl App {
             probe_rx: None,
             probe_status: String::new(),
             show_settings: false,
-            chan_tags: Default::default(),
             lookup: Lookup::default(),
             cty: Arc::new(Cty::built_in()),
             cty_status: String::new(),
@@ -562,7 +553,6 @@ impl App {
             for ev in &events {
                 self.qso_feed(ev.freq, &ev.text);
             }
-            self.tag_channels(events.iter().map(|e| e.channel).collect());
             for ev in events {
                 let e = self.lines.entry(ev.channel).or_insert_with(|| (ev.freq, String::new(), Instant::now()));
                 e.0 = ev.freq;
@@ -618,14 +608,7 @@ impl App {
                 }
                 None => {
                     let country = self.cty.lookup(&sp.call);
-                    self.spots.push(SpotRow { call: sp.call.clone(), rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count, country, tags: vec![] })
-                }
-            }
-            if let (Some(tags), Some(r)) = (self.chan_tags.get(&sp.channel), self.spots.iter_mut().find(|r| r.call == sp.call)) {
-                for t in tags {
-                    if !r.tags.iter().any(|(n, _)| n == &t.0) {
-                        r.tags.push(t.clone());
-                    }
+                    self.spots.push(SpotRow { call: sp.call, rf, audio: sp.freq, wpm: sp.wpm, snr: sp.snr_db, last: Instant::now(), count: sp.count, country })
                 }
             }
         }
@@ -762,9 +745,8 @@ impl App {
         }
     }
 
-    /// Ends the conversation when we have moved off frequency for 30 s. While
-    /// we stay on frequency it stays up; only without CAT (frequency unknown)
-    /// does 10 minutes without text end it.
+    /// Ends the conversation when we have moved off frequency for 30 s, or
+    /// after 10 minutes without text.
     fn qso_tick(&mut self) {
         let vfo_rf = self.rf_of(self.pitch());
         let Some(q) = &mut self.qso else { return };
@@ -777,7 +759,7 @@ impl App {
         } else {
             q.away_since = None;
         }
-        if self.qso.as_ref().is_some_and(|q| (q.rf.is_none() || vfo_rf.is_none()) && q.last_text.elapsed() > Duration::from_secs(600)) {
+        if self.qso.as_ref().is_some_and(|q| q.last_text.elapsed() > Duration::from_secs(600)) {
             self.qso_finish();
         }
     }
@@ -832,34 +814,6 @@ impl App {
             *p = colormap(v);
         }
         self.wf_dirty = true;
-    }
-
-    /// Looks for activity flags in the text of channels that just decoded
-    /// something, and forgets channels that are gone.
-    fn tag_channels(&mut self, mut ids: Vec<u64>) {
-        ids.sort_unstable();
-        ids.dedup();
-        for ch in self.snap.channels.iter().filter(|c| ids.binary_search(&c.id).is_ok()) {
-            let mut from = ch.text.len().saturating_sub(300);
-            while !ch.text.is_char_boundary(from) {
-                from += 1;
-            }
-            let tail = &ch.text[from..];
-            let found = activity::detect(&self.s.activities, &activity::words(&to_display(tail)));
-            let tags = self.chan_tags.entry(ch.id).or_default();
-            for t in found {
-                if !tags.iter().any(|(n, _)| n == &t.0) {
-                    tags.push(t);
-                }
-            }
-        }
-        let live: std::collections::HashSet<u64> = self.snap.channels.iter().map(|c| c.id).collect();
-        self.chan_tags.retain(|id, _| live.contains(id));
-    }
-
-    /// Flags to draw for `tags`: only activities still enabled, in settings order.
-    fn flags<'a>(&'a self, tags: &'a [(String, String)]) -> impl Iterator<Item = (&'a Activity, &'a str)> + 'a {
-        self.s.activities.iter().filter(|a| a.enabled).filter_map(move |a| tags.iter().find(|(n, _)| *n == a.name).map(|(_, p)| (a, p.as_str())))
     }
 
     /// Uses a downloaded country file if there is a good one, else the built-in copy.
@@ -1207,7 +1161,6 @@ impl App {
         });
         ui.label(RichText::new(&self.cty_status).small().weak());
         ui.add_space(6.0);
-        self.ui_activity_settings(ui);
         if self.s.lookup != before {
             self.lookup.clear();
         }
@@ -1217,43 +1170,6 @@ impl App {
             }
         }
         ui.label(RichText::new("Decoder parameters apply to newly detected signals.").small().weak());
-    }
-
-    /// Editable list of activity flags.
-    fn ui_activity_settings(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Activity flags").strong()).id_salt("activity_flags").show(ui, |ui| {
-            ui.label(
-                RichText::new("Stations sending these words get a flag. Separate patterns with commas; a pattern can be several words (\"CQ POTA\") and * matches anything (\"K-*\").")
-                    .small()
-                    .weak(),
-            );
-            let mut remove = None;
-            egui::Grid::new("activities").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
-                for (i, a) in self.s.activities.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut a.enabled, "").on_hover_text("Show this flag");
-                        ui.color_edit_button_srgb(&mut a.color);
-                    });
-                    ui.add(egui::TextEdit::singleline(&mut a.name).desired_width(56.0).hint_text("name"));
-                    ui.add(egui::TextEdit::singleline(&mut a.patterns).desired_width(170.0).hint_text("CQ XYZ, XYZ"));
-                    if ui.small_button("✖").on_hover_text("Delete this flag").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-            if let Some(i) = remove {
-                self.s.activities.remove(i);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Add").clicked() {
-                    self.s.activities.push(Activity::default());
-                }
-                if ui.button("Restore defaults").on_hover_text("Replace this list with the built-in flags").clicked() {
-                    self.s.activities = activity::defaults();
-                }
-            });
-        });
     }
 
     fn ui_waterfall(&mut self, ui: &mut egui::Ui, height: f32) {
@@ -1413,13 +1329,10 @@ impl App {
                             ui.label(format!("{:.0}", ch.snr_db));
                         });
                         row.col(|ui| {
-                            let tags = self.chan_tags.get(&ch.id).map(Vec::as_slice).unwrap_or_default();
-                            let flags: Vec<_> = self.flags(tags).collect();
-                            let flag_chars: usize = flags.iter().map(|(a, _)| a.name.chars().count() + 3).sum();
                             let full = to_display(&ch.text);
                             let tent = to_display(&ch.tentative);
                             let total = full.len() + tent.len();
-                            let skip = total.saturating_sub(max_chars.saturating_sub(flag_chars).max(10));
+                            let skip = total.saturating_sub(max_chars);
                             let (a, b) = if skip >= full.len() {
                                 (String::new(), tent[skip - full.len()..].to_string())
                             } else {
@@ -1428,9 +1341,6 @@ impl App {
                             let age = ch.last_mark_age;
                             let col = if age < 5.0 { Color32::WHITE } else { Color32::GRAY };
                             ui.horizontal(|ui| {
-                                for (act, heard) in &flags {
-                                    flag_badge(ui, act, heard);
-                                }
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.add(egui::Label::new(RichText::new(a).monospace().color(col)).selectable(false));
                                 ui.add(egui::Label::new(RichText::new(b).monospace().color(Color32::from_gray(130))).selectable(false));
@@ -1525,14 +1435,9 @@ impl App {
                             ui.label(if a < 60 { format!("{a}s") } else { format!("{}m", a / 60) });
                         });
                         row.col(|ui| {
-                            ui.horizontal(|ui| {
-                                for (act, heard) in self.flags(&s.tags) {
-                                    flag_badge(ui, act, heard);
-                                }
-                                if let Some(c) = &s.country {
-                                    ui.add(egui::Label::new(&c.name).truncate()).on_hover_text(self.country_summary(c));
-                                }
-                            });
+                            if let Some(c) = &s.country {
+                                ui.add(egui::Label::new(&c.name).truncate()).on_hover_text(self.country_summary(c));
+                            }
                         });
                     });
                 }
@@ -1928,13 +1833,6 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, 
 const CALL_COLOR: Color32 = Color32::from_rgb(255, 210, 90);
 
 /// A callsign drawn as a clickable link.
-/// A small coloured tag such as "POTA"; hovering shows what was heard.
-fn flag_badge(ui: &mut egui::Ui, a: &Activity, heard: &str) -> egui::Response {
-    let [r, g, b] = a.color;
-    let text = RichText::new(format!(" {} ", a.name)).small().strong().color(Color32::BLACK).background_color(Color32::from_rgb(r, g, b));
-    ui.add(egui::Label::new(text).selectable(false)).on_hover_text(format!("{}: heard \"{heard}\"", a.name))
-}
-
 fn call_link(ui: &mut egui::Ui, call: &str, size: f32) -> egui::Response {
     let r = ui.add(egui::Label::new(RichText::new(call).monospace().size(size).strong().color(CALL_COLOR)).sense(Sense::click()));
     if r.hovered() {
@@ -1979,7 +1877,7 @@ impl eframe::App for App {
         if self.show_settings {
             egui::SidePanel::left("settings").resizable(false).show(ctx, |ui| {
                 ui.heading("Settings");
-                egui::ScrollArea::vertical().show(ui, |ui| self.ui_settings(ui));
+                self.ui_settings(ui);
             });
         }
         egui::SidePanel::right("spots").default_width(370.0).resizable(true).show(ctx, |ui| self.ui_spots(ui));
