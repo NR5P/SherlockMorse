@@ -197,4 +197,6 @@ sound card / file ─► resampler (8 kHz) ─► FFT 512 ─► waterfall + sig
 
 ## License
 
-MIT
+[PolyForm Noncommercial 1.0.0](LICENSE). You can use, copy, change and share
+this software for any noncommercial purpose. You can't sell it or use it
+commercially.
