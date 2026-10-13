@@ -119,7 +119,7 @@ impl Default for DecoderParams {
             squelch_close: 1.9,
             threshold: 0.5,
             sig_decay: 0.0015,
-            bw_factor: 2.8,
+            bw_factor: 1.6,
             sig_track: 0.02,
             sig_attack: 0.01,
             debounce: 0.24,

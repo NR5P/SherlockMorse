@@ -143,22 +143,22 @@ real skywave QSB (deep, irregular fades), not a slow sine.
 | Clean, 20 WPM | 0.0 % |
 | SNR +5 dB, 25 WPM | 0.2 % |
 | SNR 0 dB, 22 WPM | 0.6 % |
-| SNR −4 dB, 18 WPM | 2.1 % |
-| SNR −8 dB, 18 WPM | 47 % |
-| Hand key, 15 % timing jitter | 0.6 % |
-| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 18 % |
+| SNR −4 dB, 18 WPM | 2.0 % |
+| SNR −8 dB, 18 WPM | 21 % |
+| Hand key, 15 % timing jitter | 0.2 % |
+| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 11 % |
 | Farnsworth 18/8 WPM | 5.1 % |
-| Deep periodic QSB | 1.8 % |
-| Rayleigh fading, SNR 0 dB, 16 WPM, 1 Hz | 5.7 % |
-| Rayleigh fading, SNR −3 dB, 20 WPM | 5.8 % |
-| Rayleigh fading + hand key | 1.4 % |
-| Words run together (4.5-dot word gaps) | 2.9 % |
+| Deep periodic QSB | 1.3 % |
+| Rayleigh fading, SNR 0 dB, 16 WPM, 1 Hz | 5.2 % |
+| Rayleigh fading, SNR −3 dB, 20 WPM | 3.7 % |
+| Rayleigh fading + hand key | 0.8 % |
+| Words run together (4.5-dot word gaps) | 1.6 % |
 | Letters spread apart (4.5-dot character gaps) | 0.3 % |
 | Static crashes (QRN) | 0.6 % |
 | Speed drifting +40 % | 0.0 % |
 | 40 WPM / 10 WPM | 0.0 % / 0.0 % |
-| Random 5-letter groups (LM can't help) | 1.7 % |
-| 5-station pileup, 80–240 Hz apart | 1.7 % |
+| Random 5-letter groups (LM can't help) | 1.5 % |
+| 5-station pileup, 80–240 Hz apart | 1.9 % |
 
 Turning the language model off (`--compare-lm`) raises the error rate on clean
 signals from about 0 % to about 20 %, so the text prediction matters. At
