@@ -5,6 +5,7 @@ use crate::callsign::parse_callsign;
 use crate::decoder::{CwDecoder, DecoderParams};
 use crate::dsp::channel::ChannelDemod;
 use crate::dsp::spectrum::Spectrum;
+use crate::dsp::Lowpass4;
 use crate::lm::LanguageModel;
 use num_complex::Complex32;
 use std::collections::{HashMap, VecDeque};
@@ -75,6 +76,10 @@ pub struct Channel {
     call_counts: HashMap<String, u32>,
     prev_word: String,
     frames: Vec<Complex32>,
+    /// Baseband frames since the channel was created, kept until the
+    /// decoder knows the speed: then they are decoded again through the
+    /// narrow speed-matched filter (see `redecode_start`).
+    start_frames: Option<Vec<Complex32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +375,7 @@ impl Skimmer {
         demod.process(b, &mut frames);
         let amps: Vec<f32> = frames.iter().map(|z| z.norm()).collect();
         decoder.warmup(&amps);
+        let start_frames = Some(frames);
         self.channels.push(Channel {
             id,
             demod,
@@ -389,6 +395,7 @@ impl Skimmer {
             call_counts: rcalls,
             prev_word: String::new(),
             frames: Vec::new(),
+            start_frames,
         });
         id
     }
@@ -497,13 +504,26 @@ impl Skimmer {
             self.preroll.drain(..n);
         }
         let now = self.time;
+        let (params, lm) = (&self.cfg.params, &self.lm);
         for ch in &mut self.channels {
             ch.frames.clear();
             ch.demod.process(samples, &mut ch.frames);
             ch.decoder.set_erasure(self.burst && (5..60).contains(&self.burst_hops));
             for i in 0..ch.frames.len() {
                 let z = ch.frames[i];
+                let had_speed = ch.decoder.timing().is_some();
                 ch.decoder.push_frame(z.norm());
+                if let Some(f) = &mut ch.start_frames {
+                    f.push(z);
+                    // Give up on very long starts (nothing that looks like
+                    // Morse for 20 s).
+                    if f.len() as f32 * ch.demod.frame_ms() > 20_000.0 {
+                        ch.start_frames = None;
+                    }
+                }
+                if !had_speed && ch.decoder.timing().is_some() {
+                    Self::redecode_start(ch, params, lm);
+                }
                 // AFC only on clean marks so it cannot wander off onto
                 // a neighbour.
                 let strong = ch.decoder.snr_db() > 12.0;
@@ -537,6 +557,32 @@ impl Skimmer {
             let txt = ch.decoder.take_text();
             Self::deliver(ch, &txt, self.time, true, &self.lm, &mut self.events, &mut self.spots);
         }
+    }
+
+    /// The decoder has just measured the speed: decode the channel's start
+    /// again through the speed-matched filter. Until now it was filtered
+    /// wide (the speed was unknown), so the first characters of every
+    /// transmission were copied through several dB more noise. Nothing has
+    /// been shown yet (text starts once the speed is known), so the fresh
+    /// decoder simply replaces the old one.
+    fn redecode_start(ch: &mut Channel, params: &DecoderParams, lm: &Arc<LanguageModel>) {
+        let Some(frames) = ch.start_frames.take() else { return };
+        let Some(t) = ch.decoder.timing() else { return };
+        let bw = (params.bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);
+        if bw > 0.8 * ch.demod.bandwidth {
+            return;
+        }
+        let fs = 1000.0 / ch.demod.frame_ms();
+        let (mut li, mut lq) = (Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0));
+        let amps: Vec<f32> = frames.iter().map(|z| Complex32::new(li.process(z.re), lq.process(z.im)).norm()).collect();
+        // Start from the timing already measured: re-measuring on the
+        // narrow-filtered start can go wrong with a sloppy fist whose short
+        // gaps the filter partly fills in.
+        let mut d = CwDecoder::new(ch.demod.frame_ms(), params.clone(), lm.clone());
+        d.seed_timing(t.clone());
+        d.warmup(&amps);
+        ch.decoder = d;
+        ch.demod.set_bandwidth(bw);
     }
 
     /// Appends decoded text to a channel and publishes it once the channel

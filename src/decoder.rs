@@ -996,6 +996,11 @@ impl CwDecoder {
         }
     }
 
+    /// Starts decoding with a known timing instead of measuring it first.
+    pub fn seed_timing(&mut self, tm: TimingModel) {
+        self.beam = Some(BeamDecoder::new(self.params.clone(), self.lm.clone(), tm));
+    }
+
     pub fn params(&self) -> &DecoderParams {
         &self.params
     }
