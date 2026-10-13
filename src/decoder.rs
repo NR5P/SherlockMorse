@@ -752,6 +752,41 @@ pub fn better(runs: &[Run], cur: f32, new: f32) -> bool {
     m.len() >= 6 && model_score(new, &m, &s) > model_score(cur, &m, &s)
 }
 
+/// Character gap from the first few long gaps: the lower group if they
+/// split into two (character and word gaps), otherwise judged by length:
+/// under 5 dots they are character gaps, over 9 Farnsworth character gaps,
+/// and in between most likely word gaps (keep the 3-dot default).
+fn early_cgap(long: &mut [f32], dot: f32) -> Option<f32> {
+    // One or two gaps (possibly stretched by a fade) are too few to judge.
+    if long.len() < 3 {
+        return None;
+    }
+    long.sort_by(|a, b| a.total_cmp(b));
+    let jump = (1..long.len()).max_by(|&i, &j| (long[i] / long[i - 1]).total_cmp(&(long[j] / long[j - 1])));
+    if let Some(i) = jump.filter(|&i| long[i] / long[i - 1] >= 1.6) {
+        let lower = &long[..i];
+        return Some(lower[lower.len() / 2]);
+    }
+    let med = long[long.len() / 2];
+    if med < 5.0 * dot || med > 9.0 * dot {
+        Some(med)
+    } else {
+        None
+    }
+}
+
+/// Spaces clearly longer than an element gap (over 2.2 x the 25th-percentile
+/// mark, which is about a dot).
+fn boot_long_gaps(runs: &[Run]) -> usize {
+    let mut marks: Vec<f32> = runs.iter().filter_map(|r| if let Run::Mark(m) = r { Some(*m) } else { None }).collect();
+    if marks.is_empty() {
+        return 0;
+    }
+    marks.sort_by(|a, b| a.total_cmp(b));
+    let dot = marks[marks.len() / 4];
+    runs.iter().filter(|r| matches!(r, Run::Space(s) if *s > 2.2 * dot)).count()
+}
+
 /// Maximum-likelihood speed estimate from a set of runs.
 pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     let total_marks = runs.iter().filter(|r| matches!(r, Run::Mark(_))).count();
@@ -806,9 +841,7 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     // percentile of the long spaces is the character gap. This also copes
     // with Farnsworth spacing where gaps are far longer than 3 dots.
     let mut long: Vec<f32> = spaces.iter().copied().filter(|&s| s >= 2.0 * tm.egap.max(dot)).collect();
-    if long.len() >= 3 {
-        long.sort_by(|a, b| a.total_cmp(b));
-        let v = long[(long.len() as f32 * 0.35) as usize];
+    if let Some(v) = early_cgap(&mut long, tm.dot) {
         tm.cgap = v.clamp(tm.dot * 2.0, tm.dot * 15.0);
     }
     Some(tm)
@@ -1261,7 +1294,9 @@ impl CwDecoder {
                 self.boot_prof.push(prof);
             }
             let nmarks = self.boot.iter().filter(|r| matches!(r, Run::Mark(_))).count();
-            if nmarks >= 8 || (matches!(run, Run::Flush) && nmarks >= 4) {
+            // Wait for a few gaps longer than an element gap too, so the
+            // character gap is measured rather than assumed (Farnsworth).
+            if (nmarks >= 8 && (boot_long_gaps(&self.boot) >= 3 || nmarks >= 16)) || (matches!(run, Run::Flush) && nmarks >= 4) {
                 if let Some(tm) = estimate_timing(&self.boot) {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("boot: {:?} wpm={:.1} snr={:.1}dB runs={:?}", tm, tm.wpm(), self.snr_db(), &self.boot);
