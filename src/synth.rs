@@ -77,7 +77,8 @@ impl Default for Scene {
 
 /// Builds the keying timeline (on, seconds) for a signal.
 pub fn timeline(spec: &SignalSpec, rng: &mut StdRng) -> Vec<(bool, f32)> {
-    let words: Vec<&str> = spec.text.split_whitespace().collect();
+    let text = crate::morse::from_display(&spec.text);
+    let words: Vec<&str> = text.split_whitespace().collect();
     let total_chars: usize = spec.text.len().max(1);
     let jit = Normal::new(0.0f32, spec.jitter.max(1e-6)).unwrap();
     let mut out = Vec::new();

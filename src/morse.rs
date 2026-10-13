@@ -148,6 +148,9 @@ pub fn pattern_bits(pat: &str) -> (u8, u8) {
 
 /// Morse pattern for a character (uppercase), if known.
 pub fn pattern_for(c: u8) -> Option<&'static str> {
+    if c == ERROR {
+        return Some("........");
+    }
     let c = c.to_ascii_uppercase();
     TABLE.iter().find(|(k, _)| *k == c).map(|(_, p)| *p)
 }
@@ -186,6 +189,7 @@ pub fn from_display(text: &str) -> String {
         .replace("<AS>", "&")
         .replace("<AR>", "+")
         .replace("<BT>", "=")
+        .replace("<HH>", "\x08")
 }
 
 #[cfg(test)]

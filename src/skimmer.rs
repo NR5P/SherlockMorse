@@ -385,7 +385,14 @@ impl Skimmer {
             let f = c.demod.freq + df as f64;
             c.demod.set_freq(f);
         }
-        self.channels.retain(|c| (c.demod.freq as f32) > lo - 20.0 && (c.demod.freq as f32) < hi + 20.0);
+        let (now, events, spots) = (self.time, &mut self.events, &mut self.spots);
+        self.channels.retain_mut(|c| {
+            let keep = (c.demod.freq as f32) > lo - 20.0 && (c.demod.freq as f32) < hi + 20.0;
+            if !keep {
+                Self::dropping(c, now, events, spots);
+            }
+            keep
+        });
         // Spectral history no longer lines up.
         let nb = self.peak.len();
         self.peak = vec![0.0; nb];
@@ -527,6 +534,13 @@ impl Skimmer {
         ch.text.push_str(&txt);
         ch.pending_out.push_str(&txt);
         Self::publish(ch, now, events, spots);
+    }
+
+    /// Called before a channel is removed: keeps its held-back last word.
+    fn dropping(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+        if ch.qualified {
+            Self::hide(ch, now, events, spots);
+        }
     }
 
     fn scan_calls(ch: &mut Channel, txt: &str, now: f64, spots: &mut Vec<Spot>) {
@@ -672,7 +686,8 @@ impl Skimmer {
                     .map(|(i, c)| (i, c.level_db));
                 match weakest {
                     Some((i, l)) if l + 6.0 < lvl => {
-                        self.channels.remove(i);
+                        let mut c = self.channels.remove(i);
+                        Self::dropping(&mut c, self.time, &mut self.events, &mut self.spots);
                     }
                     _ => continue,
                 }
@@ -729,10 +744,12 @@ impl Skimmer {
         }
         let until = self.time + 60.0;
         let mut i = 0;
-        self.channels.retain(|c| {
+        let (now, events, spots) = (self.time, &mut self.events, &mut self.spots);
+        self.channels.retain_mut(|c| {
             let keep = !dead[i];
             i += 1;
             if !keep {
+                Self::dropping(c, now, events, spots);
                 self.suppressed.push((c.demod.freq as f32, until));
             }
             keep
@@ -760,8 +777,12 @@ impl Skimmer {
         }
         let timeout = self.cfg.channel_timeout as f64;
         let mut retired = Vec::new();
-        self.channels.retain(|c| {
+        let (events, spots) = (&mut self.events, &mut self.spots);
+        self.channels.retain_mut(|c| {
             let keep = c.pinned || (now - c.last_mark < timeout && now - c.last_good < timeout);
+            if !keep {
+                Self::dropping(c, now, events, spots);
+            }
             if !keep && c.qualified {
                 retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone() });
             }
@@ -779,11 +800,12 @@ impl Skimmer {
                 if df < self.cfg.min_spacing * 0.6 {
                     let (a, b) = (&self.channels[i], &self.channels[j]);
                     let drop_j = b.pinned <= a.pinned && (a.pinned || a.decoder.total_marks >= b.decoder.total_marks);
+                    let k = if drop_j { j } else { i };
+                    let mut c = self.channels.remove(k);
+                    Self::dropping(&mut c, now, &mut self.events, &mut self.spots);
                     if drop_j {
-                        self.channels.remove(j);
                         continue;
                     } else {
-                        self.channels.remove(i);
                         removed = true;
                         break;
                     }
