@@ -3,3 +3,4 @@
 *.mp3
 /testdata/
 /docs/radio/
+.claude/settings.local.json

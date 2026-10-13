@@ -327,7 +327,9 @@ impl App {
         if args.iter().any(|a| a == "--record") {
             app.toggle_recording();
         }
-        if app.s.rig_enabled {
+        // --no-rig: listen only, leaving the CAT port to another program
+        // (e.g. a script tuning the radio while this one decodes).
+        if app.s.rig_enabled && !args.iter().any(|a| a == "--no-rig") {
             app.connect_rig();
         }
         app
