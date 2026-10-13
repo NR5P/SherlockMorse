@@ -48,6 +48,8 @@ struct Settings {
     my_grid: String,
     /// Flags shown on stations heard in a contest or on-air program.
     activities: Vec<Activity>,
+    /// Spots list filter: empty shows all, "*" any flagged spot, else one flag's name.
+    spot_filter: String,
 }
 
 impl Default for Settings {
@@ -74,6 +76,7 @@ impl Default for Settings {
             lookup: Credentials::default(),
             my_grid: String::new(),
             activities: activity::defaults(),
+            spot_filter: String::new(),
         }
     }
 }
@@ -1464,8 +1467,33 @@ impl App {
     }
 
     fn ui_spots(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Spots");
+        ui.horizontal(|ui| {
+            ui.heading("Spots");
+            let label = |f: &str| match f {
+                "" => "All".to_string(),
+                "*" => "Any flag".to_string(),
+                n => n.to_string(),
+            };
+            let names: Vec<String> = self.s.activities.iter().filter(|a| a.enabled && !a.name.trim().is_empty()).map(|a| a.name.clone()).collect();
+            // A flag that was renamed or turned off no longer filters anything.
+            if !matches!(self.s.spot_filter.as_str(), "" | "*") && !names.contains(&self.s.spot_filter) {
+                self.s.spot_filter.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt("spot_filter").selected_text(label(&self.s.spot_filter)).show_ui(ui, |ui| {
+                    for f in [String::new(), "*".to_string()].into_iter().chain(names) {
+                        let l = label(&f);
+                        ui.selectable_value(&mut self.s.spot_filter, f, l);
+                    }
+                });
+                ui.label("Show");
+            });
+        });
         let mut spots = self.spots.clone();
+        let filter = self.s.spot_filter.clone();
+        if !filter.is_empty() {
+            spots.retain(|r| self.flags(&r.tags).any(|(a, _)| filter == "*" || a.name == filter));
+        }
         spots.sort_by(|a, b| a.last.cmp(&b.last).reverse());
         let mut tune_rf: Option<u64> = None;
         let mut tune_audio: Option<f32> = None;
