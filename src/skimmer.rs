@@ -218,8 +218,10 @@ pub fn text_plausibility(lm: &LanguageModel, text: &str) -> Option<f32> {
     (k.len() >= 30).then(|| lm.score(&format!(" {k} ")))
 }
 
-/// Splits a callsign sent twice with the word gap squeezed out
-/// ("K5ZDK5ZD" -> "K5ZD K5ZD"); calls are routinely sent twice.
+/// Splits callsigns run together with a neighbour when the word gap was
+/// squeezed out: a call sent twice ("K5ZDK5ZD" -> "K5ZD K5ZD"; calls are
+/// routinely sent twice) and "DE" glued to a call ("DEN4XYZ" -> "DE N4XYZ";
+/// DE prefixes are not issued to amateurs).
 fn split_doubled_calls(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 4);
     for (i, w) in text.split(' ').enumerate() {
@@ -231,6 +233,9 @@ fn split_doubled_calls(text: &str) -> String {
             out.push_str(&w[..h]);
             out.push(' ');
             out.push_str(&w[h..]);
+        } else if w.len() >= 6 && w.starts_with("DE") && parse_callsign(&w[2..]).is_some_and(|c| crate::callsign::valid_prefix(&c)) {
+            out.push_str("DE ");
+            out.push_str(&w[2..]);
         } else {
             out.push_str(w);
         }
@@ -1073,5 +1078,7 @@ mod tests {
     fn splits_doubled_calls_only() {
         assert_eq!(split_doubled_calls("TEST K5ZDK5ZD TU"), "TEST K5ZD K5ZD TU");
         assert_eq!(split_doubled_calls("HIHI TUTU 599599"), "HIHI TUTU 599599");
+        assert_eq!(split_doubled_calls("CQ DEN4XYZ K"), "CQ DE N4XYZ K");
+        assert_eq!(split_doubled_calls("DENVER DEPARTED"), "DENVER DEPARTED");
     }
 }
