@@ -1023,6 +1023,10 @@ pub struct CwDecoder {
     held_frames: u32,
     pub frames_since_mark: u64,
     pub total_marks: u64,
+    /// A long silence just ended: the next over (maybe another station)
+    /// is held back for a few elements to check its speed first.
+    pause_pending: bool,
+    over_buf: Option<Vec<(Run, Option<Vec<f32>>)>>,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
     dump: Option<std::io::BufWriter<std::fs::File>>,
 }
@@ -1059,6 +1063,8 @@ impl CwDecoder {
             held_frames: 0,
             frames_since_mark: 0,
             total_marks: 0,
+            pause_pending: false,
+            over_buf: None,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
         }
     }
@@ -1320,6 +1326,12 @@ impl CwDecoder {
             let tail = self.run_z.split_off(self.run_z.len().saturating_sub(self.cand as usize));
             let prof = std::mem::replace(&mut self.run_z, tail);
             let was_mark = self.state;
+            if !was_mark && self.flushed {
+                let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(f32::MAX);
+                if self.frames_since_mark as f32 * self.frame_ms >= (3.0 * wg).max(2500.0) {
+                    self.pause_pending = true;
+                }
+            }
             self.state = want;
             self.run_frames = self.cand;
             self.cand = 0;
@@ -1345,6 +1357,50 @@ impl CwDecoder {
     }
 
     fn on_run(&mut self, run: Run, prof: Option<Vec<f32>>) {
+        // Start of an over after a long pause: hold its first elements.
+        if self.beam.is_some() {
+            if let Some(buf) = &mut self.over_buf {
+                let flush = matches!(run, Run::Flush);
+                buf.push((run, prof));
+                let marks = buf.iter().filter(|(r, _)| matches!(r, Run::Mark(_))).count();
+                if flush || marks >= 10 {
+                    self.release_over();
+                }
+                return;
+            }
+            if std::mem::take(&mut self.pause_pending) && matches!(run, Run::Mark(_)) {
+                self.over_buf = Some(vec![(run, prof)]);
+                return;
+            }
+        }
+        self.feed(run, prof);
+    }
+
+    /// The held start of an over: if its elements are explained clearly
+    /// better by another speed (a different station), switch to it first,
+    /// then decode them. Decoding them with the previous station's timing
+    /// lost the first call of every over after a change of station.
+    fn release_over(&mut self) {
+        let Some(buf) = self.over_buf.take() else { return };
+        let runs: Vec<Run> = buf.iter().map(|(r, _)| *r).filter(|r| !matches!(r, Run::Flush)).collect();
+        if let (Some(tm), Some(b)) = (estimate_timing(&runs), self.beam.as_mut()) {
+            let r = tm.dot / b.timing.dot;
+            if !(0.8..=1.25).contains(&r) && better(&runs, b.timing.dot, tm.dot) {
+                if std::env::var_os("CWSK_DEBUG").is_some() {
+                    eprintln!("new over at another speed: {:?} -> {:?}", b.timing, tm);
+                }
+                // Gaps scale with the speed; the spacing statistics follow.
+                let cgap = b.timing.cgap * r;
+                b.timing = TimingModel { cgap, wscale: b.timing.wscale, ..tm };
+                self.history.clear();
+            }
+        }
+        for (run, prof) in buf {
+            self.feed(run, prof);
+        }
+    }
+
+    fn feed(&mut self, run: Run, prof: Option<Vec<f32>>) {
         if std::env::var_os("CWSK_RUNS").is_some() {
             let dot = self.beam.as_ref().map(|b| b.timing.dot).unwrap_or(0.0);
             eprintln!("RUN {:?} ev={:.1} dot={:.0} tent={:?}", run, prof.as_ref().map(|p| p.iter().sum::<f32>() / dot.max(1.0)).unwrap_or(f32::NAN), dot, self.beam.as_ref().map(|b| b.tentative()));
@@ -1463,6 +1519,7 @@ impl CwDecoder {
 
     /// Forces out any pending text (e.g. at end of a file).
     pub fn finish(&mut self) {
+        self.release_over();
         if self.beam.is_none() && !self.boot.is_empty() {
             self.on_run(Run::Flush, None);
         }
