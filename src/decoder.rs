@@ -1092,7 +1092,10 @@ impl CwDecoder {
                 self.text.append(&mut self.held);
                 // A human copying fills in a garbled letter from the word;
                 // do the same when the fix is unambiguous.
-                let fixed = if self.params.word_fix > 0.0 { self.lm.correct(body) } else { None };
+                // Only on clearly real keying: on noise it would turn junk
+                // into plausible-looking words.
+                let real = self.beam.as_ref().is_some_and(|b| b.fit >= 0.8);
+                let fixed = if self.params.word_fix > 0.0 && real { self.lm.correct(body) } else { None };
                 self.held = match fixed {
                     Some(f) => [f, b" "].concat(),
                     None => w,

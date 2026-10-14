@@ -102,6 +102,10 @@ impl LanguageModel {
         m.char_bonus = m.cross_entropy(&held);
         m.vocab = WORDS.lines().map(|w| w.trim().as_bytes().to_vec()).filter(|w| !w.is_empty()).collect();
         m.dict = DICT.lines().map(str::as_bytes).collect();
+        // Correction targets: the common vocabulary only. (Taking them
+        // from the whole dictionary fixed as many words as it broke on live
+        // recordings: WEEKLY, AURORA, but also DURNING -> BURNING,
+        // ETHAT -> ETHAN.)
         m.vocab_morse = m.vocab.iter().filter(|w| w.len() >= 4 && w.iter().all(u8::is_ascii_uppercase)).map(|w| (w.clone(), morse_render(w))).collect();
         m
     }
@@ -280,7 +284,7 @@ impl LanguageModel {
         let m = morse_render(w);
         let mut found: Option<&[u8]> = None;
         for (word, wm) in &self.vocab_morse {
-            if wm.len().abs_diff(m.len()) <= 1 && lost_dit(&m, wm) {
+            if wm.len().abs_diff(m.len()) <= 1 && (lost_dit(&m, wm) || split_letter(&m, wm)) {
                 if found.is_some() {
                     return None;
                 }
@@ -331,6 +335,17 @@ fn lost_dit(got: &[u8], word: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+/// True if Morse rendering `word` is `got` with one character break
+/// removed: a letter split in two because a fade stretched the gap inside
+/// it (WEEKLY copied as WEEKEDY: L = E + D).
+fn split_letter(got: &[u8], word: &[u8]) -> bool {
+    if got.len() != word.len() + 1 {
+        return false;
+    }
+    let pre = got.iter().zip(word).take_while(|(x, y)| x == y).count();
+    got[pre] == b' ' && got[pre + 1..] == word[pre..]
 }
 
 fn unpack(mut k: u32, order: usize) -> Vec<usize> {
@@ -543,6 +558,8 @@ mod tests {
         assert_eq!(lm.correct(b"WEATHER"), None);
         // A real word outside the common vocabulary is left alone.
         assert_eq!(lm.correct(b"STACK"), None);
+        // A letter split in two by a fade (LITTLE: L = E + D).
+        assert_eq!(lm.correct(b"EDITTLE"), Some(&b"LITTLE"[..]));
     }
 
     #[test]
