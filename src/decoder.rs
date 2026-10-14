@@ -959,6 +959,9 @@ pub struct CwDecoder {
     /// A long pause preceded the current run: likely a different station
     /// starting its over (nets, QSOs on one frequency).
     after_pause: bool,
+    /// The current over started after a long pause: the next speed check
+    /// switches on any better fit.
+    fresh_over: bool,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
     dump: Option<std::io::BufWriter<std::fs::File>>,
 }
@@ -996,6 +999,7 @@ impl CwDecoder {
             frames_since_mark: 0,
             total_marks: 0,
             after_pause: false,
+            fresh_over: false,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
         }
     }
@@ -1334,19 +1338,18 @@ impl CwDecoder {
             return;
         }
         if self.new_over(run) {
-            // Finish the previous over's text, then measure the new
-            // sender's speed and spacing from scratch (the bootstrap path
-            // above), instead of reading them with the old sender's.
-            let mut b = self.beam.take().unwrap();
-            b.push(Run::Flush);
-            self.word.extend_from_slice(&b.take_committed());
+            // A new over (maybe another sender): forget the previous
+            // over's runs and re-check the speed after a few marks of this
+            // one, switching if the new measurement fits better. (Measuring
+            // from scratch on the first few elements was sometimes far off:
+            // 29 WPM for a 13 WPM straight key.)
+            self.history.clear();
             self.long_gaps.clear();
-            self.boot.clear();
-            self.boot_prof.clear();
+            self.fresh_over = true;
+            self.marks_since_check = 0;
             if std::env::var_os("CWSK_DEBUG").is_some() {
-                eprintln!("new over: re-measuring timing");
+                eprintln!("new over: re-checking timing soon");
             }
-            return self.on_run(run, prof);
         }
         if let Run::Mark(_) = run {
             self.marks_since_check += 1;
@@ -1354,7 +1357,7 @@ impl CwDecoder {
         // Periodically re-estimate speed in case a different operator (or
         // a speed change) appears on this frequency.
         let poor_fit = self.beam.as_ref().is_some_and(|b| b.fit < 0.7);
-        if self.marks_since_check >= if poor_fit { 8 } else { 16 } {
+        if self.marks_since_check >= if poor_fit || self.fresh_over { 8 } else { 16 } {
             self.marks_since_check = 0;
             let hist: Vec<Run> = self.history.iter().copied().collect();
             if let Some(tm) = estimate_timing(&hist) {
@@ -1363,7 +1366,7 @@ impl CwDecoder {
                 // Switch speed when the new estimate is clearly more likely,
                 // or merely better when the current model fits poorly (e.g.
                 // it was bootstrapped on noise before the station started).
-                let poor = b.fit < 0.7;
+                let poor = b.fit < 0.7 || std::mem::take(&mut self.fresh_over);
                 if !(0.7..=1.43).contains(&r) && (clearly_better(&hist, b.timing.dot, tm.dot) || (poor && better(&hist, b.timing.dot, tm.dot))) {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("re-estimate: {:?} -> {:?}", b.timing, tm);
