@@ -179,6 +179,11 @@ pub fn bin_hz() -> f32 {
 /// 0.8-0.97 on live recordings; noise 0.35-0.68).
 const MIN_FIT: f32 = 0.78;
 
+/// Above this speed a channel must fit Morse timing at least `FAST_MIN_FIT`
+/// to be shown.
+const FAST_WPM: f32 = 45.0;
+const FAST_MIN_FIT: f32 = 0.86;
+
 /// Timing fit above which keying is certainly real CW (live recordings:
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
@@ -743,7 +748,11 @@ impl Skimmer {
         if ch.pinned {
             ch.qualified = true;
         } else if runs >= 20 || (final_ && runs >= 10) {
-            if fit >= MIN_FIT && text_ok {
+            // Noise decodes as very fast "keying" that only just passes the
+            // timing test (40 m scan: every channel shown above 45 WPM fit
+            // 0.78-0.83 and was junk; real fast CW fits 0.94-0.98).
+            let min_fit = if ch.decoder.wpm().is_some_and(|w| w > FAST_WPM) { FAST_MIN_FIT } else { MIN_FIT };
+            if fit >= min_fit && text_ok {
                 if !ch.qualified {
                     Self::note(ch, now, events, "shown");
                 }
