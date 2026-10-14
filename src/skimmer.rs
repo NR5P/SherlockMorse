@@ -266,14 +266,43 @@ fn split_doubled_calls(text: &str) -> String {
             out.push_str(&w[..h]);
             out.push(' ');
             out.push_str(&w[h..]);
-        } else if w.len() >= 6 && w.starts_with("DE") && parse_callsign(&w[2..]).is_some_and(|c| crate::callsign::valid_prefix(&c)) {
-            out.push_str("DE ");
-            out.push_str(&w[2..]);
         } else {
-            out.push_str(w);
+            out.push_str(&split_glued(w).join(" "));
         }
     }
     out
+}
+
+/// Splits CQ, DE and DX run into what follows them ("CQCQDE" -> "CQ CQ
+/// DE", "CQDXE71A" -> "CQ DX E71A", "DEN4XYZ" -> "DE N4XYZ"). Only where
+/// the rest is CQ/DE/DX/K/TEST or a call with an issued prefix: no word
+/// starts with CQ, DE prefixes are not issued, and a DX call (DX1ABC,
+/// Philippines) stays whole when it parses as a call itself.
+fn split_glued(w: &str) -> Vec<&str> {
+    let call = |r: &str| parse_callsign(r).is_some_and(|c| crate::callsign::valid_prefix(&c));
+    let ok_rest = |r: &str| matches!(r, "DE" | "DX" | "K" | "TEST") || r.starts_with("CQ") || call(r) || ((r.starts_with("DE") || r.starts_with("DX")) && call(&r[2..]));
+    for head in ["CQ", "DE", "DX"] {
+        if w.len() > 2 && w.starts_with(head) {
+            let rest = &w[2..];
+            let take = match head {
+                "CQ" => ok_rest(rest),
+                "DE" => w.len() >= 6 && call(rest),
+                _ => w.len() >= 6 && call(rest) && !call(w),
+            };
+            if take {
+                let mut v = vec![&w[..2]];
+                v.extend(split_glued(rest));
+                return v;
+            }
+        }
+    }
+    // The closing K run onto a call ("XE1FRFK"): only when that makes a
+    // 4-letter suffix, which real calls almost never have.
+    let suffix = w.bytes().rev().take_while(u8::is_ascii_uppercase).count();
+    if w.len() >= 5 && w.ends_with('K') && suffix == 4 && call(&w[..w.len() - 1]) {
+        return vec![&w[..w.len() - 1], "K"];
+    }
+    vec![w]
 }
 
 /// Replaces near-miss decodes of a callsign confirmed on this channel
@@ -1322,5 +1351,11 @@ mod tests {
         assert_eq!(split_doubled_calls("HIHI TUTU 599599"), "HIHI TUTU 599599");
         assert_eq!(split_doubled_calls("CQ DEN4XYZ K"), "CQ DE N4XYZ K");
         assert_eq!(split_doubled_calls("DENVER DEPARTED"), "DENVER DEPARTED");
+        assert_eq!(split_doubled_calls("CQCQCQCQDE XE1FRF"), "CQ CQ CQ CQ DE XE1FRF");
+        assert_eq!(split_doubled_calls("CQDXE71A E71A"), "CQ DX E71A E71A");
+        assert_eq!(split_doubled_calls("QRZ? DXE71A"), "QRZ? DX E71A");
+        assert_eq!(split_doubled_calls("DX1ABC CQD"), "DX1ABC CQD");
+        assert_eq!(split_doubled_calls("DE XE1FRF XE1FRFK"), "DE XE1FRF XE1FRF K");
+        assert_eq!(split_doubled_calls("DE W1AK"), "DE W1AK");
     }
 }
