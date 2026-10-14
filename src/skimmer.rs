@@ -29,6 +29,10 @@ pub struct SkimmerConfig {
     pub min_spacing: f32,
     /// Seconds without a mark before an automatic channel is dropped.
     pub channel_timeout: f32,
+    /// A shown channel that has proven real (timing fit reached
+    /// `STRONG_FIT`) is hidden for poor timing only after this many
+    /// seconds without good keying: a weak station's fit dips in fades.
+    pub dropout_s: f32,
     pub params: DecoderParams,
     /// Automatically create channels for detected signals.
     pub auto_detect: bool,
@@ -43,6 +47,7 @@ impl Default for SkimmerConfig {
             detect_db: 12.0,
             min_spacing: 30.0,
             channel_timeout: 25.0,
+            dropout_s: 15.0,
             params: DecoderParams::default(),
             auto_detect: true,
         }
@@ -68,6 +73,8 @@ pub struct Channel {
     pending_out: String,
     /// The decoded text looks like real Morse (see [`text_quality`]).
     qualified: bool,
+    /// Best timing fit seen (a channel that reached `STRONG_FIT` is real).
+    best_fit: f32,
     /// Last time the keying fitted Morse timing (noise keeps `last_mark`
     /// fresh, so lifetime is based on this instead).
     last_good: f64,
@@ -181,7 +188,7 @@ const MIN_FIT: f32 = 0.78;
 
 /// Above this speed a channel must fit Morse timing at least `FAST_MIN_FIT`
 /// to be shown.
-const FAST_WPM: f32 = 45.0;
+const FAST_WPM: f32 = 30.0;
 const FAST_MIN_FIT: f32 = 0.86;
 
 /// Timing fit above which keying is certainly real CW (live recordings:
@@ -485,6 +492,7 @@ impl Skimmer {
             qualified: pinned || was_revived,
             last_good: self.time,
             words: String::new(),
+            best_fit: 0.0,
             post: None,
             start_dot: None,
             start_redecodes: 0,
@@ -668,7 +676,7 @@ impl Skimmer {
             }
             let txt = ch.decoder.take_text();
             if !txt.is_empty() {
-                Self::deliver(ch, &txt, now, false, &self.lm, &mut self.events, &mut self.spots);
+                Self::deliver(ch, &txt, now, false, &self.lm, self.cfg.dropout_s, &mut self.events, &mut self.spots);
             }
         }
         self.time += samples.len() as f64 / RATE as f64;
@@ -680,7 +688,7 @@ impl Skimmer {
         for ch in &mut self.channels {
             ch.decoder.finish();
             let txt = ch.decoder.take_text();
-            Self::deliver(ch, &txt, self.time, true, &self.lm, &mut self.events, &mut self.spots);
+            Self::deliver(ch, &txt, self.time, true, &self.lm, self.cfg.dropout_s, &mut self.events, &mut self.spots);
         }
     }
 
@@ -714,7 +722,7 @@ impl Skimmer {
 
     /// Appends decoded text to a channel and publishes it once the channel
     /// looks like real Morse rather than noise or an artefact.
-    fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, lm: &LanguageModel, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
+    fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, lm: &LanguageModel, dropout_s: f32, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
         let snapped = snap_calls(&split_doubled_calls(txt), &ch.call_counts);
         let txt = snapped.as_str();
         ch.text.push_str(txt);
@@ -749,7 +757,7 @@ impl Skimmer {
             ch.qualified = true;
         } else if runs >= 20 || (final_ && runs >= 10) {
             // Noise decodes as very fast "keying" that only just passes the
-            // timing test (40 m scan: every channel shown above 45 WPM fit
+            // timing test (40 m scan: every channel shown above 30 WPM fit
             // 0.78-0.83 and was junk; real fast CW fits 0.94-0.98).
             let min_fit = if ch.decoder.wpm().is_some_and(|w| w > FAST_WPM) { FAST_MIN_FIT } else { MIN_FIT };
             if fit >= min_fit && text_ok {
@@ -757,7 +765,7 @@ impl Skimmer {
                     Self::note(ch, now, events, "shown");
                 }
                 ch.qualified = true;
-            } else if fit < MIN_FIT - 0.13 || (n >= 8 && !text_ok) {
+            } else if (fit < MIN_FIT - 0.13 && !Self::holding(ch, now, dropout_s)) || (n >= 8 && !text_ok) {
                 if ch.qualified {
                     let why = if fit < MIN_FIT - 0.13 { "hidden: keying no longer fits Morse timing" } else { "hidden: text looks like noise" };
                     Self::note(ch, now, events, why);
@@ -798,6 +806,12 @@ impl Skimmer {
             Self::note(ch, now, events, &format!("removed: {why}"));
             Self::hide(ch, now, events, spots);
         }
+    }
+
+    /// A shown channel that has proven real keeps its row through a
+    /// stretch of poor timing (a fade) up to the dropout time.
+    fn holding(ch: &Channel, now: f64, dropout_s: f32) -> bool {
+        ch.best_fit >= STRONG_FIT && now - ch.last_good <= f64::from(dropout_s)
     }
 
     /// Records a change in a channel's visibility with its measurements.
@@ -1077,7 +1091,10 @@ impl Skimmer {
             if fit >= MIN_FIT {
                 c.last_good = now;
             }
-            if !c.pinned && c.qualified && runs >= 20 && fit < MIN_FIT - 0.13 {
+            if runs >= 20 {
+                c.best_fit = c.best_fit.max(fit);
+            }
+            if !c.pinned && c.qualified && runs >= 20 && fit < MIN_FIT - 0.13 && !Self::holding(c, now, self.cfg.dropout_s) {
                 Self::note(c, now, &mut self.events, "hidden: keying no longer fits Morse timing (housekeeping)");
                 Self::hide(c, now, &mut self.events, &mut self.spots);
                 c.qualified = false;

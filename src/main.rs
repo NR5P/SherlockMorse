@@ -32,6 +32,8 @@ struct Settings {
     max_freq: f32,
     detect_db: f32,
     max_channels: usize,
+    /// Seconds a proven station's row stays through a fade.
+    dropout_s: f32,
     squelch: f32,
     lm_weight: f32,
     show_rf: bool,
@@ -65,6 +67,7 @@ impl Default for Settings {
             max_freq: 2800.0,
             detect_db: 12.0,
             max_channels: 40,
+            dropout_s: 15.0,
             squelch: 2.3,
             lm_weight: 0.7,
             show_rf: true,
@@ -344,6 +347,7 @@ impl App {
             max_freq: self.s.max_freq,
             max_channels: self.s.max_channels,
             detect_db: self.s.detect_db,
+            dropout_s: self.s.dropout_s,
             ..Default::default()
         };
         c.params.squelch_open = self.s.squelch;
@@ -1209,6 +1213,9 @@ impl App {
             ui.end_row();
             ui.label("Max decoders");
             changed |= ui.add(egui::Slider::new(&mut self.s.max_channels, 1..=80)).changed();
+            ui.end_row();
+            ui.label("Row dropout (s)").on_hover_text("How long a station's row stays visible through a fade (keying too weak to read) before it is hidden");
+            changed |= ui.add(egui::Slider::new(&mut self.s.dropout_s, 0.0..=60.0)).changed();
             ui.end_row();
             ui.label("Squelch");
             changed |= ui.add(egui::Slider::new(&mut self.s.squelch, 1.6..=4.0)).on_hover_text("Lower decodes weaker signals but more noise garbage").changed();
