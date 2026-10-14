@@ -2,7 +2,7 @@
 # Receive-only adaptive band scan (40 + 80 m). Sets the VFO over CAT on /dev/ttyUSB0 only
 # and records audio; never keys the radio. Hops every ~7 s; stays (90 s chunks, up to 6 min)
 # only where a keyed tone is heard.
-# usage: nightscan.sh <end-epoch-seconds>
+# usage: tools/bandscan.sh <end-epoch-seconds>   (e.g. $(date -d "08:00" +%s))
 cd "$(dirname "$0")/.." || exit 1
 END=$1
 OUT=testdata/night/$(date -u +%Y%m%d)
