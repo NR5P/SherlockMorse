@@ -1060,6 +1060,8 @@ struct KeyViterbi {
     back: std::collections::VecDeque<Vec<u8>>,
     /// Per frame: the evidence passed through to the run builder.
     ev: std::collections::VecDeque<f32>,
+    /// Backpointer buffers for reuse.
+    spare: Vec<Vec<u8>>,
 }
 
 const KMAX: usize = 100;
@@ -1069,7 +1071,7 @@ impl KeyViterbi {
         let mut score = vec![-1e9; 2 * KMAX];
         let k = k.clamp(1, KMAX);
         score[usize::from(!mark) * KMAX + k - 1] = 0.0;
-        Self { k, score, next: vec![-1e9; 2 * KMAX], back: Default::default(), ev: Default::default() }
+        Self { k, score, next: vec![-1e9; 2 * KMAX], back: Default::default(), ev: Default::default(), spare: Vec::new() }
     }
 
     /// Changes the minimum run length. Runs already longer than the new
@@ -1091,7 +1093,8 @@ impl KeyViterbi {
     /// the log-probabilities per frame of starting a mark / a space.
     fn step(&mut self, llr: f32, ev: f32, enter: [f32; 2]) {
         let k = self.k;
-        let mut bp = vec![0u8; 2 * KMAX];
+        let mut bp = if self.back.len() > 64 { self.spare.pop().unwrap_or_default() } else { Vec::new() };
+        bp.resize(2 * KMAX, 0);
         for m in 0..2 {
             let base = m * KMAX;
             let other = (1 - m) * KMAX + k - 1;
@@ -1136,7 +1139,8 @@ impl KeyViterbi {
         for i in 0..n {
             out.push(((path[i] as usize) < KMAX, self.ev[i]));
         }
-        self.back.drain(..n);
+        self.spare.extend(self.back.drain(..n));
+        self.spare.truncate(64);
         self.ev.drain(..n);
     }
 }
@@ -1552,7 +1556,10 @@ impl CwDecoder {
         let lag = (self.params.vit_lag * dot / fm).round() as usize;
         if let Some(v) = &mut self.vit {
             v.step(llr * scale, ev, enter);
-            v.decide(lag, &mut self.vit_out);
+            // Trace back in batches: each traceback walks the whole lag.
+            if v.back.len() >= lag + 16 {
+                v.decide(lag, &mut self.vit_out);
+            }
         }
         self.feed_vit();
     }
