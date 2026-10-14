@@ -45,6 +45,15 @@ pub struct DecoderParams {
     pub sig_decay: f32,
     /// Demodulator bandwidth as a multiple of 1/dot.
     pub bw_factor: f32,
+    /// Narrowest speed-matched post filter (Hz) for a strong signal.
+    pub min_bw: f32,
+    /// Narrowest post filter for a weak signal (Hz): below `weak_db` peak
+    /// level over the noise (per FFT bin) the floor moves from `min_bw`
+    /// down to this, reaching it `weak_span_db` lower. Noise matters more
+    /// than smearing the gaps then.
+    pub narrow_bw: f32,
+    pub weak_db: f32,
+    pub weak_span_db: f32,
     /// Signal-level tracking rate during marks, and attack rate outside.
     pub sig_track: f32,
     pub sig_attack: f32,
@@ -71,9 +80,32 @@ pub struct DecoderParams {
     /// Correct finished words that are one Morse element away from exactly
     /// one known word (see `LanguageModel::correct`); 0 turns it off.
     pub word_fix: f32,
+    /// Find mark/space runs by a Viterbi search over per-frame likelihoods
+    /// (minimum run length, evidence summed over each run) instead of
+    /// thresholding frame by frame (1 = on).
+    pub viterbi: f32,
+    /// Scale of the per-frame log-likelihood ratios in that search.
+    pub vit_gain: f32,
+    /// Cap on one independent sample's log-likelihood ratio (clicks, fades).
+    pub vit_cap: f32,
+    /// Decision delay of the search, in dots.
+    pub vit_lag: f32,
+    /// Which of the recent blocks' noise levels to take as the floor
+    /// (0 = the minimum, 0.5 = the median).
+    pub noise_rank: f32,
+    /// Apply the squelch to the Viterbi search once the speed is known.
+    pub vit_squelch: f32,
 }
 
 impl DecoderParams {
+    /// Bandwidth (Hz) of the speed-matched post filter for a signal of this
+    /// dot length (ms) and peak level over the noise (dB).
+    pub fn post_bw(&self, dot: f32, level_db: f32) -> f32 {
+        let t = ((self.weak_db - level_db) / self.weak_span_db.max(0.1)).clamp(0.0, 1.0);
+        let floor = self.min_bw + t * (self.narrow_bw - self.min_bw);
+        (self.bw_factor * 1000.0 / dot).clamp(floor, 200.0)
+    }
+
     /// Defaults with overrides from `CWSK_PARAMS="name=value,..."` (tuning aid).
     pub fn from_env() -> Self {
         let mut p = Self::default();
@@ -94,6 +126,10 @@ impl DecoderParams {
                     "threshold" => p.threshold = v,
                     "sig_decay" => p.sig_decay = v,
                     "bw_factor" => p.bw_factor = v,
+                    "min_bw" => p.min_bw = v,
+                    "narrow_bw" => p.narrow_bw = v,
+                    "weak_db" => p.weak_db = v,
+                    "weak_span_db" => p.weak_span_db = v,
                     "sig_track" => p.sig_track = v,
                     "sig_attack" => p.sig_attack = v,
                     "debounce" => p.debounce = v,
@@ -102,6 +138,12 @@ impl DecoderParams {
                     "clipped_dit" => p.clipped_dit = v,
                     "repeat_bonus" => p.repeat_bonus = v,
                     "word_fix" => p.word_fix = v,
+                    "viterbi" => p.viterbi = v,
+                    "vit_gain" => p.vit_gain = v,
+                    "vit_cap" => p.vit_cap = v,
+                    "vit_lag" => p.vit_lag = v,
+                    "noise_rank" => p.noise_rank = v,
+                    "vit_squelch" => p.vit_squelch = v,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -124,6 +166,10 @@ impl Default for DecoderParams {
             threshold: 0.5,
             sig_decay: 0.0015,
             bw_factor: 1.6,
+            min_bw: 30.0,
+            narrow_bw: 15.0,
+            weak_db: 20.0,
+            weak_span_db: 6.0,
             sig_track: 0.02,
             sig_attack: 0.01,
             debounce: 0.24,
@@ -132,6 +178,12 @@ impl Default for DecoderParams {
             clipped_dit: -4.5,
             repeat_bonus: 2.0,
             word_fix: 1.0,
+            viterbi: 0.0,
+            vit_gain: 1.0,
+            vit_cap: 4.0,
+            vit_lag: 4.0,
+            noise_rank: 0.0,
+            vit_squelch: 1.0,
         }
     }
 }
@@ -983,6 +1035,115 @@ pub fn is_noise_word(w: &[u8]) -> bool {
     !w.is_empty() && w.iter().all(|&c| c == b'E' || c == b'T')
 }
 
+/// ln I0(u) for u >= 0 (modified Bessel function), accurate to ~1e-3.
+fn ln_i0(u: f32) -> f32 {
+    if u < 3.0 {
+        let q = u * u / 4.0;
+        (1.0 + q * (1.0 + q * (0.25 + q * (1.0 / 36.0 + q / 576.0)))).ln()
+    } else {
+        u - 0.5 * (2.0 * std::f32::consts::PI * u).ln() + (1.0 + 1.0 / (8.0 * u) + 9.0 / (128.0 * u * u)).ln()
+    }
+}
+
+/// Fixed-lag Viterbi search for the key state. States are "mark for c
+/// frames" and "space for c frames", c = 1..k, the last one absorbing (a run
+/// is at least k frames). Each frame adds half its log-likelihood ratio to
+/// the mark states and subtracts it from the space states, so a run's
+/// evidence is summed over the whole run instead of being thresholded frame
+/// by frame: a dit sitting in the noise is kept if, as a whole, it is more
+/// likely signal than noise, and a dash is not split by a few noisy frames.
+struct KeyViterbi {
+    /// Minimum run length (frames); may change between frames.
+    k: usize,
+    /// Score of state (m, c) at `m * KMAX + c`: m = 0 mark, 1 space; c + 1
+    /// frames into the run, the last count (k - 1) absorbing.
+    score: Vec<f32>,
+    next: Vec<f32>,
+    /// Per frame: the best previous state of each state.
+    back: std::collections::VecDeque<Vec<u8>>,
+    /// Per frame: the evidence passed through to the run builder.
+    ev: std::collections::VecDeque<f32>,
+}
+
+const KMAX: usize = 100;
+
+impl KeyViterbi {
+    fn new(k: usize, mark: bool) -> Self {
+        let mut score = vec![-1e9; 2 * KMAX];
+        let k = k.clamp(1, KMAX);
+        score[usize::from(!mark) * KMAX + k - 1] = 0.0;
+        Self { k, score, next: vec![-1e9; 2 * KMAX], back: Default::default(), ev: Default::default() }
+    }
+
+    /// Changes the minimum run length. Runs already longer than the new
+    /// minimum fold into its absorbing state; backpointers stay valid.
+    fn set_k(&mut self, k: usize) {
+        let k = k.clamp(1, KMAX);
+        if k < self.k {
+            for m in 0..2 {
+                let b = m * KMAX;
+                let top = self.score[b + k - 1..b + self.k].iter().copied().fold(f32::MIN, f32::max);
+                self.score[b + k - 1] = top;
+                self.score[b + k..b + self.k].iter_mut().for_each(|s| *s = -1e9);
+            }
+        }
+        self.k = k;
+    }
+
+    /// One frame: `llr` is the log-likelihood ratio mark/space, `enter`
+    /// the log-probabilities per frame of starting a mark / a space.
+    fn step(&mut self, llr: f32, ev: f32, enter: [f32; 2]) {
+        let k = self.k;
+        let mut bp = vec![0u8; 2 * KMAX];
+        for m in 0..2 {
+            let base = m * KMAX;
+            let other = (1 - m) * KMAX + k - 1;
+            let half = if m == 0 { 0.5 * llr } else { -0.5 * llr };
+            for c in 0..k {
+                let (mut best, mut arg) = if c == 0 {
+                    (self.score[other] + enter[m], other)
+                } else {
+                    (self.score[base + c - 1], base + c - 1)
+                };
+                if c == k - 1 && self.score[base + c] > best {
+                    best = self.score[base + c];
+                    arg = base + c;
+                }
+                self.next[base + c] = best + half;
+                bp[base + c] = arg as u8;
+            }
+        }
+        let top = (0..2).flat_map(|m| (0..k).map(move |c| m * KMAX + c)).map(|i| self.next[i]).fold(f32::MIN, f32::max);
+        for m in 0..2 {
+            for c in 0..KMAX {
+                let i = m * KMAX + c;
+                self.score[i] = if c < k { self.next[i] - top } else { -1e9 };
+            }
+        }
+        self.back.push_back(bp);
+        self.ev.push_back(ev);
+    }
+
+    /// Decisions for the oldest frames, keeping the newest `lag` undecided.
+    fn decide(&mut self, lag: usize, out: &mut Vec<(bool, f32)>) {
+        if self.back.len() <= lag {
+            return;
+        }
+        let n = self.back.len() - lag;
+        let mut st = (0..2 * KMAX).max_by(|&a, &b| self.score[a].total_cmp(&self.score[b])).unwrap_or(0);
+        let mut path = vec![0u8; self.back.len()];
+        for (i, bp) in self.back.iter().enumerate().rev() {
+            path[i] = st as u8;
+            st = bp[st] as usize;
+        }
+        for i in 0..n {
+            out.push(((path[i] as usize) < KMAX, self.ev[i]));
+        }
+        self.back.drain(..n);
+        self.ev.drain(..n);
+    }
+}
+
 /// Converts a sampled envelope into decoded text.
 pub struct CwDecoder {
     pub frame_ms: f32,
@@ -1029,6 +1190,17 @@ pub struct CwDecoder {
     over_buf: Option<Vec<(Run, Option<Vec<f32>>)>>,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
     dump: Option<std::io::BufWriter<std::fs::File>>,
+    /// Viterbi key-state search (`params.viterbi`); `state`/`cand` then
+    /// keep the immediate threshold decision (level tracking, `is_mark`),
+    /// and `vstate`/`vcand` build the runs from the search's decisions.
+    vit: Option<KeyViterbi>,
+    vstate: bool,
+    vcand: u32,
+    vfsm: u64,
+    /// Bandwidth (Hz) of the envelope filter: how many independent
+    /// samples per second the frames carry.
+    bw: f32,
+    vit_out: Vec<(bool, f32)>,
 }
 
 impl CwDecoder {
@@ -1066,7 +1238,18 @@ impl CwDecoder {
             pause_pending: false,
             over_buf: None,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
+            vit: None,
+            vstate: false,
+            vcand: 0,
+            vfsm: 0,
+            bw: 100.0,
+            vit_out: Vec::new(),
         }
+    }
+
+    /// Tells the decoder the bandwidth (Hz) of the envelope filter.
+    pub fn set_bandwidth(&mut self, bw: f32) {
+        self.bw = bw;
     }
 
     /// Starts decoding with a known timing instead of measuring it first.
@@ -1227,7 +1410,17 @@ impl CwDecoder {
             if self.block_p25.len() > 8 {
                 self.block_p25.pop_front();
             }
-            self.noise_q = self.block_p25.iter().copied().fold(f32::MAX, f32::min);
+            self.noise_q = if self.params.noise_rank > 0.0 {
+                // A low rank rather than the minimum: the receiver's AGC
+                // ducks the band noise for a moment whenever a strong
+                // signal keys, and the minimum would follow those dips
+                // down, leaving the threshold in the noise.
+                let mut v: Vec<f32> = self.block_p25.iter().copied().collect();
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[((v.len() - 1) as f32 * self.params.noise_rank).round() as usize]
+            } else {
+                self.block_p25.iter().copied().fold(f32::MAX, f32::min)
+            };
             self.block = b;
             self.block.clear();
         }
@@ -1251,15 +1444,27 @@ impl CwDecoder {
     /// Feeds one envelope amplitude frame.
     pub fn push_frame(&mut self, x: f32) {
         let x = x.max(1e-12);
+        let vit = self.params.viterbi > 0.0;
         if self.erasure {
-            self.slice(false, 0.0);
+            if vit {
+                // No information either way.
+                self.debounce(false);
+                self.vit_frame(0.0, 0.0);
+            } else {
+                self.slice(false, 0.0);
+            }
             return;
         }
         // Noise floor: 25th-percentile tracker. Signal: fast attack on peaks,
         // slower tracking during marks, decay toward the noise floor.
         self.track_levels(x);
         if self.noise_q <= 0.0 {
-            self.slice(false, 0.0);
+            if vit {
+                self.debounce(false);
+                self.vit_frame(-1.0, 0.0);
+            } else {
+                self.slice(false, 0.0);
+            }
             return;
         }
         let nm = self.noise_q * 1.65;
@@ -1291,7 +1496,98 @@ impl CwDecoder {
         // Computed even while the squelch or activity gate holds the slicer
         // off: a deep fade is exactly when a faded dit must still be found.
         let z = ((x - thr) / (0.52 * nm)).clamp(-8.0, 8.0);
-        self.slice(want, z * self.frame_ms);
+        if vit {
+            self.debounce(want);
+            // Until the speed is known the squelch does not apply: the
+            // search's run priors keep most noise out, and at low SNR (the
+            // envelope still filtered wide) it would hide the marks the
+            // speed estimate needs.
+            let shut = !self.gate || (!self.squelch_open && self.beam.is_some() && self.params.vit_squelch > 0.0);
+            let llr = if shut { -self.params.vit_cap } else { self.frame_llr(x, nm, thr) };
+            if let Some(d) = &mut self.dump {
+                use std::io::Write;
+                let _ = writeln!(d, "L,{llr:.3},{},{}", u8::from(self.squelch_open), u8::from(self.gate));
+            }
+            self.vit_frame(llr, z * self.frame_ms);
+        } else {
+            self.slice(want, z * self.frame_ms);
+        }
+    }
+
+    /// Log-likelihood ratio of one envelope sample, keyed carrier at the
+    /// tracked signal level against noise alone, capped. The high-SNR
+    /// (linear) form, centred on the slicing threshold: the exact
+    /// Rician/Rayleigh ratio is convex in the amplitude, and on the smeared
+    /// edges of each element (where neither model holds) that biases every
+    /// boundary toward the mark.
+    fn frame_llr(&self, x: f32, nm: f32, thr: f32) -> f32 {
+        let s2 = (nm / 1.2533).powi(2);
+        let a = (self.sig * self.sig - s2).max(0.25 * s2).sqrt();
+        let cap = self.params.vit_cap;
+        if self.params.viterbi >= 2.0 {
+            let a2 = a * a;
+            return (ln_i0(x * a / s2) - a2 / (2.0 * s2)).clamp(-cap, cap);
+        }
+        (a * (x - thr) / s2).clamp(-cap, cap)
+    }
+
+    /// The immediate (debounced threshold) key state, for level tracking
+    /// and `is_mark` while the runs come from the Viterbi search.
+    fn debounce(&mut self, want: bool) {
+        if want != self.state {
+            self.cand += 1;
+        } else {
+            self.cand = 0;
+        }
+        if self.cand >= self.confirm_frames() {
+            self.state = want;
+            self.cand = 0;
+        }
+        if self.state {
+            self.frames_since_mark = 0;
+        } else {
+            self.frames_since_mark += 1;
+        }
+    }
+
+    /// Feeds one frame to the Viterbi key search and builds runs from the
+    /// frames it has decided.
+    fn vit_frame(&mut self, llr: f32, ev: f32) {
+        let dot = self.beam.as_ref().map(|b| b.timing.dot).unwrap_or(40.0);
+        let fm = self.frame_ms;
+        let k = self.confirm_frames() as usize;
+        match &mut self.vit {
+            Some(v) => v.set_k(k),
+            None => self.vit = Some(KeyViterbi::new(k, self.vstate)),
+        }
+        let scale = self.params.vit_gain * fm * self.bw / 1000.0;
+        let enter = [(fm / (2.5 * dot)).ln(), (fm / (1.6 * dot)).ln()];
+        let lag = (self.params.vit_lag * dot / fm).round() as usize;
+        if let Some(v) = &mut self.vit {
+            v.step(llr * scale, ev, enter);
+            v.decide(lag, &mut self.vit_out);
+        }
+        self.feed_vit();
+    }
+
+    fn feed_vit(&mut self) {
+        let out = std::mem::take(&mut self.vit_out);
+        for &(w, e) in &out {
+            self.with_vit_state(|d| d.slice_n(w, e, 1));
+        }
+        self.vit_out = out;
+        self.vit_out.clear();
+    }
+
+    /// Runs `f` with the run builder's key state in `state`/`cand`.
+    fn with_vit_state(&mut self, f: impl FnOnce(&mut Self)) {
+        std::mem::swap(&mut self.state, &mut self.vstate);
+        std::mem::swap(&mut self.cand, &mut self.vcand);
+        std::mem::swap(&mut self.frames_since_mark, &mut self.vfsm);
+        f(self);
+        std::mem::swap(&mut self.state, &mut self.vstate);
+        std::mem::swap(&mut self.cand, &mut self.vcand);
+        std::mem::swap(&mut self.frames_since_mark, &mut self.vfsm);
     }
 
     fn confirm_frames(&self) -> u32 {
@@ -1303,6 +1599,11 @@ impl CwDecoder {
     }
 
     fn slice(&mut self, want: bool, ev: f32) {
+        let c = self.confirm_frames();
+        self.slice_n(want, ev, c);
+    }
+
+    fn slice_n(&mut self, want: bool, ev: f32, confirm: u32) {
         self.run_z.push(ev);
         // A silence after a flush is never reported: keep only what a
         // pending transition could need.
@@ -1321,7 +1622,7 @@ impl CwDecoder {
         } else {
             self.cand = 0;
         }
-        if self.cand >= self.confirm_frames() {
+        if self.cand >= confirm {
             let dur = (self.run_frames - self.cand) as f32 * self.frame_ms;
             let tail = self.run_z.split_off(self.run_z.len().saturating_sub(self.cand as usize));
             let prof = std::mem::replace(&mut self.run_z, tail);
@@ -1519,6 +1820,25 @@ impl CwDecoder {
 
     /// Forces out any pending text (e.g. at end of a file).
     pub fn finish(&mut self) {
+        if let Some(mut v) = self.vit.take() {
+            v.decide(0, &mut self.vit_out);
+            self.feed_vit();
+            self.with_vit_state(|d| d.finish_runs());
+        } else {
+            self.finish_runs();
+        }
+        if let Some(b) = &mut self.beam {
+            let c = b.take_committed();
+            self.word.extend_from_slice(&c);
+        }
+        if !self.word.ends_with(b" ") && !self.word.is_empty() {
+            self.word.push(b' ');
+        }
+        self.release_words();
+        self.text.append(&mut self.held);
+    }
+
+    fn finish_runs(&mut self) {
         self.release_over();
         if self.beam.is_none() && !self.boot.is_empty() {
             self.on_run(Run::Flush, None);
@@ -1533,15 +1853,6 @@ impl CwDecoder {
             self.on_run(Run::Flush, None);
             self.flushed = true;
         }
-        if let Some(b) = &mut self.beam {
-            let c = b.take_committed();
-            self.word.extend_from_slice(&c);
-        }
-        if !self.word.ends_with(b" ") && !self.word.is_empty() {
-            self.word.push(b' ');
-        }
-        self.release_words();
-        self.text.append(&mut self.held);
     }
 }
 

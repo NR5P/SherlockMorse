@@ -63,6 +63,10 @@ pub struct Channel {
     pub last_mark: f64,
     pub pinned: bool,
     pub level_db: f32,
+    /// Peak level over the noise right around the channel (dB): what the
+    /// decoder actually has to work with. Not comparable between channels
+    /// (`level_db` is), since the noise reference differs.
+    pub local_db: f32,
     /// Spectral activity gate: something is transmitting at this frequency.
     pub active: bool,
     /// Recent mark/space decisions (one per frame) for artefact detection.
@@ -152,6 +156,13 @@ pub struct Skimmer {
     recent: Vec<f32>,
     persist: Vec<u16>,
     pub noise_floor: f32,
+    /// Per-bin noise reference: the median of nearby bins (about ±125 Hz).
+    /// The receiver's filter shapes the band noise (on the FTDX3000 it is
+    /// ~6 dB stronger at 500-1000 Hz than on average, and falls off above
+    /// 2 kHz): a weak signal on the skirt sits well above its own noise but
+    /// below the overall median, and one in the middle looks stronger
+    /// against the overall median than it is.
+    local_floor: Vec<f32>,
     pub channels: Vec<Channel>,
     next_id: u64,
     /// Seconds of audio processed.
@@ -425,6 +436,7 @@ impl Skimmer {
             recent: vec![0.0; nb],
             persist: vec![0; nb],
             noise_floor: 1e-9,
+            local_floor: vec![1e-9; nb],
             channels: Vec::new(),
             next_id: 1,
             time: 0.0,
@@ -485,6 +497,7 @@ impl Skimmer {
             last_mark: self.time,
             pinned,
             level_db: -200.0,
+            local_db: -200.0,
             active: true,
             marks: VecDeque::with_capacity(MARK_HIST),
             amps: VecDeque::with_capacity(MARK_HIST),
@@ -662,16 +675,23 @@ impl Skimmer {
             }
             if let Some(t) = ch.decoder.timing() {
                 // Match the filter to the keying speed.
-                let bw = (ch.decoder.params().bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);
+                let bw = ch.decoder.params().post_bw(t.dot, ch.local_db);
+                if std::env::var_os("CWSK_BWDBG").is_some() && ch.post.as_ref().is_some_and(|p| (bw - p.2).abs() > 0.1 * p.2) {
+                    eprintln!("BW t={:.0} {:.0} Hz level {:.1} dB snr {:.1} -> {bw:.1}", now, ch.demod.freq, ch.level_db, ch.decoder.snr_db());
+                }
                 let fs = 1000.0 / ch.demod.frame_ms();
                 match &mut ch.post {
-                    Some((li, lq, b)) if (bw - *b).abs() > 1.0 => {
+                    Some((li, lq, b)) if (bw - *b).abs() > 0.1 * *b => {
                         li.retune(fs, bw / 2.0);
                         lq.retune(fs, bw / 2.0);
                         *b = bw;
+                        ch.decoder.set_bandwidth(bw);
                     }
                     Some(_) => {}
-                    None => ch.post = Some((Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0), bw)),
+                    None => {
+                        ch.post = Some((Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0), bw));
+                        ch.decoder.set_bandwidth(bw);
+                    }
                 }
             }
             let txt = ch.decoder.take_text();
@@ -701,7 +721,7 @@ impl Skimmer {
     /// yet, so its text so far is simply replaced.
     fn redecode_start(ch: &mut Channel, params: &DecoderParams, lm: &Arc<LanguageModel>) {
         let (Some(t), Some(frames)) = (ch.decoder.timing().cloned(), &ch.start_frames) else { return };
-        let bw = (params.bw_factor * 1000.0 / t.dot).clamp(30.0, 200.0);
+        let bw = params.post_bw(t.dot, ch.local_db);
         let fs = 1000.0 / ch.demod.frame_ms();
         let (mut li, mut lq) = (Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0));
         let amps: Vec<f32> = frames.iter().map(|z| Complex32::new(li.process(z.re), lq.process(z.im)).norm()).collect();
@@ -710,6 +730,7 @@ impl Skimmer {
         // gaps the filter partly fills in.
         let mut d = CwDecoder::new(ch.demod.frame_ms(), params.clone(), lm.clone());
         d.seed_timing(t.clone());
+        d.set_bandwidth(bw);
         d.warmup(&amps);
         ch.decoder = d;
         // The filter carries on from the end of the replayed start.
@@ -934,13 +955,53 @@ impl Skimmer {
         let nf = v[v.len() / 2].max(1e-15);
         self.noise_floor = 0.9 * self.noise_floor + 0.1 * nf;
         let nf = self.noise_floor;
+        // Local floor: medians of 16-bin blocks, interpolated between block
+        // centres, smoothed like the overall floor.
+        const BLK: usize = 16;
+        let meds: Vec<(f32, f32)> = (lo..hi)
+            .step_by(BLK)
+            .map(|b0| {
+                let b1 = (b0 + BLK).min(hi);
+                let mut v: Vec<f32> = self.fast[b0..b1].to_vec();
+                v.sort_unstable_by(|a, b| a.total_cmp(b));
+                ((b0 + b1) as f32 / 2.0, v[v.len() / 2].max(1e-15))
+            })
+            .collect();
+        for b in lo..hi {
+            let x = b as f32 + 0.5;
+            let k = meds.partition_point(|m| m.0 <= x);
+            let m = if k == 0 {
+                meds[0].1
+            } else if k == meds.len() {
+                meds[k - 1].1
+            } else {
+                let (a, c) = (meds[k - 1], meds[k]);
+                a.1 + (c.1 - a.1) * (x - a.0) / (c.0 - a.0)
+            };
+            let l = 0.9 * self.local_floor[b] + 0.1 * m;
+            self.local_floor[b] = l;
+        }
+        // Detection and the activity gate: never above the overall floor
+        // (finds weak signals on the skirts without making a noisy stretch
+        // of band harder).
+        let floors: Vec<f32> = self.local_floor.iter().map(|l| l.clamp(nf * 0.1, nf)).collect();
+        let floor = |b: usize| floors[b];
 
         for ch in &mut self.channels {
             let b = ((ch.demod.freq as f32 / bin_hz()).round() as usize).min(p.len() - 1);
-            ch.level_db = 10.0 * (self.peak[b] / nf).log10();
+            let local = self.local_floor[b].max(nf * 0.1);
+            ch.level_db = 10.0 * (self.peak[b] / floor(b)).log10();
+            // Level over the noise right around the signal: in the middle
+            // of the receiver's passband the noise is several dB above the
+            // overall median, and this picks the envelope filter.
+            ch.local_db = 10.0 * (self.peak[b] / local).log10();
+            // Activity gate: energy at the channel 9 dB (with the default
+            // detection threshold) over the noise. Against the overall
+            // floor: in the middle of the passband the local one would gate
+            // off a faded straight-key signal's marks.
             let r = self.recent[b.saturating_sub(1)..(b + 2).min(p.len())].iter().fold(0.0f32, |m, &v| m.max(v));
-            let gate = 10f32.powf((self.cfg.detect_db - 2.0) / 10.0);
-            ch.active = r > nf * gate;
+            let gate = 10f32.powf((self.cfg.detect_db - 3.0) / 10.0);
+            ch.active = r > floor(b) * gate;
             ch.decoder.set_gate(ch.active);
         }
 
@@ -951,6 +1012,7 @@ impl Skimmer {
         let hz = bin_hz();
         for b in lo..hi {
             let pk = self.peak[b];
+            let nf = floor(b);
             let is_max = (b - 2..=b + 2).all(|j| j == b || self.peak[j] < pk);
             let keyed = pk / self.trough[b].max(nf * 0.3) > 5.0;
             if is_max && pk > nf * det && keyed {
@@ -1032,8 +1094,10 @@ impl Skimmer {
                 let (wo, so) = (weak.marks.len() - wl, len - wl);
                 let mut tot = 0u32;
                 let mut inside = 0u32;
+                let mut covered = 0u32;
                 for i in 0..wl {
                     let c = dil(so + i);
+                    covered += u32::from(c);
                     if weak.marks[wo + i] {
                         tot += 1;
                         if c {
@@ -1047,10 +1111,19 @@ impl Skimmer {
                 }
                 let corr = if tot >= 100 { lagged_corr(&strong.marks, &weak.marks) } else { 0.0 };
                 if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
-                    eprintln!("    corr {corr:.2}");
+                    eprintln!("    corr {corr:.2} covered {:.2}", covered as f32 / wl.max(1) as f32);
                 }
                 let much_stronger = strong.level_db >= weak.level_db + 10.0;
                 let inside_frac = inside as f32 / tot.max(1) as f32;
+                // A busy strong signal's (dilated) marks cover most of the
+                // time, so many of a real station's marks land inside them by
+                // chance; an artefact's marks avoid the strong signal's gaps
+                // almost completely.
+                // Skirts, clicks and AGC junk sit near the strong signal or key
+                // badly; a station far away with good Morse timing is real
+                // even if it happens to send at the same time (weak1: a
+                // 2170 Hz station 1.5 kHz from a QSO, 93% "inside").
+                let far_and_clean = df > 400.0 && weak.decoder.fit().0 >= MIN_FIT;
                 // The receiver's AGC turns the gain down while the strong
                 // station keys, so band noise elsewhere dips in step with
                 // it: inverted "keying" that decodes as junk. Its envelope
@@ -1058,7 +1131,7 @@ impl Skimmer {
                 // keying dominates its envelope instead. (On 40 m at night
                 // next to W1AW: dozens of junk channels, all -0.24..-0.45.)
                 let agc = much_stronger && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
-                if tot >= 100 && ((much_stronger && (inside_frac > 0.92 || corr > 0.5)) || (twin && corr > 0.7) || agc) {
+                if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc) {
                     dead[wi] = true;
                 }
             }
@@ -1124,7 +1197,12 @@ impl Skimmer {
                 let df = (self.channels[i].demod.freq - self.channels[j].demod.freq).abs() as f32;
                 if df < self.cfg.min_spacing * 0.6 {
                     let (a, b) = (&self.channels[i], &self.channels[j]);
-                    let drop_j = b.pinned <= a.pinned && (a.pinned || a.decoder.total_marks >= b.decoder.total_marks);
+                    // Keep the established channel: pinned, then shown, then
+                    // the older. (Not the one with more marks: a skirt channel
+                    // walked onto a strong signal by its AFC can split every
+                    // dash into dits, ARRL 15 WPM.)
+                    let rank = |c: &Channel| (c.pinned, c.qualified, -c.created);
+                    let drop_j = rank(a).partial_cmp(&rank(b)).is_some_and(|o| o.is_ge());
                     let k = if drop_j { j } else { i };
                     let mut c = self.channels.remove(k);
                     Self::dropping(&mut c, now, &mut self.events, &mut self.spots, "merged with a channel on the same signal");
