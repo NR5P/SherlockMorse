@@ -34,6 +34,8 @@ struct Settings {
     max_channels: usize,
     /// Seconds a proven station's row stays through a fade.
     dropout_s: f32,
+    /// Find marks with the Viterbi search (more weak copy, more junk rows).
+    viterbi: bool,
     squelch: f32,
     lm_weight: f32,
     show_rf: bool,
@@ -68,6 +70,7 @@ impl Default for Settings {
             detect_db: 12.0,
             max_channels: 40,
             dropout_s: 30.0,
+            viterbi: false,
             squelch: 2.3,
             lm_weight: 0.7,
             show_rf: true,
@@ -353,6 +356,7 @@ impl App {
         c.params.squelch_open = self.s.squelch;
         c.params.squelch_close = self.s.squelch * 0.83;
         c.params.lm_weight = self.s.lm_weight;
+        c.params.viterbi = if self.s.viterbi { 1.0 } else { 0.0 };
         c
     }
 
@@ -1216,6 +1220,9 @@ impl App {
             ui.end_row();
             ui.label("Row dropout (s)").on_hover_text("How long a station's row stays visible through a fade (keying too weak to read) before it is hidden");
             changed |= ui.add(egui::Slider::new(&mut self.s.dropout_s, 0.0..=60.0)).changed();
+            ui.end_row();
+            ui.label("Sensitive slicer (experimental)").on_hover_text("Decide marks and spaces by weighing each whole element against the noise instead of frame by frame: copies more of weak and fluttering signals and spots more calls correctly, but shows more junk rows");
+            changed |= ui.checkbox(&mut self.s.viterbi, "").changed();
             ui.end_row();
             ui.label("Squelch");
             changed |= ui.add(egui::Slider::new(&mut self.s.squelch, 1.6..=4.0)).on_hover_text("Lower decodes weaker signals but more noise garbage").changed();

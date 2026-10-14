@@ -176,8 +176,8 @@ impl Default for DecoderParams {
             repeat_bonus: 2.0,
             word_fix: 1.0,
             viterbi: 0.0,
-            vit_gain: 1.0,
-            vit_cap: 4.0,
+            vit_gain: 8.0,
+            vit_cap: 10.0,
             vit_lag: 4.0,
             vit_squelch: 1.0,
 
