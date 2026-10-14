@@ -1616,8 +1616,15 @@ impl CwDecoder {
             let was_mark = self.state;
             if !was_mark && self.flushed {
                 let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(f32::MAX);
-                if self.frames_since_mark as f32 * self.frame_ms >= (3.0 * wg).max(2500.0) {
+                let gap = self.frames_since_mark as f32 * self.frame_ms;
+                if gap >= (3.0 * wg).max(2500.0) {
                     self.pause_pending = true;
+                } else {
+                    // The gap outlasted the end-of-word timeout but was no
+                    // pause: let the spacing statistics see it, or a sender
+                    // whose character gaps outlast the timeout never teaches
+                    // the decoder his spacing.
+                    self.note_long_gap(gap);
                 }
             }
             self.state = want;
@@ -1634,8 +1641,18 @@ impl CwDecoder {
             // Flush after a long silence so the last word is displayed.
             // While bootstrapping, wait longer: the gaps may be Farnsworth.
             let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(1000.0);
+            // Nor before the typical long gap of this sender has passed
+            // well over: a slow hand with 7-dot character gaps was cut
+            // into single letters before the spacing was learned.
+            let typical = if self.long_gaps.len() >= 5 {
+                let mut v: Vec<f32> = self.long_gaps.iter().copied().collect();
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            } else {
+                0.0
+            };
             let dur = self.run_frames as f32 * self.frame_ms;
-            if dur > (wg * 1.6).max(250.0) {
+            if dur > (wg * 1.6).max(typical * 1.6).max(250.0) {
                 self.run_z.clear();
                 self.on_run(Run::Space(dur), None);
                 self.on_run(Run::Flush, None);
@@ -1764,22 +1781,19 @@ impl CwDecoder {
                         b.timing.cgap = tm.cgap.clamp(b.timing.dot * 2.0, b.timing.dot * 25.0);
                     }
                 }
+                // The two clusters of recent long gaps know this sender's
+                // character and word spacing better than a fresh estimate:
+                // without this a slow sender's long character gaps were
+                // read as word gaps after every re-estimate ("W 0 U").
+                self.update_spacing();
             }
             if std::env::var_os("CWSK_TIMING").is_some() {
                 let t = &self.beam.as_ref().unwrap().timing;
                 eprintln!("TIMING dot {:.0} dash {:.0} egap {:.0} cgap {:.0} wgap {:.0} clusters {:?}", t.dot, t.dash, t.egap, t.cgap, t.wgap(), gap_clusters(&self.long_gaps.iter().copied().collect::<Vec<_>>()));
             }
         }
-        if let (Run::Space(sp), Some(b)) = (run, &self.beam) {
-            let t = &b.timing;
-            let nominal = t.wgap() / t.wscale;
-            if sp > 2.0 * t.egap.max(t.dot) && sp < 2.5 * nominal {
-                self.long_gaps.push_back(sp);
-                if self.long_gaps.len() > 48 {
-                    self.long_gaps.pop_front();
-                }
-                self.update_spacing();
-            }
+        if let Run::Space(sp) = run {
+            self.note_long_gap(sp);
         }
         let b = self.beam.as_mut().unwrap();
         b.adapt(run);
@@ -1788,6 +1802,20 @@ impl CwDecoder {
 
     /// This sender's character and word spacing, from the two clusters of
     /// recent long gaps.
+    /// Records a character or word gap (not a pause) for `gap_clusters`.
+    fn note_long_gap(&mut self, sp: f32) {
+        let Some(b) = &self.beam else { return };
+        let t = &b.timing;
+        let nominal = t.wgap() / t.wscale;
+        if sp > 2.0 * t.egap.max(t.dot) && sp < 2.5 * nominal {
+            self.long_gaps.push_back(sp);
+            if self.long_gaps.len() > 48 {
+                self.long_gaps.pop_front();
+            }
+            self.update_spacing();
+        }
+    }
+
     fn update_spacing(&mut self) {
         let lg: Vec<f32> = self.long_gaps.iter().copied().collect();
         if let Some((c, w)) = gap_clusters(&lg) {
