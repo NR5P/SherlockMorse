@@ -206,6 +206,10 @@ const FAST_MIN_FIT: f32 = 0.86;
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
 const STRONG_FIT: f32 = 0.85;
+/// Below this SNR (dB) a channel must fit Morse timing at least
+/// `LOW_SNR_MIN_FIT` to be shown.
+const LOW_SNR_DB: f32 = 6.0;
+const LOW_SNR_MIN_FIT: f32 = 0.82;
 
 /// Minimum mean Morse elements per character for a channel to be shown.
 /// Noise and artefacts decode as short characters (E T I A N M S, ~1.6
@@ -801,15 +805,25 @@ impl Skimmer {
         // sloppy fist): show it, dimmed, rather than hide it.
         // (Echoes and other artefacts of strong signals are keyed too, but
         // decode as runs of E I S T; real text averages 2.5-3.3 elements per
-        // character.)
-        let text_ok = text_ok || (fit >= STRONG_FIT && ch.decoder.snr_db() >= 12.0 && (n < 8 || el >= SHORT_JUNK_ELEMS));
+        // character, and even garbled text keeps its dashes: a steady
+        // pattern of dits like "UHVHVHV" is not a station talking.)
+        let text_ok = text_ok || (fit >= STRONG_FIT && ch.decoder.snr_db() >= 12.0 && (n < 8 || (el >= SHORT_JUNK_ELEMS && dash >= MIN_DASH_FRAC)));
         if ch.pinned {
             ch.qualified = true;
         } else if runs >= 20 || (final_ && runs >= 10) {
             // Noise decodes as very fast "keying" that only just passes the
             // timing test (40 m scan: every channel shown above 30 WPM fit
             // 0.78-0.83 and was junk; real fast CW fits 0.94-0.98).
-            let min_fit = if ch.decoder.wpm().is_some_and(|w| w > FAST_WPM) { FAST_MIN_FIT } else { MIN_FIT };
+            // Likewise in the noise floor: a channel under 6 dB SNR whose
+            // timing only just passes was junk that flashed up for a few
+            // seconds (a third of the rows shown on a night of 40/80 m).
+            let min_fit = if ch.decoder.wpm().is_some_and(|w| w > FAST_WPM) {
+                FAST_MIN_FIT
+            } else if ch.decoder.snr_db() < LOW_SNR_DB {
+                LOW_SNR_MIN_FIT
+            } else {
+                MIN_FIT
+            };
             if fit >= min_fit && text_ok {
                 if !ch.qualified {
                     Self::note(ch, now, events, "shown");
