@@ -1131,6 +1131,49 @@ impl Skimmer {
             .collect()
     }
 
+    /// Everything about every channel, shown or not, for the recording's
+    /// display log: what the decoder measured and why the channel is or
+    /// is not shown.
+    pub fn debug_json(&self) -> Vec<serde_json::Value> {
+        self.channels
+            .iter()
+            .map(|c| {
+                let (fit, runs) = c.decoder.fit();
+                let (el, dash, _) = text_quality(&c.text);
+                let t = c.decoder.timing();
+                let tail: String = c.text.chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
+                serde_json::json!({
+                    "id": c.id,
+                    "audio_hz": c.demod.freq,
+                    "level_db": c.level_db,
+                    "snr_db": c.decoder.snr_db(),
+                    "active": c.active,
+                    "squelch_open": c.decoder.squelch_open(),
+                    "shown": c.qualified,
+                    "pinned": c.pinned,
+                    "fit": fit,
+                    "runs": runs,
+                    "wpm": c.decoder.wpm(),
+                    "dot_ms": t.map(|t| t.dot),
+                    "dash_ms": t.map(|t| t.dash),
+                    "egap_ms": t.map(|t| t.egap),
+                    "cgap_ms": t.map(|t| t.cgap),
+                    "wgap_ms": t.map(|t| t.wgap()),
+                    "el_per_char": el,
+                    "dash_frac": dash,
+                    "plaus": c.plaus,
+                    "doubtful": c.plaus.is_some_and(|p| p < DOUBTFUL_PLAUS),
+                    "age_s": self.time - c.created,
+                    "last_mark_s": self.time - c.last_mark,
+                    "last_good_s": self.time - c.last_good,
+                    "start_redecodes": c.start_redecodes,
+                    "text": tail,
+                    "tentative": c.decoder.tentative(),
+                })
+            })
+            .collect()
+    }
+
     pub fn channel_info(&self) -> Vec<ChannelInfo> {
         let mut v: Vec<ChannelInfo> = self
             .channels

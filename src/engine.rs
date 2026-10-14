@@ -256,14 +256,7 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
         if let Some(f) = &mut display_log {
             if last_display.elapsed() >= Duration::from_secs(1) {
                 last_display = Instant::now();
-                let chans: Vec<serde_json::Value> = sk
-                    .debug_channels()
-                    .into_iter()
-                    .map(|(freq, fit, runs, el, dash, shown, text)| {
-                        let tail: String = text.chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
-                        serde_json::json!({"audio_hz": freq, "fit": fit, "runs": runs, "el_per_char": el, "dash_frac": dash, "shown": shown, "text": tail})
-                    })
-                    .collect();
+                let chans = sk.debug_json();
                 let infos: Vec<serde_json::Value> = sk
                     .channel_info()
                     .into_iter()
@@ -292,6 +285,15 @@ fn dsp_loop(cfg: SkimmerConfig, lm: Arc<LanguageModel>, audio_rx: Receiver<Audio
         });
         if last_pub.elapsed() >= Duration::from_millis(60) || stop.load(Ordering::Relaxed) {
             last_pub = Instant::now();
+            // Channels shown, hidden or removed (with the reason) go into
+            // the display log too, so a recording explains itself.
+            if let Some(f) = &mut display_log {
+                for e in sk.events.iter().filter(|e| e.note.is_some()) {
+                    let line = serde_json::json!({"t": display_t0.elapsed().as_secs_f32(), "audio_t": sk.time, "event": e.note, "id": e.channel, "audio_hz": e.freq});
+                    use std::io::Write;
+                    let _ = writeln!(f, "{line}");
+                }
+            }
             let mut s = snap.lock();
             s.channels = sk.channel_info();
             s.spots = sk.spots.clone();
