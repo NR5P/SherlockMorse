@@ -65,6 +65,9 @@ pub struct DecoderParams {
     /// element), and the language model should get a say instead of the
     /// timing ruling it out.
     pub clipped_dit: f32,
+    /// Language-model bonus for finishing a word (3+ characters) that was
+    /// copied in the last few dozen words: CW repeats calls, CQ, reports.
+    pub repeat_bonus: f32,
     /// Correct finished words that are one Morse element away from exactly
     /// one known word (see `LanguageModel::correct`); 0 turns it off.
     pub word_fix: f32,
@@ -97,6 +100,7 @@ impl DecoderParams {
                     "soft_weight" => p.soft_weight = v,
                     "insert_penalty" => p.insert_penalty = v,
                     "clipped_dit" => p.clipped_dit = v,
+                    "repeat_bonus" => p.repeat_bonus = v,
                     "word_fix" => p.word_fix = v,
                     _ => eprintln!("unknown param {k}"),
                 }
@@ -126,6 +130,7 @@ impl Default for DecoderParams {
             soft_weight: 0.7,
             insert_penalty: -3.0,
             clipped_dit: -4.5,
+            repeat_bonus: 2.0,
             word_fix: 1.0,
         }
     }
@@ -183,6 +188,9 @@ struct Hyp {
     pend_mark: f32,
     pend_space: f32,
     ctx: [u8; 4],
+    /// The word being decoded (truncated), for the repetition bonus.
+    word: [u8; 12],
+    wlen: u8,
     out: Vec<u8>,
 }
 
@@ -207,6 +215,9 @@ pub struct BeamDecoder {
     hyps: Vec<Hyp>,
     committed: Vec<u8>,
     scratch: Vec<Hyp>,
+    /// The last few dozen committed words, and the word being committed.
+    recent: std::collections::VecDeque<Vec<u8>>,
+    cword: Vec<u8>,
     /// Smoothed fraction of runs that fit Morse timing (0..1).
     pub fit: f32,
     pub fit_n: u32,
@@ -222,13 +233,15 @@ impl BeamDecoder {
             hyps: vec![Self::root()],
             committed: Vec::new(),
             scratch: Vec::new(),
+            recent: Default::default(),
+            cword: Vec::new(),
             fit: 0.6,
             fit_n: 0,
         }
     }
 
     fn root() -> Hyp {
-        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' '; 4], out: Vec::new() }
+        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' '; 4], word: [0; 12], wlen: 0, out: Vec::new() }
     }
 
     /// Takes text committed so far.
@@ -270,6 +283,7 @@ impl BeamDecoder {
             // the word, and the next word starts with fresh context.
             h.score += self.params.lm_weight * (-4.0 + self.lm.char_bonus);
             h.ctx = [b' '; 4];
+            h.wlen = 0;
             h.out.extend_from_slice(&[ERROR, b' ']);
             return;
         }
@@ -277,6 +291,30 @@ impl BeamDecoder {
         h.score += self.params.lm_weight * (lp + self.lm.char_bonus);
         h.ctx = [h.ctx[1], h.ctx[2], h.ctx[3], c];
         h.out.push(c);
+        if c == b' ' {
+            let n = h.wlen as usize;
+            // (Longer than the buffer: never matched.)
+            let w = &h.word[..n.min(h.word.len())];
+            let before = &h.out[..h.out.len().saturating_sub(1 + n)];
+            if (3..=h.word.len()).contains(&n) && self.recently_copied(w, before) {
+                h.score += self.params.lm_weight * self.params.repeat_bonus;
+            }
+            h.wlen = 0;
+        } else if (h.wlen as usize) < h.word.len() {
+            h.word[h.wlen as usize] = c;
+            h.wlen += 1;
+        } else {
+            h.wlen = h.word.len() as u8 + 1;
+        }
+    }
+
+    /// True if `w` was one of the recently committed words, or appears as a
+    /// word earlier in this hypothesis' own uncommitted text.
+    fn recently_copied(&self, w: &[u8], before: &[u8]) -> bool {
+        if w.len() > 12 {
+            return false;
+        }
+        self.recent.iter().any(|r| r.as_slice() == w) || before.split(|&c| c == b' ').any(|x| x == w)
     }
 
     /// Ends the current character; returns false if the elements are invalid.
@@ -486,6 +524,16 @@ impl BeamDecoder {
                             next.push(n);
                         }
                     } else {
+                        // At the start of a word (after a pause) a short
+                        // mark may be a noise blip too, not only inside
+                        // the transmission.
+                        if h.pend_mark == 0.0 && h.len == 0 {
+                            if let Some(c) = self.explain_away(self.params.blip_penalty, m, ev) {
+                                let mut n = h.clone();
+                                n.score += c;
+                                next.push(n);
+                            }
+                        }
                         let mut n = h.clone();
                         n.pend_mark += m;
                         next.push(n);
@@ -592,9 +640,27 @@ impl BeamDecoder {
         }
     }
 
+    /// Remembers committed words for the repetition bonus.
+    fn note_committed(&mut self, text: &[u8]) {
+        for &c in text {
+            if c == b' ' || c == ERROR {
+                if self.cword.len() >= 3 {
+                    self.recent.push_back(std::mem::take(&mut self.cword));
+                    if self.recent.len() > 40 {
+                        self.recent.pop_front();
+                    }
+                }
+                self.cword.clear();
+            } else {
+                self.cword.push(c);
+            }
+        }
+    }
+
     fn commit(&mut self, all: bool) {
         if all {
             let out = std::mem::take(&mut self.hyps[0].out);
+            self.note_committed(&out);
             self.committed.extend_from_slice(&out);
             return;
         }
@@ -619,6 +685,7 @@ impl BeamDecoder {
             return;
         }
         let prefix: Vec<u8> = first[..take].to_vec();
+        self.note_committed(&prefix);
         self.committed.extend_from_slice(&prefix);
         self.hyps.retain(|h| h.out.len() >= take && h.out[..take] == prefix[..]);
         for h in &mut self.hyps {
