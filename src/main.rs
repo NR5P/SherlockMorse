@@ -72,7 +72,7 @@ impl Default for Settings {
             dropout_s: 30.0,
             viterbi: false,
             squelch: 2.3,
-            lm_weight: 0.7,
+            lm_weight: 0.5,
             show_rf: true,
             auto_pitch: true,
             wf_contrast: 1.0,
