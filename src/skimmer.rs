@@ -47,7 +47,7 @@ impl Default for SkimmerConfig {
             detect_db: 12.0,
             min_spacing: 30.0,
             channel_timeout: 25.0,
-            dropout_s: 15.0,
+            dropout_s: 30.0,
             params: DecoderParams::default(),
             auto_detect: true,
         }

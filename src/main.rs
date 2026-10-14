@@ -67,7 +67,7 @@ impl Default for Settings {
             max_freq: 2800.0,
             detect_db: 12.0,
             max_channels: 40,
-            dropout_s: 15.0,
+            dropout_s: 30.0,
             squelch: 2.3,
             lm_weight: 0.7,
             show_rf: true,
