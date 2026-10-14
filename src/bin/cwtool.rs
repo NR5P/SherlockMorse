@@ -91,6 +91,42 @@ enum Cmd {
         #[arg(long, default_value_t = 60.0)]
         duration: f32,
     },
+    /// Weak-signal test from a real recording: fade a strong, cleanly copied
+    /// signal into real band noise at several SNRs and score the copy against
+    /// the clean decode (or a reference transcript).
+    Weak {
+        /// Recording with one strong signal.
+        signal: PathBuf,
+        /// Audio frequency of that signal (Hz).
+        #[arg(long)]
+        freq: f32,
+        /// Band-noise recordings (no strong signals), looped as needed.
+        #[arg(long, num_args = 1.., required = true)]
+        noise: Vec<PathBuf>,
+        /// SNRs to test, dB in 2500 Hz.
+        #[arg(long, value_delimiter = ',', default_value = "6,0,-4,-8,-11")]
+        snr: Vec<f32>,
+        #[arg(long)]
+        reference: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.0)]
+        skip: f32,
+        #[arg(long)]
+        duration: Option<f32>,
+        /// Print the decoded text at each SNR.
+        #[arg(long)]
+        verbose: bool,
+        /// Runs per SNR, each with a different stretch of the noise.
+        #[arg(long, default_value_t = 1)]
+        trials: usize,
+    },
+    /// Quick check for on/off keyed tones (CW) in a short clip, for band scanning.
+    /// Prints one line per keyed tone, strongest first.
+    Keying {
+        file: PathBuf,
+        /// Seconds to check from the start of the file.
+        #[arg(long, default_value_t = 8.0)]
+        duration: f32,
+    },
     /// List audio input devices (best radio match marked).
     Devices,
     /// List serial ports.
@@ -240,6 +276,107 @@ fn main() -> Result<()> {
             println!("wrote {} ({:.1} s)", out.display(), s.len() as f32 / scene.rate as f32);
         }
         Cmd::Bench { trials, compare_lm, only, verbose } => bench(trials, compare_lm, only, verbose),
+        Cmd::Weak { signal, freq, noise, snr, reference, skip, duration, verbose, trials } => {
+            let load = |p: &PathBuf, skip: f32, dur: Option<f32>| -> Result<Vec<f32>> {
+                let (x, rate) = cwskimmer::audiofile::read_audio(p)?;
+                let s0 = ((skip * rate as f32) as usize).min(x.len());
+                let s1 = dur.map_or(x.len(), |d| (s0 + (d * rate as f32) as usize).min(x.len()));
+                let mut rs = Resampler::new(rate, RATE);
+                let mut out = Vec::new();
+                rs.process(&x[s0..s1], &mut out);
+                Ok(out)
+            };
+            let sig = load(&signal, skip, duration)?;
+            let mut nz = Vec::new();
+            for p in &noise {
+                nz.extend(load(p, 0.0, None)?);
+            }
+            anyhow::ensure!(!nz.is_empty(), "no noise audio");
+            let lm = Arc::new(LanguageModel::new());
+            let r = match reference {
+                Some(r) => {
+                    let r: String = std::fs::read(r)?.iter().map(|&b| if b == 0x89 { '=' } else { b as char }).collect();
+                    normalize_ref(&r)
+                }
+                None => normalize_ref(&decode_near(&sig, freq, lm.clone())),
+            };
+            // Power in a 20 ms box filter (about 50 Hz wide) at `freq`.
+            let w = (RATE as f32 * 0.02) as usize;
+            let envelope = |x: &[f32]| {
+                let (mut acc, mut q) = (num_complex::Complex32::new(0.0, 0.0), std::collections::VecDeque::new());
+                let mut env: Vec<f32> = Vec::with_capacity(x.len() / 8);
+                for (i, &x) in x.iter().enumerate() {
+                    let ph = 2.0 * std::f32::consts::PI * freq * ((i % RATE as usize) as f32 / RATE as f32);
+                    let z = num_complex::Complex32::new(x * ph.cos(), -x * ph.sin());
+                    acc += z;
+                    q.push_back(z);
+                    if q.len() > w {
+                        acc -= q.pop_front().unwrap();
+                    }
+                    if i % 8 == 0 {
+                        env.push((acc / w as f32).norm_sqr());
+                    }
+                }
+                env
+            };
+            // Tone power while keyed: 95th percentile of the envelope power.
+            let mut env = envelope(&sig);
+            env.sort_by(|a, b| a.total_cmp(b));
+            let ps = 2.0 * env[env.len() * 95 / 100];
+            // Noise in 2500 Hz at the density found at `freq` (the radio's
+            // filter shapes band noise; this keeps SNRs comparable with the
+            // white-noise benchmark).
+            let en = envelope(&nz);
+            let pn = en.iter().sum::<f32>() / en.len() as f32 * w as f32 * 2500.0 / (RATE as f32 / 2.0);
+            println!("{}: {:.0} s, {} ref chars: {}", signal.display(), sig.len() as f32 / RATE as f32, r.len(), r.chars().take(80).collect::<String>());
+            let jobs: Vec<(f32, usize)> = snr.iter().flat_map(|&db| (0..trials).map(move |k| (db, k))).collect();
+            let res: Vec<(f32, f32, String)> = std::thread::scope(|sc| {
+                let hs: Vec<_> = jobs
+                    .iter()
+                    .map(|&(db, k)| {
+                        let (sig, nz, lm, r) = (&sig, &nz, lm.clone(), &r);
+                        sc.spawn(move || {
+                            let g = (pn * 10f32.powf(db / 10.0) / ps).sqrt();
+                            let off = k * nz.len() / trials;
+                            let mix: Vec<f32> = sig.iter().enumerate().map(|(i, &x)| g * x + nz[(i + off) % nz.len()]).collect();
+                            if let Ok(p) = std::env::var("CWSK_SAVEMIX") {
+                                let spec = hound::WavSpec { channels: 1, sample_rate: RATE, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+                                if let Ok(mut w) = hound::WavWriter::create(format!("{p}-{db}-{k}.wav"), spec) {
+                                    let peak = mix.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+                                    for v in &mix {
+                                        let _ = w.write_sample((v / peak * 30000.0) as i16);
+                                    }
+                                }
+                            }
+                            let hyp = normalize_ref(&decode_near(&mix, freq, lm));
+                            (db, synth::cer(r, &hyp), hyp)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for &db in &snr {
+                let v: Vec<&(f32, f32, String)> = res.iter().filter(|x| x.0 == db).collect();
+                let mean = v.iter().map(|x| x.1).sum::<f32>() / v.len() as f32;
+                let each: Vec<String> = v.iter().map(|x| format!("{:.1}", x.1 * 100.0)).collect();
+                println!("  snr {db:5.1} dB: CER {:5.1}%   ({})", mean * 100.0, each.join(" "));
+                if verbose {
+                    for x in v {
+                        println!("      {}", x.2);
+                    }
+                }
+            }
+        }
+        Cmd::Keying { file, duration } => {
+            let (mut samples, rate) = cwskimmer::audiofile::read_audio(&file)?;
+            samples.truncate((duration * rate as f32) as usize);
+            let mut rs = Resampler::new(rate, RATE);
+            let mut buf = Vec::new();
+            rs.process(&samples, &mut buf);
+            for (f, ons, duty, snr) in keyed_tones(&buf) {
+                println!("{f:7.1} Hz  {ons:3} marks  duty {duty:.2}  {snr:4.1} dB");
+            }
+        }
         Cmd::Waterfall { file, out, skip, duration } => {
             let (samples, rate) = cwskimmer::audiofile::read_audio(&file)?;
             let s0 = ((skip * rate as f32) as usize).min(samples.len());
@@ -327,6 +464,105 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs the skimmer (auto-detect, as live) over 8 kHz audio and returns the
+/// text of the channels within 40 Hz of `freq`, in channel order.
+fn decode_near(audio: &[f32], freq: f32, lm: Arc<LanguageModel>) -> String {
+    let mut sk = Skimmer::new(SkimmerConfig { params: DecoderParams::from_env(), ..Default::default() }, lm);
+    for c in audio.chunks(RATE as usize / 10) {
+        sk.process(c);
+    }
+    sk.process(&vec![0.0; RATE as usize * 3]);
+    sk.finish();
+    let mut by: std::collections::BTreeMap<u64, String> = Default::default();
+    for e in sk.events.drain(..) {
+        if e.note.is_none() && (e.freq - freq).abs() < 40.0 {
+            by.entry(e.channel).or_default().push_str(&e.text);
+        }
+    }
+    by.into_values().map(|t| cwskimmer::morse::to_display(t.trim())).collect::<Vec<_>>().join(" ")
+}
+
+/// Tones that key on and off like CW: (audio Hz, marks, duty cycle, mark level over the
+/// noise floor in dB). A bin counts only if, while it is off, its neighbours within
+/// 150 Hz are quiet too, so tone-hopping digital modes (RTTY, MFSK, Olivia) and steady
+/// carriers (FT8 tones, carriers) do not count.
+fn keyed_tones(audio: &[f32]) -> Vec<(f32, usize, f32, f32)> {
+    let mut sp = cwskimmer::dsp::spectrum::Spectrum::new(512, 80);
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    sp.process(audio, |p| rows.push(p.to_vec()));
+    if rows.len() < 100 {
+        return Vec::new();
+    }
+    // Smooth power over 4 frames (40 ms) so single-bin noise does not chop weak marks.
+    let rows: Vec<Vec<f32>> = (0..rows.len())
+        .map(|t| {
+            let w = &rows[t.saturating_sub(1)..(t + 3).min(rows.len())];
+            (0..rows[t].len()).map(|b| 10.0 * (w.iter().map(|r| r[b]).sum::<f32>() / w.len() as f32 + 1e-14).log10()).collect()
+        })
+        .collect();
+    let hz = RATE as f32 / 512.0;
+    let (lo, hi) = ((250.0 / hz) as usize, (2600.0 / hz) as usize);
+    // Noise floor per bin: 20th percentile over time, then the median over a 300 Hz span.
+    let pct = |mut v: Vec<f32>, q: f32| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[((v.len() - 1) as f32 * q) as usize]
+    };
+    let low: Vec<f32> = (0..rows[0].len()).map(|b| pct(rows.iter().map(|r| r[b]).collect(), 0.2)).collect();
+    let floor: Vec<f32> = (0..low.len())
+        .map(|b| pct(low[b.saturating_sub(10)..(b + 10).min(low.len())].to_vec(), 0.5))
+        .collect();
+    let mut found: Vec<(f32, usize, f32, f32)> = Vec::new();
+    for b in lo..hi {
+        let lvl: Vec<f32> = rows.iter().map(|r| r[b] - floor[b]).collect();
+        let peak = pct(lvl.clone(), 0.9);
+        if peak < 6.0 {
+            continue;
+        }
+        // Local maximum in frequency (by the 90th percentile level).
+        let p90 = |bb: usize| pct(rows.iter().map(|r| r[bb] - floor[bb]).collect(), 0.9);
+        if p90(b - 1) > peak || p90(b + 1) > peak {
+            continue;
+        }
+        let thr = peak / 2.0;
+        let on: Vec<bool> = lvl.iter().map(|&v| v > thr).collect();
+        let (mut marks, mut good_off, mut offs, mut on_frames) = (0usize, 0usize, 0usize, 0usize);
+        let mut i = 0;
+        while i < on.len() {
+            let j = (i..on.len()).find(|&k| on[k] != on[i]).unwrap_or(on.len());
+            let len = j - i;
+            if on[i] {
+                on_frames += len;
+                if (3..=60).contains(&len) {
+                    marks += 1;
+                }
+            } else if len >= 3 && i > 0 && j < on.len() {
+                offs += 1;
+                // Neighbours (30-150 Hz away) quiet while this bin is off.
+                let near = |r: &Vec<f32>| {
+                    (2..=10usize).flat_map(|d| [b - d, b + d]).filter(|&x| x < r.len()).map(|x| r[x] - floor[x]).fold(f32::MIN, f32::max)
+                };
+                let busy = rows[i..j].iter().filter(|r| near(r) > thr).count();
+                if busy * 2 < len {
+                    good_off += 1;
+                }
+            }
+            i = j;
+        }
+        let duty = on_frames as f32 / on.len() as f32;
+        if std::env::var_os("CWSK_KEYDBG").is_some() {
+            eprintln!("{:6.1} peak {peak:4.1} marks {marks} offs {offs} good {good_off} duty {duty:.2}", b as f32 * hz);
+        }
+        if marks >= 8 && offs > 0 && good_off * 10 >= offs * 7 && (0.15..0.8).contains(&duty) {
+            if found.last().is_some_and(|l| (b as f32 * hz - l.0) < 40.0) {
+                continue;
+            }
+            found.push((b as f32 * hz, marks, duty, peak));
+        }
+    }
+    found.sort_by(|a, b| b.3.total_cmp(&a.3));
+    found
 }
 
 fn normalize_ref(s: &str) -> String {
