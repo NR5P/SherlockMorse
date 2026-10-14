@@ -10,6 +10,7 @@ recordings in `testdata/` (not in git: off-air audio and ARRL files).
 | `w1aw80.sh` | W1AW received on 80 m at night, against the bulletin's published text. |
 | `semicer.py` | CER of decoded lines against the best-matching stretch of a reference text. |
 | `readable.py` | Share of decoded words that are dictionary words, QSO terms, numbers or calls (for recordings without a reference). |
+| `bandscan.sh <end-epoch>` | Receive-only adaptive scan of 40 and 80 m: sets the VFO over CAT (/dev/ttyUSB0) and records 6 s per 2 kHz step, staying 90 s chunks (up to 6 min) where `cwtool keying` hears CW. Stop the app first; it never keys the radio. |
 | `flash.py` | From `CWSK_NOTES=1` output: rows shown, and rows hidden again within 10 s. |
 
 Run them from the repository root (`readable.py` reads `data/corpus/`).
