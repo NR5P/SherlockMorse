@@ -119,6 +119,18 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         trials: usize,
     },
+    /// Write the benchmark scenes as WAV files with their transcripts, for
+    /// decoding by another program. Callsigns are replaced by random ones,
+    /// unique per scene, so a skimmer that suppresses repeat spots is not
+    /// penalised for calls the benchmark reuses.
+    ExportBench {
+        #[arg(long, default_value_t = 2)]
+        trials: u64,
+        #[arg(long)]
+        only: Option<String>,
+        #[arg(long, default_value = "bench-export")]
+        out: PathBuf,
+    },
     /// Quick check for on/off keyed tones (CW) in a short clip, for band scanning.
     /// Prints one line per keyed tone, strongest first.
     Keying {
@@ -364,6 +376,62 @@ fn main() -> Result<()> {
                     for x in v {
                         println!("      {}", x.2);
                     }
+                }
+            }
+        }
+        Cmd::ExportBench { trials, only, out } => {
+            use rand::{Rng, SeedableRng};
+            std::fs::create_dir_all(&out)?;
+            const PFX: &[&str] = &[
+                "K", "W", "N", "AA", "AB", "KB", "KC", "KD", "WA", "WB", "VE", "VA", "DL", "DJ", "G", "M", "F", "I", "EA", "ON", "PA",
+                "OK", "OM", "SP", "HA", "YU", "S5", "9A", "OH", "SM", "LA", "OZ", "UA", "UR", "JA", "JH", "VK", "ZL", "LU", "PY", "CE",
+                "XE", "CT", "EI", "OE", "ES", "LY", "YL", "ZS",
+            ];
+            for (ci, case) in cases().iter().enumerate() {
+                if only.as_ref().is_some_and(|o| !case.name.contains(o.as_str())) {
+                    continue;
+                }
+                for t in 0..trials {
+                    let mut scene = (case.make)(t + 1);
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(1000 * ci as u64 + t);
+                    let mut map: std::collections::HashMap<String, String> = Default::default();
+                    for sig in &mut scene.signals {
+                        let words: Vec<String> = sig
+                            .text
+                            .split(' ')
+                            .map(|w| {
+                                if cwskimmer::callsign::parse_callsign(w).is_none() || w.contains('/') {
+                                    return w.to_string();
+                                }
+                                map.entry(w.to_string())
+                                    .or_insert_with(|| loop {
+                                        let p = PFX[rng.gen_range(0..PFX.len())];
+                                        let n = rng.gen_range(if p.len() == 1 { 2..=3 } else { 1..=3 });
+                                        let suf: String = (0..n).map(|_| (b'A' + rng.gen_range(0..26u8)) as char).collect();
+                                        let c = format!("{p}{}{suf}", rng.gen_range(0..10));
+                                        if cwskimmer::callsign::parse_callsign(&c).is_some() && cwskimmer::callsign::valid_prefix(&c) {
+                                            break c;
+                                        }
+                                    })
+                                    .clone()
+                            })
+                            .collect();
+                        sig.text = words.join(" ");
+                    }
+                    let samples = synth::render(&scene);
+                    let peak = samples.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+                    let name = format!("{}-{}", case.name.replace('/', "_"), t + 1);
+                    let spec = hound::WavSpec { channels: 1, sample_rate: scene.rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+                    let mut w = hound::WavWriter::create(out.join(format!("{name}.wav")), spec)?;
+                    for v in &samples {
+                        w.write_sample((v / peak * 30000.0) as i16)?;
+                    }
+                    w.finalize()?;
+                    let mut truth: Vec<String> = scene.signals.iter().map(|s| format!("{:.0}|{:.0}|{:.1}|{}", s.freq, s.wpm, s.snr_db, s.text)).collect();
+                    let mut calls: Vec<&String> = map.values().collect();
+                    calls.sort();
+                    truth.push(format!("#CALLS {}", calls.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(" ")));
+                    std::fs::write(out.join(format!("{name}.txt")), truth.join("\n") + "\n")?;
                 }
             }
         }
