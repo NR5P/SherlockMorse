@@ -165,6 +165,9 @@ struct Qso {
     text: String,
     calls: Vec<String>,
     path: std::path::PathBuf,
+    /// The station stopped keying for a while since the last text: the
+    /// next text starts a new line (a new over).
+    paused: bool,
 }
 
 impl Qso {
@@ -194,7 +197,7 @@ impl Qso {
                 let calls = stem.split('-').skip(6).map(|c| c.replace('_', "/")).collect();
                 let age = mtime.elapsed().unwrap_or_default();
                 let last_text = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-                Some(Qso { rf, started_utc, last_text, away_since: None, text, calls, path })
+                Some(Qso { rf, started_utc, last_text, away_since: None, text, calls, path, paused: false })
             })
             .collect()
     }
@@ -582,6 +585,11 @@ impl App {
                 }
             }
             let conv = selected_near.or(nearest);
+            if let (Some(c), Some(q)) = (conv.and_then(|id| self.snap.channels.iter().find(|c| c.id == id)), &mut self.qso) {
+                if c.last_mark_age > 4.0 {
+                    q.paused = true;
+                }
+            }
             for ev in &events {
                 if Some(ev.channel) == conv {
                     self.qso_feed(ev.freq, &ev.text);
@@ -776,10 +784,12 @@ impl App {
         }
         let q = self.qso.get_or_insert_with(|| {
             let (d, t) = utc_now();
-            Qso { rf, started_utc: format!("{d} {t}"), last_text: now, away_since: None, text: String::new(), calls: Vec::new(), path: std::path::PathBuf::new() }
+            Qso { rf, started_utc: format!("{d} {t}"), last_text: now, away_since: None, text: String::new(), calls: Vec::new(), path: std::path::PathBuf::new(), paused: false }
         });
-        // A pause of more than 4 s means someone else (or a new over) is sending.
-        if q.text.is_empty() || q.last_text.elapsed() > Duration::from_secs(4) {
+        // A new line when the station paused (someone else, or a new
+        // over), not merely because text arrived in bursts: the decoder
+        // holds words back a few seconds in case of an error sign.
+        if q.text.is_empty() || std::mem::take(&mut q.paused) || q.last_text.elapsed() > Duration::from_secs(30) {
             let (_, t) = utc_now();
             if !q.text.is_empty() {
                 q.text.push('\n');
