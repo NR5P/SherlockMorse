@@ -956,12 +956,6 @@ pub struct CwDecoder {
     held_frames: u32,
     pub frames_since_mark: u64,
     pub total_marks: u64,
-    /// A long pause preceded the current run: likely a different station
-    /// starting its over (nets, QSOs on one frequency).
-    after_pause: bool,
-    /// The current over started after a long pause: the next speed check
-    /// switches on any better fit.
-    fresh_over: bool,
     /// Debug: per-frame trace (CWSK_DUMP=path), one decoder only.
     dump: Option<std::io::BufWriter<std::fs::File>>,
 }
@@ -998,8 +992,6 @@ impl CwDecoder {
             held_frames: 0,
             frames_since_mark: 0,
             total_marks: 0,
-            after_pause: false,
-            fresh_over: false,
             dump: std::env::var_os("CWSK_DUMP").and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
         }
     }
@@ -1261,14 +1253,6 @@ impl CwDecoder {
             let tail = self.run_z.split_off(self.run_z.len().saturating_sub(self.cand as usize));
             let prof = std::mem::replace(&mut self.run_z, tail);
             let was_mark = self.state;
-            if !was_mark && self.flushed {
-                // A silence after a flush is not reported as a space: note a
-                // long one here, for `new_over`.
-                let wg = self.beam.as_ref().map(|b| b.timing.wgap()).unwrap_or(0.0);
-                if self.frames_since_mark as f32 * self.frame_ms >= (3.0 * wg).max(2500.0) {
-                    self.after_pause = true;
-                }
-            }
             self.state = want;
             self.run_frames = self.cand;
             self.cand = 0;
@@ -1340,27 +1324,13 @@ impl CwDecoder {
             }
             return;
         }
-        if self.new_over(run) {
-            // A new over (maybe another sender): forget the previous
-            // over's runs and re-check the speed after a few marks of this
-            // one, switching if the new measurement fits better. (Measuring
-            // from scratch on the first few elements was sometimes far off:
-            // 29 WPM for a 13 WPM straight key.)
-            self.history.clear();
-            self.long_gaps.clear();
-            self.fresh_over = true;
-            self.marks_since_check = 0;
-            if std::env::var_os("CWSK_DEBUG").is_some() {
-                eprintln!("new over: re-checking timing soon");
-            }
-        }
         if let Run::Mark(_) = run {
             self.marks_since_check += 1;
         }
         // Periodically re-estimate speed in case a different operator (or
         // a speed change) appears on this frequency.
         let poor_fit = self.beam.as_ref().is_some_and(|b| b.fit < 0.7);
-        if self.marks_since_check >= if poor_fit || self.fresh_over { 8 } else { 16 } {
+        if self.marks_since_check >= if poor_fit { 8 } else { 16 } {
             self.marks_since_check = 0;
             let hist: Vec<Run> = self.history.iter().copied().collect();
             if let Some(tm) = estimate_timing(&hist) {
@@ -1369,7 +1339,7 @@ impl CwDecoder {
                 // Switch speed when the new estimate is clearly more likely,
                 // or merely better when the current model fits poorly (e.g.
                 // it was bootstrapped on noise before the station started).
-                let poor = b.fit < 0.7 || std::mem::take(&mut self.fresh_over);
+                let poor = b.fit < 0.7;
                 if !(0.7..=1.43).contains(&r) && (clearly_better(&hist, b.timing.dot, tm.dot) || (poor && better(&hist, b.timing.dot, tm.dot))) {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("re-estimate: {:?} -> {:?}", b.timing, tm);
@@ -1421,21 +1391,6 @@ impl CwDecoder {
             }
             let nominal = t.wgap() / t.wscale;
             t.wscale = (w / nominal).clamp(0.55, 1.6);
-        }
-    }
-
-    /// True when this run starts a different sender's over: the first mark
-    /// after a long pause. (A change of signal level would catch quick
-    /// handovers too, but QSB changes the level as much and was worse.)
-    fn new_over(&mut self, run: Run) -> bool {
-        let Some(b) = &self.beam else { return false };
-        match run {
-            Run::Space(sp) => {
-                self.after_pause |= sp >= (3.0 * b.timing.wgap()).max(2500.0);
-                false
-            }
-            Run::Mark(_) => std::mem::take(&mut self.after_pause) && b.fit_n > 0,
-            Run::Flush => false,
         }
     }
 
