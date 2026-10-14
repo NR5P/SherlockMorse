@@ -90,9 +90,6 @@ pub struct DecoderParams {
     pub vit_cap: f32,
     /// Decision delay of the search, in dots.
     pub vit_lag: f32,
-    /// Which of the recent blocks' noise levels to take as the floor
-    /// (0 = the minimum, 0.5 = the median).
-    pub noise_rank: f32,
     /// Apply the squelch to the Viterbi search once the speed is known.
     pub vit_squelch: f32,
 }
@@ -142,8 +139,8 @@ impl DecoderParams {
                     "vit_gain" => p.vit_gain = v,
                     "vit_cap" => p.vit_cap = v,
                     "vit_lag" => p.vit_lag = v,
-                    "noise_rank" => p.noise_rank = v,
                     "vit_squelch" => p.vit_squelch = v,
+
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -182,8 +179,8 @@ impl Default for DecoderParams {
             vit_gain: 1.0,
             vit_cap: 4.0,
             vit_lag: 4.0,
-            noise_rank: 0.0,
             vit_squelch: 1.0,
+
         }
     }
 }
@@ -1410,17 +1407,7 @@ impl CwDecoder {
             if self.block_p25.len() > 8 {
                 self.block_p25.pop_front();
             }
-            self.noise_q = if self.params.noise_rank > 0.0 {
-                // A low rank rather than the minimum: the receiver's AGC
-                // ducks the band noise for a moment whenever a strong
-                // signal keys, and the minimum would follow those dips
-                // down, leaving the threshold in the noise.
-                let mut v: Vec<f32> = self.block_p25.iter().copied().collect();
-                v.sort_by(|a, b| a.total_cmp(b));
-                v[((v.len() - 1) as f32 * self.params.noise_rank).round() as usize]
-            } else {
-                self.block_p25.iter().copied().fold(f32::MAX, f32::min)
-            };
+            self.noise_q = self.block_p25.iter().copied().fold(f32::MAX, f32::min);
             self.block = b;
             self.block.clear();
         }
