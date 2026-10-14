@@ -127,6 +127,8 @@ cwtool decode recording.mp3         # decode every signal in a recording
 cwtool decode w1aw.mp3 --reference w1aw.txt   # measure character error rate
 cwtool synth --pileup -o band.wav   # generate a 6-station test scene
 cwtool bench --compare-lm           # synthetic benchmark suite
+cwtool weak rec.wav --freq 750 --noise band*.wav   # fade a recording into real band noise
+cwtool keying clip.wav              # any CW (on/off keyed tones) in a short clip?
 cwtool cty DL/W1ABC VP8LP           # DXCC country, zones and position of calls
 ```
 
@@ -134,32 +136,32 @@ cwtool cty DL/W1ABC VP8LP           # DXCC country, zones and position of calls
 
 `cwtool bench` runs the full skimmer (detection plus decoding) on synthetic
 signals with realistic impairments. The score is character error rate
-(Levenshtein distance), averaged over 48 trials; SNR is measured in a
+(Levenshtein distance), averaged over 24 trials; SNR is measured in a
 2500 Hz bandwidth. "Rayleigh" scenarios use random multipath fading like
 real skywave QSB (deep, irregular fades), not a slow sine.
 
 | Scenario | CER |
 |---|---|
 | Clean, 20 WPM | 0.0 % |
-| SNR +5 dB, 25 WPM | 0.2 % |
-| SNR 0 dB, 22 WPM | 0.6 % |
-| SNR −4 dB, 18 WPM | 0.8 % |
-| SNR −8 dB, 18 WPM | 20 % |
+| SNR +5 dB, 25 WPM | 0.0 % |
+| SNR 0 dB, 22 WPM | 0.0 % |
+| SNR −4 dB, 18 WPM | 0.4 % |
+| SNR −8 dB, 18 WPM | 5.8 % |
 | Hand key, 15 % timing jitter | 0.2 % |
-| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 10 % |
-| Farnsworth 18/8 WPM | 2.0 % |
-| Deep periodic QSB | 0.9 % |
-| Rayleigh fading, SNR 0 dB, 16 WPM, 1 Hz | 4.9 % |
-| Rayleigh fading, SNR −3 dB, 20 WPM | 2.8 % |
-| Rayleigh fading + hand key | 1.0 % |
-| Words run together (4.5-dot word gaps) | 2.0 % |
+| Bad fist: 25 % jitter, 3.8:1 dashes, heavy weighting | 3.9 % |
+| Farnsworth 18/8 WPM | 1.0 % |
+| Deep periodic QSB | 0.7 % |
+| Rayleigh fading, SNR 0 dB, 16 WPM, 1 Hz | 3.4 % |
+| Rayleigh fading, SNR −3 dB, 20 WPM | 0.9 % |
+| Rayleigh fading + hand key | 0.4 % |
+| Words run together (4.5-dot word gaps) | 1.0 % |
 | Letters spread apart (4.5-dot character gaps) | 0.2 % |
-| Static crashes (QRN) | 0.1 % |
+| Static crashes (QRN) | 0.0 % |
 | Frequency drifting 40 Hz, SNR +3 dB | 0.0 % |
 | Speed drifting +40 % | 0.0 % |
 | 40 WPM / 10 WPM | 0.0 % / 0.0 % |
-| Random 5-letter groups (LM can't help) | 0.7 % |
-| 5-station pileup, 80–240 Hz apart | 1.3 % |
+| Random 5-letter groups (LM can't help) | 1.1 % |
+| 5-station pileup, 80–240 Hz apart | 1.1 % |
 
 Turning the language model off (`--compare-lm`) raises the error rate on clean
 signals from about 0 % to about 20 %, so the text prediction matters. At
@@ -174,9 +176,24 @@ signals from about 0 % to about 20 %, so the text prediction matters. At
 | W1AW fast code practice received off the air on 20 m (30-35 WPM) | ~1,400 characters copied with a handful of errors |
 | 49 WPM ragchew received on 40 m | nearly perfect; remaining "errors" are the operator's own keying slips |
 | DARC "Morse class on the air" (real HF reception, several stations) | main text copied, e.g. "…NASAL BONES WERE A UNIQUE FEATURE OF TYRANNOSAURIDS…"; some noise channels remain in the hiss |
+| W1AW bulletin received off the air on 80 m at night, weak and near the top of the passband (scored against the ARRL's published ARLP041 text) | 21 % CER, e.g. "…IN THE CENTEN OF THE SOLAS DISH IT GREW RAPIDLY AND HAD THE RIGHT MAGNETIC CONFIGURATION…" |
 
 W1AW files come from <https://www.arrl.org/code-practice-files>. To check
 them yourself, run `cwtool decode <mp3> --reference <txt>`.
+
+### Weak signals in real band noise
+
+`cwtool weak` fades a clean recording into real 40 m band noise recorded
+on an FTDX3000. The SNR is taken at the noise density found at the
+signal's own frequency: the receiver's filter shapes band noise (about
+6 dB denser at 500–1000 Hz than on average), so a nominal 2500 Hz SNR
+would make real noise look far worse than white noise. Mean of 3 runs on
+the ARRL practice files with their published transcripts:
+
+| Recording | −4 dB | −8 dB | −11 dB |
+|---|---|---|---|
+| ARRL 20 WPM | 3.3 % | 12 % | 50 % |
+| ARRL 13 WPM | 2.7 % | 16 % | 50 % |
 
 ### Noise and artifact handling
 
