@@ -94,6 +94,9 @@ pub struct Channel {
     /// A call heard in no telling context yet: spotted if the next word
     /// shows it was addressed or signing (DE, K, KN, ...).
     pending_call: Option<String>,
+    /// A call cut short after DE or CQ (W3P): joined with the next word
+    /// if that makes a whole call (W3PYF; a letter gap read as a word gap).
+    pending_join: Option<String>,
     frames: Vec<Complex32>,
     /// Speed-matched filter (I, Q, bandwidth) applied after the fixed
     /// 100 Hz demodulator, so the unfiltered frames stay available.
@@ -565,6 +568,7 @@ impl Skimmer {
             heard: rheard,
             prev_word: String::new(),
             pending_call: None,
+            pending_join: None,
             frames: Vec::new(),
             start_frames,
         });
@@ -947,6 +951,19 @@ impl Skimmer {
                     Self::spot(ch, c, now, spots, true);
                 }
             }
+            if let Some(c) = ch.pending_join.take() {
+                let joined = format!("{c}{bare}");
+                if (1..=3).contains(&bare.len())
+                    && parse_callsign(&joined).as_deref() == Some(joined.as_str())
+                    && crate::callsign::standard_shape(&joined)
+                    && crate::callsign::valid_prefix(&joined)
+                {
+                    *ch.call_counts.entry(joined.clone()).or_insert(0) += 1;
+                    Self::spot(ch, joined, now, spots, true);
+                    ch.prev_word = w;
+                    continue;
+                }
+            }
             let calls = Self::calls_in(&w, ch, spots);
             for call in calls {
                 // A near miss of a call already confirmed here, or spotted
@@ -976,13 +993,41 @@ impl Skimmer {
                 if let Some(v) = &voted {
                     spots.retain(|s| !(s.channel == ch.id && &s.call != v && s.count <= 2 && crate::callsign::element_distance(&s.call, v) <= 2));
                 }
-                let call = voted.clone().or(local_rival).or(band_rival).unwrap_or(call);
+                let unsnapped = voted.is_none() && local_rival.is_none() && band_rival.is_none();
+                let mut call = voted.clone().or(local_rival).or(band_rival).unwrap_or(call);
+                // The call sent twice or three times in a row with a copy
+                // garbled ("CX55K CX5FK"): signing, as after DE, when this
+                // copy fits them all best. The garbled copies are forgotten.
+                let mut repeated = false;
+                if unsnapped {
+                    let mut group: Vec<&str> = ch
+                        .heard
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .filter(|(t, h)| now - t < 20.0 && *h != call && crate::callsign::morse_distance(h, &call) <= 2)
+                        .map(|(_, h)| h.as_str())
+                        .collect();
+                    if !group.is_empty() {
+                        group.push(&call);
+                        if let Some(r) = crate::callsign::repeat_vote(&group).filter(|r| *r == call) {
+                            let drop: Vec<String> = group.iter().filter(|g| **g != r).map(|g| g.to_string()).collect();
+                            ch.call_counts.retain(|c, _| !drop.contains(c));
+                            spots.retain(|s| !(s.channel == ch.id && !s.confirmed && drop.contains(&s.call)));
+                            call = r;
+                            repeated = true;
+                        }
+                    }
+                }
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
                 if voted.is_some() {
                     *n = (*n).max(2);
                 }
-                let strong_ctx = matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
+                let strong_ctx = repeated || matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
+                if strong_ctx && !repeated && call.len() <= 4 && !crate::callsign::standard_shape(&call) {
+                    ch.pending_join = Some(call.clone());
+                }
                 if *n >= 2 || strong_ctx {
                     Self::spot(ch, call, now, spots, strong_ctx);
                 } else {

@@ -184,6 +184,26 @@ pub fn consensus(copies: &[&str]) -> Option<String> {
     Some(call.clone())
 }
 
+/// A call sent twice or three times in a row with a copy garbled
+/// ("CX55K CX5FK"): the copy of standard shape that fits all copies best,
+/// if there is exactly one such best copy.
+pub fn repeat_vote(copies: &[&str]) -> Option<String> {
+    let rendered: Vec<Vec<u8>> = copies.iter().map(|c| render(c)).collect();
+    let score = |c: &str| rendered.iter().map(|x| copy_distance(&render(c), x)).sum::<usize>();
+    let mut scored: Vec<(usize, &str)> = copies
+        .iter()
+        .filter(|c| parse_callsign(c).as_deref() == Some(**c) && standard_shape(c) && valid_prefix(c))
+        .map(|c| (score(c), *c))
+        .collect();
+    scored.sort();
+    scored.dedup();
+    let &(best, call) = scored.first()?;
+    if scored.get(1).is_some_and(|(s, _)| *s == best) || copies.iter().any(|c| parse_callsign(c).is_none() && score(c) <= best) {
+        return None;
+    }
+    Some(call.to_string())
+}
+
 fn is_base_call(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() < 3 || b.len() > 7 || !b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
@@ -221,6 +241,8 @@ mod tests {
         // Three loose copies are not enough (HA8WZ really).
         assert_eq!(consensus(&["DS8WP", "HA8WG", "HA7EMP"]), None);
         assert_eq!(consensus(&["THE", "THE", "T4E", "THE"]), None);
+        assert_eq!(repeat_vote(&["CX55K", "CX5FK"]).as_deref(), Some("CX5FK"));
+        assert_eq!(repeat_vote(&["E6US", "N6US"]), None);
         // Both ends of a QSO on one channel stay apart ("K9UR DE K9UIY").
         assert!(element_distance("K9UR", "K9UIY") > 2);
         let qso = ["K9UR", "DE", "K9UIY", "K9UIY", "K9UR", "DE", "K9UIY", "K9UR", "DE", "K9UIY"];
