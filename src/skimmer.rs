@@ -73,6 +73,11 @@ pub struct Channel {
     marks: VecDeque<bool>,
     /// Recent envelope (one per frame), same span as `marks`.
     amps: VecDeque<f32>,
+    /// The same, before the speed-matched filter (see [`speed_watchdog`]).
+    wide: VecDeque<f32>,
+    /// Strong enough that the post filter is kept at least `STRONG_BW` wide.
+    strong_bw: bool,
+    wide_checked: usize,
     /// Text not yet published (held until the channel qualifies).
     pending_out: String,
     /// The decoded text looks like real Morse (see [`text_quality`]).
@@ -91,6 +96,8 @@ pub struct Channel {
     /// together a weak call from several differing copies.
     heard: Vec<(f64, String)>,
     prev_word: String,
+    /// The word before `prev_word` ("CQ" in "CQ POTA K1ABC").
+    prev2_word: String,
     /// A call heard in no telling context yet: spotted if the next word
     /// shows it was addressed or signing (DE, K, KN, ...).
     pending_call: Option<String>,
@@ -219,10 +226,15 @@ const FAST_MIN_FIT: f32 = 0.86;
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
 const STRONG_FIT: f32 = 0.85;
+/// Frames between looks at the unfiltered keying (see `speed_watchdog`).
+const WATCH_FRAMES: usize = 600;
 /// How long a channel keeps its recent words for piecing calls together.
 const HEARD_SECS: f64 = 600.0;
-/// Keying fit needed to trust a single sighting of a call.
+/// Keying fit needed to trust a single sighting of a call, and the fastest
+/// keying trusted (noise decodes as very fast text; contest CW tops out
+/// around 45 WPM).
 const SINGLE_SPOT_FIT: f32 = 0.85;
+const SINGLE_SPOT_MAX_WPM: f32 = 48.0;
 /// Below this SNR (dB) a channel must fit Morse timing at least
 /// `LOW_SNR_MIN_FIT` to be shown.
 const LOW_SNR_DB: f32 = 6.0;
@@ -554,6 +566,9 @@ impl Skimmer {
             active: true,
             marks: VecDeque::with_capacity(MARK_HIST),
             amps: VecDeque::with_capacity(MARK_HIST),
+            wide: VecDeque::with_capacity(MARK_HIST),
+            wide_checked: 0,
+            strong_bw: false,
             pending_out: String::new(),
             qualified: pinned || was_revived,
             last_good: self.time,
@@ -567,6 +582,7 @@ impl Skimmer {
             call_counts: rcalls,
             heard: rheard,
             prev_word: String::new(),
+            prev2_word: String::new(),
             pending_call: None,
             pending_join: None,
             frames: Vec::new(),
@@ -720,9 +736,11 @@ impl Skimmer {
                 if ch.marks.len() >= MARK_HIST {
                     ch.marks.pop_front();
                     ch.amps.pop_front();
+                    ch.wide.pop_front();
                 }
                 ch.marks.push_back(ch.decoder.is_mark());
                 ch.amps.push_back(z.norm());
+                ch.wide.push_back(raw.norm());
             }
             if ch.decoder.is_mark() {
                 ch.last_mark = now;
@@ -737,9 +755,16 @@ impl Skimmer {
                 let c = c + 0.005 * (ch.demod.freq - c);
                 ch.demod.afc_limit = (c - 12.0, c + 12.0);
             }
+            Self::speed_watchdog(ch, now);
+            let snr = ch.decoder.snr_db();
+            if snr >= crate::decoder::STRONG_BW_ON {
+                ch.strong_bw = true;
+            } else if snr < crate::decoder::STRONG_BW_OFF {
+                ch.strong_bw = false;
+            }
             if let Some(t) = ch.decoder.timing() {
                 // Match the filter to the keying speed.
-                let bw = ch.decoder.params().post_bw(t.dot, ch.local_db);
+                let bw = ch.decoder.params().post_bw(t.dot, ch.local_db, ch.strong_bw);
                 if std::env::var_os("CWSK_BWDBG").is_some() && ch.post.as_ref().is_some_and(|p| (bw - p.2).abs() > 0.1 * p.2) {
                     eprintln!("BW t={:.0} {:.0} Hz level {:.1} dB snr {:.1} -> {bw:.1}", now, ch.demod.freq, ch.level_db, ch.decoder.snr_db());
                 }
@@ -776,6 +801,94 @@ impl Skimmer {
         }
     }
 
+    /// A faster station on the frequency of a slow one is smeared by the
+    /// filter matched to the slow one (30 Hz for 12 WPM; a 35 WPM dit is
+    /// 34 ms) into blobs the decoder reads as the slow station's dashes,
+    /// so the speed is never re-measured and the fast station is lost for
+    /// as long as it keeps sending (contest QSOs after a slow CQ). Watch
+    /// the keying before the filter: when it is clearly explained by a much
+    /// faster speed, switch the decoder and the filter to it.
+    fn speed_watchdog(ch: &mut Channel, now: f64) {
+        let Some(dot) = ch.decoder.timing().map(|t| t.dot) else { return };
+        // (Only a slow model's filter can hide a station; one for 27 WPM
+        // or faster passes everything up to 60 WPM.)
+        // (And only while the channel reads badly: a slow station copied
+        // well, or keyed cleanly, is left alone whatever its clicks look
+        // like unfiltered.)
+        let reading_well = ch.plaus.is_some_and(|p| p >= DOUBTFUL_PLAUS) || ch.decoder.fit().0 >= 0.9;
+        if dot < 45.0 || reading_well || ch.wide.len() < MARK_HIST || ch.wide_checked < WATCH_FRAMES || std::env::var_os("CWSK_NOWATCH").is_some() {
+            ch.wide_checked += 1;
+            return;
+        }
+        ch.wide_checked = 0;
+        let mut sorted: Vec<f32> = ch.wide.iter().copied().collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let (noise, peak) = (sorted[sorted.len() / 4], sorted[sorted.len() * 95 / 100]);
+        // (Strong, clean keying only: a weak signal's blips and clicks
+        // would argue for a very fast station.)
+        if peak < 6.0 * noise {
+            return;
+        }
+        let (thr, hyst) = (noise + 0.5 * (peak - noise), 0.1 * (peak - noise));
+        let ms = ch.demod.frame_ms();
+        let mut runs: Vec<crate::decoder::Run> = Vec::new();
+        let (mut state, mut len) = (false, 0usize);
+        for &x in &ch.wide {
+            let want = if state { x > thr - hyst } else { x > thr + hyst };
+            if want != state && len > 0 {
+                runs.push(if state { crate::decoder::Run::Mark(len as f32 * ms) } else { crate::decoder::Run::Space(len as f32 * ms) });
+                len = 0;
+            }
+            state = want;
+            len += 1;
+        }
+        let marks = runs.iter().filter(|r| matches!(r, crate::decoder::Run::Mark(_))).count();
+        if marks < 12 {
+            return;
+        }
+        let Some(tm) = crate::decoder::estimate_timing(&runs) else { return };
+        // (Up to 42 WPM: faster "keying" is a strong signal's edge chatter.)
+        if tm.dot > 0.6 * dot || tm.dot < 28.5 || !crate::decoder::clearly_better(&runs, dot, tm.dot) {
+            return;
+        }
+        // Real keying at that speed has both dits and dashes, and element
+        // gaps of a dit; static crashes and clicks on a slow station's
+        // channel make random short blips that an estimate can still fit.
+        let d = tm.dot;
+        let (mut dits, mut dashes, mut egaps, mut gaps) = (0, 0, 0, 0);
+        for r in &runs {
+            match *r {
+                crate::decoder::Run::Mark(m) if (0.6..=1.5).contains(&(m / d)) => dits += 1,
+                crate::decoder::Run::Mark(m) if (2.2..=4.2).contains(&(m / d)) => dashes += 1,
+                crate::decoder::Run::Space(g) if g < 2.0 * d => {
+                    gaps += 1;
+                    if (0.6..=1.6).contains(&(g / d)) {
+                        egaps += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if dits < 6 || dashes < 4 || gaps < 8 || egaps * 3 < gaps * 2 {
+            return;
+        }
+        if std::env::var_os("CWSK_DEBUG").is_some() {
+            eprintln!("speed watchdog t={now:.0} {:.0} Hz: dot {dot:.0} -> {:.0} ms ({:.0} WPM) from the wide keying", ch.demod.freq, tm.dot, tm.wpm());
+        }
+        let bw = ch.decoder.params().post_bw(tm.dot, ch.local_db, ch.strong_bw);
+        let fs = 1000.0 / ms;
+        ch.decoder.reseed_timing(tm);
+        ch.decoder.set_bandwidth(bw);
+        match &mut ch.post {
+            Some((li, lq, b)) => {
+                li.retune(fs, bw / 2.0);
+                lq.retune(fs, bw / 2.0);
+                *b = bw;
+            }
+            None => ch.post = Some((Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0), bw)),
+        }
+    }
+
     /// The decoder has measured the speed (for the first time, or found it
     /// different): decode the channel's start again through the filter
     /// matched to it. Until the speed was known the start was filtered wide
@@ -785,7 +898,7 @@ impl Skimmer {
     /// yet, so its text so far is simply replaced.
     fn redecode_start(ch: &mut Channel, params: &DecoderParams, lm: &Arc<LanguageModel>) {
         let (Some(t), Some(frames)) = (ch.decoder.timing().cloned(), &ch.start_frames) else { return };
-        let bw = params.post_bw(t.dot, ch.local_db);
+        let bw = params.post_bw(t.dot, ch.local_db, ch.strong_bw);
         let fs = 1000.0 / ch.demod.frame_ms();
         let (mut li, mut lq) = (Lowpass4::new(fs, bw / 2.0), Lowpass4::new(fs, bw / 2.0));
         let amps: Vec<f32> = frames.iter().map(|z| Complex32::new(li.process(z.re), lq.process(z.im)).norm()).collect();
@@ -960,12 +1073,12 @@ impl Skimmer {
                 {
                     *ch.call_counts.entry(joined.clone()).or_insert(0) += 1;
                     Self::spot(ch, joined, now, spots, true);
-                    ch.prev_word = w;
+                    ch.prev2_word = std::mem::replace(&mut ch.prev_word, w);
                     continue;
                 }
             }
             let calls = Self::calls_in(&w, ch, spots);
-            for call in calls {
+            for (call, signing) in calls {
                 // A near miss of a call already confirmed here, or spotted
                 // elsewhere, counts toward that call.
                 let near = |c: &str| c != call && crate::callsign::morse_distance(c, &call) == 1;
@@ -1024,7 +1137,10 @@ impl Skimmer {
                 if voted.is_some() {
                     *n = (*n).max(2);
                 }
-                let strong_ctx = repeated || matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
+                // (Contest and activation calls: "TU K1GU" from the running
+                // station, "CQ CWT K1AJ", "CQ POTA W3PYF".)
+                let cq_word = ch.prev2_word == "CQ" && (2..=5).contains(&ch.prev_word.len()) && ch.prev_word.bytes().all(|c| c.is_ascii_uppercase());
+                let strong_ctx = repeated || signing || cq_word || matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST" | "TU");
                 if strong_ctx && !repeated && call.len() <= 4 && !crate::callsign::standard_shape(&call) {
                     ch.pending_join = Some(call.clone());
                 }
@@ -1034,27 +1150,47 @@ impl Skimmer {
                     ch.pending_call = Some(call);
                 }
             }
-            ch.prev_word = w;
+            ch.prev2_word = std::mem::replace(&mut ch.prev_word, w);
         }
     }
 
     /// The callsigns in a decoded word: the word itself, or two calls run
-    /// together where one of them is already known ("KA4WLXE71A").
-    fn calls_in(w: &str, ch: &Channel, spots: &[Spot]) -> Vec<String> {
+    /// together where one of them is already known ("KA4WLXE71A"), maybe
+    /// with DE, BK or K between them ("XE1FRFBKH6KB": XE1FRF DE KH6KB, DE
+    /// run together reads as B). The flag: signing after a DE in the word.
+    fn calls_in(w: &str, ch: &Channel, spots: &[Spot]) -> Vec<(String, bool)> {
         let ok = |c: &str| parse_callsign(c).filter(|c| crate::callsign::valid_prefix(c));
         if let Some(c) = ok(w) {
-            return vec![c];
+            return vec![(c, false)];
+        }
+        // (After a prosign run on in front: "<SK>XE1FRF...".)
+        let w = w.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        // A signing word run on in front at speed ("TESTW5TM", "CQK1AJ"):
+        // the call, counted as heard but not as a clean single sighting
+        // (the gap lost, the letters may be too).
+        for sep in ["CQ", "DE", "TEST", "TU"] {
+            if let Some(y) = w.strip_prefix(sep).and_then(ok).filter(|y| y.len() >= 4 && crate::callsign::standard_shape(y)) {
+                return vec![(y, false)];
+            }
         }
         let known = |c: &str| ch.call_counts.get(c).is_some_and(|&n| n >= 2) || spots.iter().any(|s| s.call == c);
-        // (Two full-length calls rarely come out of noise by chance.)
-        for k in 3..w.len().saturating_sub(2) {
-            if !w.is_char_boundary(k) {
-                continue;
+        let splits = || (3..w.len().saturating_sub(2)).filter(|&k| w.is_char_boundary(k)).map(|k| (&w[..k], &w[k..]));
+        // A known or whole call, a turn-over word, a whole call (first:
+        // BKH6KB is call shaped too).
+        for (a, b) in splits() {
+            if let Some(x) = ok(a).filter(|x| known(x) || x.len() >= 4 && crate::callsign::standard_shape(x)) {
+                for (sep, de) in [("DE", true), ("B", true), ("BK", false), ("K", false)] {
+                    if let Some(y) = b.strip_prefix(sep).and_then(ok).filter(|y| y.len() >= 4 && crate::callsign::standard_shape(y)) {
+                        return vec![(x, false), (y, de)];
+                    }
+                }
             }
-            let (a, b) = (&w[..k], &w[k..]);
+        }
+        // (Two full-length calls rarely come out of noise by chance.)
+        for (a, b) in splits() {
             if let (Some(x), Some(y)) = (ok(a), ok(b)) {
                 if known(&x) || known(&y) || (x.len() >= 4 && y.len() >= 4) {
-                    return vec![x, y];
+                    return vec![(x, false), (y, false)];
                 }
             }
         }
@@ -1078,6 +1214,7 @@ impl Skimmer {
         let clean_single = strong
             && crate::callsign::standard_shape(&call)
             && ch.decoder.fit().0 >= SINGLE_SPOT_FIT
+            && ch.decoder.wpm().is_some_and(|w| w <= SINGLE_SPOT_MAX_WPM)
             && !spots.iter().any(|s| lookalike(&s.call) || head(&s.call, 1))
             && !ch.call_counts.keys().any(|c| lookalike(c) || head(c, 2));
         let confirmed = n >= 2 || spots.iter().any(|s| s.call == call) || clean_single;
@@ -1101,8 +1238,9 @@ impl Skimmer {
     /// Drops spots that are garbled copies of an established call: a
     /// fragment of it (XE1F for XE1FRF), it with a letter run on (K9UIYR),
     /// or within two Morse elements (E7AOA for E71A). Unconfirmed spots go
-    /// if such a call is confirmed; a confirmed one only if the other call
-    /// has been heard four times as often. Real stations rarely have calls
+    /// if such a call is confirmed; a confirmed one heard once if the other
+    /// call is confirmed and heard twice, others only if the other call has
+    /// been heard four times as often. Real stations rarely have calls
     /// that similar; a sighting that is one is almost always a misread.
     fn drop_variants(spots: &mut Vec<Spot>) {
         let variant = |a: &str, b: &str| {
@@ -1116,7 +1254,7 @@ impl Skimmer {
             !all.iter().any(|(c, n, conf)| {
                 c != &s.call
                     && variant(&s.call, c)
-                    && ((!s.confirmed && (*conf || *n >= 2)) || (s.confirmed && *n >= 4 && *n >= 4 * s.count))
+                    && ((!s.confirmed && (*conf || *n >= 2)) || (s.confirmed && s.count == 1 && *conf && *n >= 2) || (s.confirmed && *n >= 4 && *n >= 4 * s.count))
             })
         });
     }

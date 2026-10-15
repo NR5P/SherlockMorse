@@ -94,12 +94,27 @@ pub struct DecoderParams {
     pub vit_squelch: f32,
 }
 
+/// Post-filter floor for a strong signal (Hz; passes 40 WPM). A channel
+/// counts as strong from `STRONG_BW_ON` dB of envelope SNR (`snr_db`)
+/// until it drops under `STRONG_BW_OFF` (hysteresis: the level wobbles
+/// by several dB and the filter should not keep retuning).
+pub const STRONG_BW: f32 = 60.0;
+pub const STRONG_BW_ON: f32 = 30.0;
+pub const STRONG_BW_OFF: f32 = 24.0;
+
 impl DecoderParams {
     /// Bandwidth (Hz) of the speed-matched post filter for a signal of this
     /// dot length (ms) and peak level over the noise (dB).
-    pub fn post_bw(&self, dot: f32, level_db: f32) -> f32 {
+    pub fn post_bw(&self, dot: f32, level_db: f32, strong: bool) -> f32 {
         let t = ((self.weak_db - level_db) / self.weak_span_db.max(0.1)).clamp(0.0, 1.0);
-        let floor = self.min_bw + t * (self.narrow_bw - self.min_bw);
+        let mut floor = self.min_bw + t * (self.narrow_bw - self.min_bw);
+        // A strong signal gains nothing from a narrow filter, and on a
+        // frequency shared by a slow and a fast station (a contest run
+        // after a slow CQ) the filter matched to the slow one smears the
+        // fast one's dits into blobs that read as the slow one's dashes.
+        if strong {
+            floor = floor.max(STRONG_BW);
+        }
         (self.bw_factor * 1000.0 / dot).clamp(floor, 200.0)
     }
 
@@ -1256,6 +1271,18 @@ impl CwDecoder {
     /// Starts decoding with a known timing instead of measuring it first.
     pub fn seed_timing(&mut self, tm: TimingModel) {
         self.beam = Some(BeamDecoder::new(self.params.clone(), self.lm.clone(), tm));
+    }
+
+    /// Switches to another station's timing, forgetting the runs seen so
+    /// far (through a filter matched to the old speed they would only
+    /// argue for it again).
+    pub fn reseed_timing(&mut self, tm: TimingModel) {
+        self.seed_timing(tm);
+        self.history.clear();
+        self.long_gaps.clear();
+        self.marks_since_check = 0;
+        self.over_buf = None;
+        self.pause_pending = false;
     }
 
     pub fn params(&self) -> &DecoderParams {
