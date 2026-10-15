@@ -88,6 +88,9 @@ pub struct Channel {
     plaus: Option<f32>,
     call_counts: HashMap<String, u32>,
     prev_word: String,
+    /// A call heard in no telling context yet: spotted if the next word
+    /// shows it was addressed or signing (DE, K, KN, ...).
+    pending_call: Option<String>,
     frames: Vec<Complex32>,
     /// Speed-matched filter (I, Q, bandwidth) applied after the fixed
     /// 100 Hz demodulator, so the unfiltered frames stay available.
@@ -183,6 +186,10 @@ pub struct Skimmer {
     /// The latest spectrum frame was a broadband burst (static crash).
     burst: bool,
     burst_hops: u32,
+    /// The latest spectrum frame was muted audio (far below the noise),
+    /// and for how many frames in a row.
+    muted: bool,
+    muted_hops: u32,
 }
 
 const PREROLL_SECS: f32 = 1.5;
@@ -206,6 +213,8 @@ const FAST_MIN_FIT: f32 = 0.86;
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
 const STRONG_FIT: f32 = 0.85;
+/// Keying fit needed to trust a single sighting of a call.
+const SINGLE_SPOT_FIT: f32 = 0.85;
 /// Below this SNR (dB) a channel must fit Morse timing at least
 /// `LOW_SNR_MIN_FIT` to be shown.
 const LOW_SNR_DB: f32 = 6.0;
@@ -485,6 +494,8 @@ impl Skimmer {
             hops: 0,
             burst: false,
             burst_hops: 0,
+            muted: false,
+            muted_hops: 0,
         }
     }
 
@@ -546,6 +557,7 @@ impl Skimmer {
             plaus: None,
             call_counts: rcalls,
             prev_word: String::new(),
+            pending_call: None,
             frames: Vec::new(),
             start_frames,
         });
@@ -646,8 +658,16 @@ impl Skimmer {
     fn process_piece(&mut self, samples: &[f32]) {
         let mut spectra: Vec<Vec<f32>> = Vec::new();
         self.spectrum.process(samples, |p| spectra.push(p.to_vec()));
+        // Muted only if every spectrum frame of this piece was: the decoder
+        // takes one erasure flag per piece, and a piece ending in a short
+        // gap of digital silence (an MP3 between elements) still holds marks.
+        // (And only after about 5 s of it: an MP3 has stretches of digital
+        // silence between words, seconds long at 5 WPM, which are true
+        // spaces.)
+        let mut all_muted = !spectra.is_empty();
         for p in &spectra {
             self.on_spectrum(p);
+            all_muted &= self.muted_hops > 300;
         }
         self.preroll.extend(samples.iter().copied());
         let max = (PREROLL_SECS * RATE as f32) as usize;
@@ -660,7 +680,7 @@ impl Skimmer {
         for ch in &mut self.channels {
             ch.frames.clear();
             ch.demod.process(samples, &mut ch.frames);
-            ch.decoder.set_erasure(self.burst && (5..60).contains(&self.burst_hops));
+            ch.decoder.set_erasure((self.burst && (5..60).contains(&self.burst_hops)) || all_muted);
             for i in 0..ch.frames.len() {
                 let raw = ch.frames[i];
                 let z = match &mut ch.post {
@@ -904,44 +924,121 @@ impl Skimmer {
             if w.is_empty() {
                 continue;
             }
-            if let Some(call) = parse_callsign(&w).filter(|c| crate::callsign::valid_prefix(c)) {
+            // A call just before DE or a turn-over (K, KN, BK, ...) is
+            // being addressed or is signing: as good a sighting as one
+            // after DE ("W2GLN DE K9UIY", "... W9UZ K").
+            if let Some(c) = ch.pending_call.take() {
+                if matches!(w.as_str(), "DE" | "K" | "KN" | "BK" | "AR" | "SK" | "<KN>" | "<AR>" | "<SK>") {
+                    Self::spot(ch, c, now, spots, true);
+                }
+            }
+            let calls = Self::calls_in(&w, ch, spots);
+            for call in calls {
                 // A near miss of a call already confirmed here, or spotted
                 // elsewhere, counts toward that call.
                 let near = |c: &str| c != call && crate::callsign::morse_distance(c, &call) == 1;
-                let call = ch
+                let rival = ch
                     .call_counts
                     .iter()
                     .filter(|(c, &n)| n >= 2 && near(c))
                     .max_by_key(|(_, &n)| n)
                     .map(|(c, _)| c.clone())
-                    .or_else(|| spots.iter().filter(|s| s.confirmed && near(&s.call)).max_by_key(|s| s.count).map(|s| s.call.clone()))
-                    .unwrap_or(call);
+                    .or_else(|| spots.iter().filter(|s| s.confirmed && near(&s.call)).max_by_key(|s| s.count).map(|s| s.call.clone()));
+                let call = rival.unwrap_or(call);
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
-                // Twice on this channel, or already spotted earlier (a net
-                // control is heard every few minutes, longer than a
-                // channel remembers its calls).
-                let confirmed = *n >= 2 || spots.iter().any(|s| s.call == call);
                 let strong_ctx = matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
                 if *n >= 2 || strong_ctx {
-                    let wpm = ch.decoder.wpm().unwrap_or(0.0);
-                    let snr = ch.decoder.snr_db();
-                    let f = ch.demod.freq as f32;
-                    if let Some(s) = spots.iter_mut().find(|s| s.call == call) {
-                        s.freq = f;
-                        s.wpm = wpm;
-                        s.snr_db = snr;
-                        s.time = now;
-                        s.channel = ch.id;
-                        s.count += 1;
-                        s.confirmed |= confirmed;
-                    } else {
-                        spots.push(Spot { call, freq: f, wpm, snr_db: snr, time: now, channel: ch.id, count: 1, confirmed });
-                    }
+                    Self::spot(ch, call, now, spots, strong_ctx);
+                } else {
+                    ch.pending_call = Some(call);
                 }
             }
             ch.prev_word = w;
         }
+    }
+
+    /// The callsigns in a decoded word: the word itself, or two calls run
+    /// together where one of them is already known ("KA4WLXE71A").
+    fn calls_in(w: &str, ch: &Channel, spots: &[Spot]) -> Vec<String> {
+        let ok = |c: &str| parse_callsign(c).filter(|c| crate::callsign::valid_prefix(c));
+        if let Some(c) = ok(w) {
+            return vec![c];
+        }
+        let known = |c: &str| ch.call_counts.get(c).is_some_and(|&n| n >= 2) || spots.iter().any(|s| s.call == c);
+        // (Two full-length calls rarely come out of noise by chance.)
+        for k in 3..w.len().saturating_sub(2) {
+            if !w.is_char_boundary(k) {
+                continue;
+            }
+            let (a, b) = (&w[..k], &w[k..]);
+            if let (Some(x), Some(y)) = (ok(a), ok(b)) {
+                if known(&x) || known(&y) || (x.len() >= 4 && y.len() >= 4) {
+                    return vec![x, y];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Records a sighting of `call` on this channel as a spot; `strong`:
+    /// it was signing or being called (after DE/CQ, before DE/K).
+    fn spot(ch: &mut Channel, call: String, now: f64, spots: &mut Vec<Spot>, strong: bool) {
+        // Twice on this channel, or already spotted earlier (a net control
+        // is heard every few minutes, longer than a channel remembers its
+        // calls). Or once, signing or being called, on clean keying, with
+        // the shape of a real call and not a near copy of another call
+        // heard this session: CW Skimmer spots such single sightings too
+        // (it checks them against a call database; we use only the shape).
+        let n = ch.call_counts.get(&call).copied().unwrap_or(1);
+        let lookalike = |c: &str| c != call && (crate::callsign::morse_distance(c, &call) <= 2 || (c.len() >= 3 && (c.contains(call.as_str()) || call.contains(c))));
+        // Same first four characters give or take an element or two: a
+        // partial or busted copy (DL1BM next to DL1DGR, E71TDX next to E71A).
+        let head = |c: &str, max: usize| c != call && c.len() >= 4 && call.len() >= 4 && crate::callsign::morse_distance(&c[..4], &call[..4]) <= max;
+        let clean_single = strong
+            && crate::callsign::standard_shape(&call)
+            && ch.decoder.fit().0 >= SINGLE_SPOT_FIT
+            && !spots.iter().any(|s| lookalike(&s.call) || head(&s.call, 1))
+            && !ch.call_counts.keys().any(|c| lookalike(c) || head(c, 2));
+        let confirmed = n >= 2 || spots.iter().any(|s| s.call == call) || clean_single;
+        let wpm = ch.decoder.wpm().unwrap_or(0.0);
+        let snr = ch.decoder.snr_db();
+        let f = ch.demod.freq as f32;
+        if let Some(s) = spots.iter_mut().find(|s| s.call == call) {
+            s.freq = f;
+            s.wpm = wpm;
+            s.snr_db = snr;
+            s.time = now;
+            s.channel = ch.id;
+            s.count += 1;
+            s.confirmed |= confirmed;
+        } else {
+            spots.push(Spot { call, freq: f, wpm, snr_db: snr, time: now, channel: ch.id, count: 1, confirmed });
+        }
+        Self::drop_variants(spots);
+    }
+
+    /// Drops spots that are garbled copies of an established call: a
+    /// fragment of it (XE1F for XE1FRF), it with a letter run on (K9UIYR),
+    /// or within two Morse elements (E7AOA for E71A). Unconfirmed spots go
+    /// if such a call is confirmed; a confirmed one only if the other call
+    /// has been heard four times as often. Real stations rarely have calls
+    /// that similar; a sighting that is one is almost always a misread.
+    fn drop_variants(spots: &mut Vec<Spot>) {
+        let variant = |a: &str, b: &str| {
+            a != b && ((a.len() >= 3 && (b.contains(a) || a.contains(b))) || crate::callsign::morse_distance(a, b) <= 2)
+        };
+        // Against established calls anywhere on the band, not only nearby:
+        // in a pileup the callers send the DX call too, each with its own
+        // copying errors (E71A heard as E71EE, E7AOA, XE71A ...).
+        let all: Vec<(String, u32, bool)> = spots.iter().map(|s| (s.call.clone(), s.count, s.confirmed)).collect();
+        spots.retain(|s| {
+            !all.iter().any(|(c, n, conf)| {
+                c != &s.call
+                    && variant(&s.call, c)
+                    && ((!s.confirmed && (*conf || *n >= 2)) || (s.confirmed && *n >= 4 && *n >= 4 * s.count))
+            })
+        });
     }
 
     fn bin_range(&self) -> (usize, usize) {
@@ -978,6 +1075,14 @@ impl Skimmer {
         // A crash is flat: the floor comes up close to the strongest signal.
         // (Codec noise riding on a strong keyed tone stays far below it.)
         self.burst = self.hops > 30 && med > self.noise_floor * 5.0 && med * 3000.0 > top;
+        // Muted audio (the radio mutes the receiver while transmitting, a
+        // recording has a gap of digital silence): everything 30 dB under
+        // the noise floor. Keep the noise floors through it, or they
+        // collapse and the first seconds after it look 70 dB above the
+        // noise. (Only the floors: an MP3 has digital silence between
+        // elements, and the rest must keep tracking.)
+        self.muted = self.hops > 30 && med < self.noise_floor * 1e-3 && top < self.noise_floor;
+        self.muted_hops = if self.muted { self.muted_hops + 1 } else { 0 };
         if self.burst {
             self.burst_hops += 1;
             // A sustained rise is a real change of band noise, not a crash.
@@ -996,7 +1101,9 @@ impl Skimmer {
         let mut v: Vec<f32> = self.fast[lo..hi].to_vec();
         v.sort_unstable_by(|a, b| a.total_cmp(b));
         let nf = v[v.len() / 2].max(1e-15);
-        self.noise_floor = 0.9 * self.noise_floor + 0.1 * nf;
+        if !self.muted {
+            self.noise_floor = 0.9 * self.noise_floor + 0.1 * nf;
+        }
         let nf = self.noise_floor;
         // Local floor: medians of 16-bin blocks, interpolated between block
         // centres, smoothed like the overall floor.
@@ -1021,8 +1128,9 @@ impl Skimmer {
                 let (a, c) = (meds[k - 1], meds[k]);
                 a.1 + (c.1 - a.1) * (x - a.0) / (c.0 - a.0)
             };
-            let l = 0.9 * self.local_floor[b] + 0.1 * m;
-            self.local_floor[b] = l;
+            if !self.muted {
+                self.local_floor[b] = 0.9 * self.local_floor[b] + 0.1 * m;
+            }
         }
         // Detection and the activity gate: never above the overall floor
         // (finds weak signals on the skirts without making a noisy stretch
@@ -1078,10 +1186,17 @@ impl Skimmer {
                 continue;
             }
             // Ignore key clicks / skirts of much stronger nearby signals.
+            // Judge the strong signal by its level now (fast decay), not
+            // its peak hold: clicks and skirts exist only while it keys,
+            // and in a QSO the other station sends while it is silent
+            // (W2GLN 165 Hz from a 47 dB K9UIY was never picked up).
             let lvl = 10.0 * (pk / nf).log10();
+            let recent = &self.recent;
             if self.channels.iter().any(|ch| {
                 let df = (ch.demod.freq as f32 - f).abs();
-                df < 200.0 && ch.level_db - lvl > 20.0 + df / 10.0
+                let cb = ((ch.demod.freq as f32 / hz).round() as usize).clamp(1, recent.len() - 2);
+                let now_db = 10.0 * (recent[cb - 1..=cb + 1].iter().fold(0.0f32, |m, &v| m.max(v)) / nf).log10();
+                df < 200.0 && ch.level_db.min(now_db) - lvl > 20.0 + df / 10.0
             }) {
                 continue;
             }

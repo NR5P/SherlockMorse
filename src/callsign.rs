@@ -51,6 +51,28 @@ pub fn morse_distance(a: &str, b: &str) -> usize {
     prev[y.len()]
 }
 
+/// True if the call has the shape most real calls have: a prefix of one or
+/// two characters (at most one of them a digit), one area digit, and a
+/// suffix of one to three letters; two or three letters after a one-letter
+/// K/N/W prefix (US 1x1 calls are rare special-event calls). Portable calls
+/// are judged by their home call. Decoding errors often break the shape
+/// (K56KB, E7WKDX, W7R).
+pub fn standard_shape(call: &str) -> bool {
+    let base = call.split('/').max_by_key(|p| p.len()).unwrap_or(call);
+    let b = base.as_bytes();
+    let Some(d) = b.iter().rposition(|c| c.is_ascii_digit()) else { return false };
+    let (pfx, suf) = (&b[..d], &b[d + 1..]);
+    if !(1..=3).contains(&suf.len()) || !suf.iter().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    if pfx.is_empty() || pfx.len() > 2 || pfx.iter().filter(|c| c.is_ascii_digit()).count() > 1 || !pfx.iter().any(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    // US prefixes (K, N, W) never contain a digit: K56KB is K5 + noise.
+    let us = matches!(pfx[0], b'K' | b'N' | b'W');
+    !(us && (pfx.len() == 2 && pfx[1].is_ascii_digit() || pfx.len() == 1 && suf.len() < 2))
+}
+
 fn is_base_call(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() < 3 || b.len() > 7 || !b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
@@ -76,6 +98,16 @@ fn is_base_call(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_shapes() {
+        for c in ["E71A", "K9UIY", "W2GLN", "KH6KB", "TI5/VA3RA", "9A1K", "S57WJ", "N5KV", "GW0SGL", "4X1AB"] {
+            assert!(standard_shape(c), "{c}");
+        }
+        for c in ["K56KB", "E7WKDX", "W7R", "DL1BMEA"] {
+            assert!(!standard_shape(c), "{c}");
+        }
+    }
 
     #[test]
     fn calls() {

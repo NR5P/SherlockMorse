@@ -205,8 +205,23 @@ fn main() -> Result<()> {
                 sk.process(&buf);
             };
             let chunk_div: usize = std::env::var("CWSK_CHUNKDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+            // Every spot ever listed (the live list forgets spots after
+            // 15 minutes): call -> (count, confirmed).
+            let mut all_spots: std::collections::BTreeMap<String, (u32, bool)> = Default::default();
+            // (A spot the skimmer withdraws as a misread is forgotten; one
+            // that merely ages out of the live list is kept.)
+            let mut last_seen: std::collections::HashMap<String, f64> = Default::default();
             for chunk in samples.chunks(rate as usize / chunk_div) {
                 feed(&mut sk, chunk);
+                for sp in &sk.spots {
+                    let e = all_spots.entry(sp.call.clone()).or_insert((0, false));
+                    e.0 = e.0.max(sp.count);
+                    e.1 |= sp.confirmed;
+                    last_seen.insert(sp.call.clone(), sp.time);
+                }
+                let now = sk.time;
+                let live: std::collections::HashSet<&str> = sk.spots.iter().map(|s| s.call.as_str()).collect();
+                all_spots.retain(|c, _| live.contains(c.as_str()) || last_seen.get(c).is_some_and(|&t| now - t >= 899.0));
             }
             if std::env::var_os("CWSK_CHANNELS").is_some() {
                 for (f, fit, n, q, d, ok, t) in sk.debug_channels() {
@@ -241,6 +256,17 @@ fn main() -> Result<()> {
                     best = t.clone();
                 }
                 println!("{f:7.1} Hz: {t}");
+            }
+            for sp in &sk.spots {
+                let e = all_spots.entry(sp.call.clone()).or_insert((0, false));
+                e.0 = e.0.max(sp.count);
+                e.1 |= sp.confirmed;
+            }
+            if std::env::var_os("CWSK_ALLSPOTS").is_some() {
+                println!("\nAll spots:");
+                for (c, (n, conf)) in &all_spots {
+                    println!("  {c:<10} x{n}{}", if *conf { "" } else { " (unconfirmed)" });
+                }
             }
             if !sk.spots.is_empty() {
                 println!("\nSpots:");
