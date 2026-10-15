@@ -77,6 +77,9 @@ pub struct Channel {
     wide: VecDeque<f32>,
     /// Strong enough that the post filter is kept at least `STRONG_BW` wide.
     strong_bw: bool,
+    /// Created next to another strong channel, or had one created next to
+    /// it: the two keep narrow demodulators while they are neighbours.
+    crowd_pair: bool,
     wide_checked: usize,
     /// Text not yet published (held until the channel qualifies).
     pending_out: String,
@@ -226,6 +229,20 @@ const FAST_MIN_FIT: f32 = 0.86;
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
 const STRONG_FIT: f32 = 0.85;
+/// Another strong channel `CROWDED_MIN_HZ`..`CROWDED_HZ` away makes a new
+/// channel "crowded": both get a `CROWDED_BW` demodulator passband instead
+/// of 100 Hz. (Closer than the minimum is a strong signal's own spectral
+/// spread, not another station: pairing a 39 dB station with its own
+/// 33 Hz sideband pinned and narrowed it and garbled its copy.)
+const CROWDED_MIN_HZ: f32 = 40.0;
+const CROWDED_HZ: f32 = 60.0;
+const CROWDED_BW: f32 = 50.0;
+/// ...when both are within this much of each other in level.
+const CROWDED_DIFF_DB: f32 = 10.0;
+/// At creation (before either has read anything) both must be this strong.
+const CROWDED_START_DB: f32 = 25.0;
+/// How far the AFC may move a crowded channel from where it was created.
+const CROWDED_AFC_HZ: f64 = 6.0;
 /// Frames between looks at the unfiltered keying (see `speed_watchdog`).
 const WATCH_FRAMES: usize = 600;
 /// How long a channel keeps its recent words for piecing calls together.
@@ -543,7 +560,37 @@ impl Skimmer {
             Some(r) => (r.text + " ", r.call_counts, r.heard),
             None => (String::new(), HashMap::new(), Vec::new()),
         };
-        let mut demod = ChannelDemod::new(RATE as f32, freq as f64, 100.0, FRAME);
+        // Next to another channel (a contest band packs stations 40-60 Hz
+        // apart), start narrow so this one hears mostly its own station.
+        let lvl = {
+            // (As `level_db` is measured.)
+            let b = ((freq / bin_hz()).round() as usize).min(self.peak.len() - 1);
+            let nf = self.noise_floor;
+            10.0 * (self.peak[b] / self.local_floor[b].clamp(nf * 0.1, nf).max(1e-15)).log10()
+        };
+        let mut crowded = false;
+        if lvl >= CROWDED_START_DB {
+            for c in &mut self.channels {
+                let d = (c.demod.freq as f32 - freq).abs();
+                if (CROWDED_MIN_HZ..CROWDED_HZ).contains(&d) && c.level_db >= CROWDED_START_DB && (c.level_db - lvl).abs() <= CROWDED_DIFF_DB {
+                    crowded = true;
+                    c.crowd_pair = true;
+                    c.demod.set_bandwidth(CROWDED_BW);
+                    c.demod.afc_limit = (c.demod.freq - CROWDED_AFC_HZ, c.demod.freq + CROWDED_AFC_HZ);
+                }
+            }
+        }
+        if std::env::var_os("CWSK_DEBUG").is_some() {
+            let nb: Vec<String> = self.channels.iter().filter(|c| (c.demod.freq as f32 - freq).abs() < CROWDED_HZ).map(|c| format!("{:.0}Hz {:.0}dB", c.demod.freq, c.level_db)).collect();
+            eprintln!("new channel t={:.1} {freq:.0} Hz lvl {lvl:.0} dB crowded={crowded} near {nb:?}", self.time);
+        }
+        let mut demod = ChannelDemod::new(RATE as f32, freq as f64, if crowded { CROWDED_BW } else { 100.0 }, FRAME);
+        // (The AFC of each is pulled toward the other while both key, so
+        // it is held close to the creation frequency, which next to a
+        // known channel is the bin centre, not an interpolation.)
+        if crowded {
+            demod.afc_limit = (freq as f64 - CROWDED_AFC_HZ, freq as f64 + CROWDED_AFC_HZ);
+        }
         let mut decoder = CwDecoder::new(demod.frame_ms(), self.cfg.params.clone(), self.lm.clone());
         // Warm up on the pre-roll audio.
         let (a, b) = self.preroll.as_slices();
@@ -569,6 +616,7 @@ impl Skimmer {
             wide: VecDeque::with_capacity(MARK_HIST),
             wide_checked: 0,
             strong_bw: false,
+            crowd_pair: crowded,
             pending_out: String::new(),
             qualified: pinned || was_revived,
             last_good: self.time,
@@ -704,7 +752,17 @@ impl Skimmer {
         }
         let now = self.time;
         let (params, lm) = (&self.cfg.params, &self.lm);
-        for ch in &mut self.channels {
+        // A channel paired at creation with a neighbour (see `add_channel`)
+        // keeps its narrow demodulator until no channel is within
+        // `CROWDED_HZ` of it any more.
+        let freqs: Vec<f32> = self.channels.iter().map(|c| c.demod.freq as f32).collect();
+        for (i, ch) in self.channels.iter_mut().enumerate() {
+            if ch.crowd_pair && !freqs.iter().enumerate().any(|(j, f)| j != i && (f - freqs[i]).abs() < CROWDED_HZ) {
+                ch.crowd_pair = false;
+                ch.demod.set_bandwidth(100.0);
+                let f = ch.demod.freq;
+                ch.demod.afc_limit = (f - 12.0, f + 12.0);
+            }
             ch.frames.clear();
             ch.demod.process(samples, &mut ch.frames);
             ch.decoder.set_erasure((self.burst && (5..60).contains(&self.burst_hops)) || all_muted);
@@ -1010,6 +1068,9 @@ impl Skimmer {
     /// Called before a channel is removed: keeps its held-back last word,
     /// and notes why a shown channel went away.
     fn dropping(ch: &mut Channel, now: f64, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>, why: &str) {
+        if std::env::var_os("CWSK_DEBUG").is_some() {
+            eprintln!("drop t={now:.1} {:.0} Hz ({:.0} dB, pair={}): {why}", ch.demod.freq, ch.level_db, ch.crowd_pair);
+        }
         if ch.qualified {
             Self::note(ch, now, events, &format!("removed: {why}"));
             Self::hide(ch, now, events, spots);
@@ -1379,6 +1440,11 @@ impl Skimmer {
         }
         let det = 10f32.powf(self.cfg.detect_db / 10.0);
         let hz = bin_hz();
+        // A peak next to a strong channel of comparable level (the pair a
+        // crowded channel is made of, see `add_channel`) is not interpolated:
+        // the neighbour's skirt pulls the estimate toward it (two stations
+        // 45 Hz apart came out 20 Hz apart, both wrong).
+        let strong: Vec<(usize, f32)> = self.channels.iter().filter(|c| c.level_db >= CROWDED_START_DB).map(|c| ((c.demod.freq as f32 / hz).round() as usize, c.level_db)).collect();
         for b in lo..hi {
             let pk = self.peak[b];
             let nf = floor(b);
@@ -1395,7 +1461,9 @@ impl Skimmer {
             // Parabolic interpolation of the peak position.
             let (a, c0, c) = (self.peak[b - 1].ln(), pk.ln(), self.peak[b + 1].ln());
             let den = a - 2.0 * c0 + c;
-            let off = if den.abs() > 1e-9 { 0.5 * (a - c) / den } else { 0.0 };
+            let lvl = 10.0 * (pk / nf).log10();
+            let paired = lvl >= CROWDED_START_DB && strong.iter().any(|&(t, l)| (2..=4).contains(&t.abs_diff(b)) && (l - lvl).abs() <= CROWDED_DIFF_DB);
+            let off = if den.abs() > 1e-9 && !paired { 0.5 * (a - c) / den } else { 0.0 };
             let f = (b as f32 + off.clamp(-0.5, 0.5)) * hz;
             if self.suppressed.iter().any(|&(sf, _)| (sf - f).abs() < self.cfg.min_spacing) {
                 continue;
@@ -1408,7 +1476,6 @@ impl Skimmer {
             // its peak hold: clicks and skirts exist only while it keys,
             // and in a QSO the other station sends while it is silent
             // (W2GLN 165 Hz from a 47 dB K9UIY was never picked up).
-            let lvl = 10.0 * (pk / nf).log10();
             let recent = &self.recent;
             if self.channels.iter().any(|ch| {
                 let df = (ch.demod.freq as f32 - f).abs();
@@ -1462,7 +1529,10 @@ impl Skimmer {
                 // picked up twice (both inside its skirt); it must then key
                 // in step with it.
                 let df = (strong.demod.freq - weak.demod.freq).abs() as f32;
-                let twin = df < 80.0 && strong.level_db >= weak.level_db;
+                // (Not two strong channels created as neighbours: those are
+                // two stations by construction, each heard through a narrow
+                // demodulator, and in a QSO they key in turn.)
+                let twin = df < 80.0 && strong.level_db >= weak.level_db && !(strong.crowd_pair && weak.crowd_pair);
                 if wi == si || dead[wi] || weak.pinned || (!twin && strong.level_db < weak.level_db + 10.0) {
                     continue;
                 }
