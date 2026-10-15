@@ -648,7 +648,12 @@ fn keyed_tones(audio: &[f32]) -> Vec<(f32, usize, f32, f32)> {
         if std::env::var_os("CWSK_KEYDBG").is_some() {
             eprintln!("{:6.1} peak {peak:4.1} marks {marks} offs {offs} good {good_off} duty {duty:.2}", b as f32 * hz);
         }
-        if marks >= 8 && offs > 0 && good_off * 10 >= offs * 7 && (0.15..0.8).contains(&duty) {
+        // Keyed if its gaps are mostly quiet around it; a strong tone passes
+        // with a quarter of them quiet (a QSO partner within 150 Hz keys in
+        // exactly those gaps and rejected CQs of 14-35 dB, while noise
+        // bumps of 8-20 dB had under a quarter quiet).
+        let quiet = good_off * 10 >= offs * 7 || (peak >= 14.0 && good_off * 4 >= offs);
+        if marks >= 8 && offs > 0 && quiet && (0.15..0.8).contains(&duty) {
             if found.last().is_some_and(|l| (b as f32 * hz - l.0) < 40.0) {
                 continue;
             }
