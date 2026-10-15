@@ -28,16 +28,6 @@ pub fn valid_prefix(call: &str) -> bool {
 /// character breaks), so a dit lost or gained in a fade (N8AE read as
 /// T8AE, R8AI as N8AI) is distance 1.
 pub fn morse_distance(a: &str, b: &str) -> usize {
-    let render = |s: &str| -> Vec<u8> {
-        let mut v = Vec::new();
-        for c in s.bytes() {
-            if !v.is_empty() {
-                v.push(b' ');
-            }
-            v.extend_from_slice(crate::morse::pattern_for(c).unwrap_or("#").as_bytes());
-        }
-        v
-    };
     let (x, y) = (render(a), render(b));
     let mut prev: Vec<usize> = (0..=y.len()).collect();
     for i in 1..=x.len() {
@@ -73,6 +63,127 @@ pub fn standard_shape(call: &str) -> bool {
     !(us && (pfx.len() == 2 && pfx[1].is_ascii_digit() || pfx.len() == 1 && suf.len() < 2))
 }
 
+/// The Morse rendering of a string: element patterns, a space between
+/// characters.
+fn render(s: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for c in s.bytes() {
+        if !v.is_empty() {
+            v.push(b' ');
+        }
+        v.extend_from_slice(crate::morse::pattern_for(c).unwrap_or("#").as_bytes());
+    }
+    v
+}
+
+/// Weighted edit distance of two renderings: an element gained, lost or
+/// changed costs 2, a character break gained or lost 1 (a fade splits or
+/// joins characters more often than it loses an element).
+fn copy_distance(x: &[u8], y: &[u8]) -> usize {
+    let w = |c: u8| if c == b' ' { 1 } else { 2 };
+    let mut prev: Vec<usize> = std::iter::once(0).chain(y.iter().scan(0, |a, &c| { *a += w(c); Some(*a) })).collect();
+    for &a in x {
+        let mut cur = vec![prev[0] + w(a); y.len() + 1];
+        for (j, &b) in y.iter().enumerate() {
+            let sub = prev[j] + if a == b { 0 } else if a == b' ' || b == b' ' { 3 } else { 2 };
+            cur[j + 1] = sub.min(prev[j + 1] + w(a)).min(cur[j] + w(b));
+        }
+        prev = cur;
+    }
+    prev[y.len()]
+}
+
+/// Element-only edit distance (character breaks ignored): how many dits
+/// and dahs two copies differ by.
+pub fn element_distance(a: &str, b: &str) -> usize {
+    let strip = |s: &str| render(s).into_iter().filter(|&c| c != b' ').collect::<Vec<u8>>();
+    copy_distance(&strip(a), &strip(b)) / 2
+}
+
+fn char_for(pat: &[u8]) -> Option<u8> {
+    crate::morse::TABLE.iter().find(|(c, p)| p.as_bytes() == pat && (c.is_ascii_alphanumeric() || *c == b'/')).map(|(c, _)| *c)
+}
+
+/// Strings one copying error away from `w`: an element gained, lost or
+/// flipped in one character, a character split in two, or two joined.
+fn neighbors(w: &str) -> Vec<String> {
+    let b = w.as_bytes();
+    let mut out = Vec::new();
+    let with = |i: usize, n: usize, rep: &[u8]| -> String {
+        let mut v = b[..i].to_vec();
+        v.extend_from_slice(rep);
+        v.extend_from_slice(&b[i + n..]);
+        String::from_utf8(v).unwrap_or_default()
+    };
+    for i in 0..b.len() {
+        let Some(p) = crate::morse::pattern_for(b[i]).map(|p| p.as_bytes()) else { continue };
+        let mut pats: Vec<Vec<u8>> = Vec::new();
+        for k in 0..=p.len() {
+            for &e in b".-" {
+                pats.push([&p[..k], &[e][..], &p[k..]].concat());
+            }
+            if k < p.len() {
+                pats.push([&p[..k], &p[k + 1..]].concat());
+                pats.push([&p[..k], &[if p[k] == b'.' { b'-' } else { b'.' }][..], &p[k + 1..]].concat());
+            }
+        }
+        for q in pats {
+            if let Some(c) = char_for(&q) {
+                out.push(with(i, 1, &[c]));
+            }
+        }
+        for k in 1..p.len() {
+            if let (Some(x), Some(y)) = (char_for(&p[..k]), char_for(&p[k..])) {
+                out.push(with(i, 1, &[x, y]));
+            }
+        }
+        if i + 1 < b.len() {
+            if let Some(q) = crate::morse::pattern_for(b[i + 1]) {
+                if let Some(c) = char_for(&[p, q.as_bytes()].concat()) {
+                    out.push(with(i, 2, &[c]));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The call several differing copies of one transmission agree on best,
+/// as an operator would piece it together over an over or two of a weak,
+/// fading signal (DL1DGR, DLEJBGR, DLEWBGR, DL1BMR: DL1BGR). Candidates are
+/// the copies and everything one copying error from them, of real-call
+/// shape; the one closest to all copies wins if it is a clear winner and
+/// at least half the copies (three or more) are within an element of it.
+pub fn consensus(copies: &[&str]) -> Option<String> {
+    if copies.len() < 3 {
+        return None;
+    }
+    let rendered: Vec<Vec<u8>> = copies.iter().map(|c| render(c)).collect();
+    let mut cands: Vec<String> = copies.iter().flat_map(|c| std::iter::once(c.to_string()).chain(neighbors(c))).collect();
+    cands.sort();
+    cands.dedup();
+    let mut scored: Vec<(usize, String)> = cands
+        .into_iter()
+        .filter(|c| parse_callsign(c).as_deref() == Some(c.as_str()) && standard_shape(c) && valid_prefix(c))
+        .map(|c| {
+            let r = render(&c);
+            (rendered.iter().map(|x| copy_distance(&r, x)).sum(), c)
+        })
+        .collect();
+    scored.sort();
+    let (best, call) = scored.first()?;
+    // Abstain when a copy that is no call fits the copies as well: they
+    // are copies of a word (THE, not T4E).
+    if copies.iter().any(|c| parse_callsign(c).is_none() && rendered.iter().map(|x| copy_distance(&render(c), x)).sum::<usize>() <= *best) {
+        return None;
+    }
+    let close = copies.iter().filter(|c| element_distance(c, call) <= 1).count();
+    if scored.get(1).is_some_and(|(s, _)| s == best) || close < 3 || 2 * close < copies.len() {
+        return None;
+    }
+    Some(call.clone())
+}
+
 fn is_base_call(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() < 3 || b.len() > 7 || !b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
@@ -98,6 +209,27 @@ fn is_base_call(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consensus_of_copies() {
+        assert_eq!(element_distance("DLEJBGR", "DL1BGR"), 1);
+        assert_eq!(element_distance("DL1DGR", "DL1BGR"), 1);
+        // A weak DL1BGR over two overs (40 m, 2026-10-14 06:12Z).
+        assert_eq!(consensus(&["DL1DGR", "DLEJBGR", "DLEWBGR", "DL1BMR", "DL1DGR"]).as_deref(), Some("DL1BGR"));
+        assert_eq!(consensus(&["K9UIY", "K9UIY", "K9UI", "K9UIY"]).as_deref(), Some("K9UIY"));
+        assert_eq!(consensus(&["K9UIY", "K9UIY"]), None);
+        // Three loose copies are not enough (HA8WZ really).
+        assert_eq!(consensus(&["DS8WP", "HA8WG", "HA7EMP"]), None);
+        assert_eq!(consensus(&["THE", "THE", "T4E", "THE"]), None);
+        // Both ends of a QSO on one channel stay apart ("K9UR DE K9UIY").
+        assert!(element_distance("K9UR", "K9UIY") > 2);
+        let qso = ["K9UR", "DE", "K9UIY", "K9UIY", "K9UR", "DE", "K9UIY", "K9UR", "DE", "K9UIY"];
+        for call in ["K9UR", "K9UIY"] {
+            let copies: Vec<&str> = qso.iter().copied().filter(|w| element_distance(w, call) <= 2).collect();
+            assert_eq!(consensus(&copies).as_deref(), Some(call));
+        }
+        assert_eq!(consensus(&["K9UIY", "K9UIY", "K9UIY", "K9UI"]).as_deref(), Some("K9UIY"));
+    }
 
     #[test]
     fn standard_shapes() {

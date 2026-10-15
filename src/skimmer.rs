@@ -87,6 +87,9 @@ pub struct Channel {
     /// [`text_plausibility`]), once there is enough of it.
     plaus: Option<f32>,
     call_counts: HashMap<String, u32>,
+    /// Recent call-length words with when they were heard, for piecing
+    /// together a weak call from several differing copies.
+    heard: Vec<(f64, String)>,
     prev_word: String,
     /// A call heard in no telling context yet: spotted if the next word
     /// shows it was addressed or signing (DE, K, KN, ...).
@@ -213,6 +216,8 @@ const FAST_MIN_FIT: f32 = 0.86;
 /// real 0.8-0.97, noise 0.35-0.68): such a channel is never hidden for its
 /// text.
 const STRONG_FIT: f32 = 0.85;
+/// How long a channel keeps its recent words for piecing calls together.
+const HEARD_SECS: f64 = 600.0;
 /// Keying fit needed to trust a single sighting of a call.
 const SINGLE_SPOT_FIT: f32 = 0.85;
 /// Below this SNR (dB) a channel must fit Morse timing at least
@@ -376,6 +381,7 @@ struct Retired {
     at: f64,
     text: String,
     call_counts: HashMap<String, u32>,
+    heard: Vec<(f64, String)>,
 }
 
 /// Pearson correlation of two envelope histories (log amplitude) while the
@@ -518,9 +524,9 @@ impl Skimmer {
                 self.next_id - 1
             }
         };
-        let (rtext, rcalls) = match revived {
-            Some(r) => (r.text + " ", r.call_counts),
-            None => (String::new(), HashMap::new()),
+        let (rtext, rcalls, rheard) = match revived {
+            Some(r) => (r.text + " ", r.call_counts, r.heard),
+            None => (String::new(), HashMap::new(), Vec::new()),
         };
         let mut demod = ChannelDemod::new(RATE as f32, freq as f64, 100.0, FRAME);
         let mut decoder = CwDecoder::new(demod.frame_ms(), self.cfg.params.clone(), self.lm.clone());
@@ -556,6 +562,7 @@ impl Skimmer {
             start_text_len: rtext.len(),
             plaus: None,
             call_counts: rcalls,
+            heard: rheard,
             prev_word: String::new(),
             pending_call: None,
             frames: Vec::new(),
@@ -924,6 +931,14 @@ impl Skimmer {
             if w.is_empty() {
                 continue;
             }
+            let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
+            if (3..=10).contains(&bare.len()) && bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'/') {
+                ch.heard.retain(|(t, _)| now - t < HEARD_SECS);
+                if ch.heard.len() >= 80 {
+                    ch.heard.remove(0);
+                }
+                ch.heard.push((now, bare.to_string()));
+            }
             // A call just before DE or a turn-over (K, KN, BK, ...) is
             // being addressed or is signing: as good a sighting as one
             // after DE ("W2GLN DE K9UIY", "... W9UZ K").
@@ -937,16 +952,36 @@ impl Skimmer {
                 // A near miss of a call already confirmed here, or spotted
                 // elsewhere, counts toward that call.
                 let near = |c: &str| c != call && crate::callsign::morse_distance(c, &call) == 1;
-                let rival = ch
-                    .call_counts
+                let local_rival = ch.call_counts.iter().filter(|(c, &n)| n >= 2 && near(c)).max_by_key(|(_, &n)| n).map(|(c, _)| c.clone());
+                let band_rival = spots.iter().filter(|s| s.confirmed && near(&s.call)).max_by_key(|s| s.count).map(|s| s.call.clone());
+                // Unless several differing copies of the call here (a weak,
+                // fading station) agree better on another: then that call,
+                // confirmed by their number. (A bad copy confirmed twice
+                // first would otherwise swallow the good ones: DL1DGR for
+                // DL1BGR.) Not against a call established elsewhere on the
+                // band, as a DX call is (EZ1A heard for E71A in a pileup).
+                let anchor = local_rival.as_deref().unwrap_or(&call);
+                let copies: Vec<&str> = ch
+                    .heard
                     .iter()
-                    .filter(|(c, &n)| n >= 2 && near(c))
-                    .max_by_key(|(_, &n)| n)
-                    .map(|(c, _)| c.clone())
-                    .or_else(|| spots.iter().filter(|s| s.confirmed && near(&s.call)).max_by_key(|s| s.count).map(|s| s.call.clone()));
-                let call = rival.unwrap_or(call);
+                    .map(|(_, h)| h.as_str())
+                    .filter(|h| crate::callsign::element_distance(h, &call) <= 2 || crate::callsign::element_distance(h, anchor) <= 2)
+                    .collect();
+                let voted = if band_rival.is_some() && local_rival.is_none() { None } else { crate::callsign::consensus(&copies) }
+                    .filter(|v| *v == call || copies.len() >= 4)
+                    .filter(|v| {
+                        let support = copies.iter().filter(|c| crate::callsign::element_distance(c, v) <= 1).count() as u32;
+                        !spots.iter().any(|s| s.confirmed && s.call != *v && crate::callsign::morse_distance(&s.call, v) <= 2 && s.count >= 3 * support)
+                    });
+                if let Some(v) = &voted {
+                    spots.retain(|s| !(s.channel == ch.id && &s.call != v && s.count <= 2 && crate::callsign::element_distance(&s.call, v) <= 2));
+                }
+                let call = voted.clone().or(local_rival).or(band_rival).unwrap_or(call);
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
+                if voted.is_some() {
+                    *n = (*n).max(2);
+                }
                 let strong_ctx = matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST");
                 if *n >= 2 || strong_ctx {
                     Self::spot(ch, call, now, spots, strong_ctx);
@@ -1340,7 +1375,7 @@ impl Skimmer {
                 Self::dropping(c, now, events, spots, "timed out");
             }
             if !keep && c.qualified {
-                retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone() });
+                retired.push(Retired { id: c.id, freq: c.demod.freq as f32, at: now, text: c.text.clone(), call_counts: c.call_counts.clone(), heard: c.heard.clone() });
             }
             keep
         });
