@@ -252,6 +252,10 @@ const HEARD_SECS: f64 = 600.0;
 /// around 45 WPM).
 const SINGLE_SPOT_FIT: f32 = 0.85;
 const SINGLE_SPOT_MAX_WPM: f32 = 48.0;
+/// Envelope SNR (dB) needed for a single sighting; less on a channel with
+/// no text to judge (see `spot`).
+const SINGLE_SPOT_SNR: f32 = 20.0;
+const SINGLE_SPOT_SNR_CLEAN: f32 = 12.0;
 /// Below this SNR (dB) a channel must fit Morse timing at least
 /// `LOW_SNR_MIN_FIT` to be shown.
 const LOW_SNR_DB: f32 = 6.0;
@@ -1272,7 +1276,14 @@ impl Skimmer {
         // Same first four characters give or take an element or two: a
         // partial or busted copy (DL1BM next to DL1DGR, E71TDX next to E71A).
         let head = |c: &str, max: usize| c != call && c.len() >= 4 && call.len() >= 4 && crate::callsign::morse_distance(&c[..4], &call[..4]) <= max;
+        // Strong enough to be copied right: on a noisy night band, single
+        // sightings under 20 dB were two garbles for every real call; a
+        // short channel with nothing but the call and CQ/DE on it (no text
+        // to judge, `plaus` None) is clean down to 12 dB (20 m by day).
+        let snr = ch.decoder.snr_db();
+        let strong_enough = snr >= SINGLE_SPOT_SNR || (ch.plaus.is_none() && snr >= SINGLE_SPOT_SNR_CLEAN);
         let clean_single = strong
+            && strong_enough
             && crate::callsign::standard_shape(&call)
             && ch.decoder.fit().0 >= SINGLE_SPOT_FIT
             && ch.decoder.wpm().is_some_and(|w| w <= SINGLE_SPOT_MAX_WPM)
