@@ -7,7 +7,7 @@
 B=${1:-./target/release/cwtool}; OUT=${2:-/tmp/cwsk-regress}; mkdir -p "$OUT"
 cd "$(dirname "$0")/.." || exit 1
 $B bench --trials 24 > "$OUT/bench.txt" 2>&1 &
-for r in testdata/arrl/2603*.txt; do b=$(basename "$r" .txt); m=testdata/arrl/${b}WPM.mp3; [ -f "$m" ] || m=testdata/arrl/$(echo "$b" | tr -d _)WPM.mp3; printf "%s %s\n" "$b" "$($B decode "$m" --reference "$r" 2>/dev/null | grep CER | sed 's/.*: //')"; done > "$OUT/arrl.txt" &
+for r in testdata/arrl/2603*.txt; do b=$(basename "$r" .txt); m=testdata/arrl/${b}WPM.mp3; [ -f "$m" ] || m=testdata/arrl/${b/_5/5}WPM.mp3; printf "%s %s\n" "$b" "$($B decode "$m" --reference "$r" 2>/dev/null | grep CER | sed 's/.*: //')"; done > "$OUT/arrl.txt" &
 for f in testdata/live/*.wav; do $B decode "$f" 2>/dev/null > "$OUT/live_$(basename "$f" .wav).txt"; done &
 tot=0; for f in testdata/scan40/pass1/*.wav; do c=$($B decode "$f" 2>/dev/null | grep -c "Hz:"); tot=$((tot+c)); done; echo "pass1 shown: $tot" > "$OUT/pass1.txt"
 wait
