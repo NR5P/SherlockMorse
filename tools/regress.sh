@@ -2,7 +2,8 @@
 # Full regression for any decoder/skimmer change (needs the gitignored testdata/):
 # synthetic bench (24 trials), all ARRL practice files, live recordings, the
 # 40 m scan's shown-row count, W1AW 80 m against the bulletin text, and the
-# real-noise weak-signal test, two stations 45 Hz apart, and W1AW bulletins
+# real-noise weak-signal test, two stations 45 Hz apart, two overlapping 25/35 Hz
+# apart, and W1AW bulletins
 # off the air at three signal strengths against the published text. CWSK_PARAMS passes through.
 # usage: tools/regress.sh [cwtool] [outdir]
 B=${1:-./target/release/cwtool}; OUT=${2:-/tmp/cwsk-regress}; mkdir -p "$OUT"
@@ -15,5 +16,6 @@ wait
 tools/w1aw80.sh "$B" > "$OUT/w1aw80.txt"
 tools/weakbench.sh "$B" > "$OUT/weak.txt"
 tools/twostation.sh "$B" > "$OUT/twostation.txt"
+tools/overlap.sh "$B" > "$OUT/overlap.txt"
 tools/w1awbull.sh "$B" > "$OUT/w1awbull.txt"
-cat "$OUT/pass1.txt" "$OUT/arrl.txt" "$OUT/w1aw80.txt" "$OUT/weak.txt" "$OUT/twostation.txt" "$OUT/w1awbull.txt"; tail -2 "$OUT/bench.txt"
+cat "$OUT/pass1.txt" "$OUT/arrl.txt" "$OUT/w1aw80.txt" "$OUT/weak.txt" "$OUT/twostation.txt" "$OUT/overlap.txt" "$OUT/w1awbull.txt"; tail -2 "$OUT/bench.txt"

@@ -80,6 +80,21 @@ pub struct Channel {
     /// Created next to another strong channel, or had one created next to
     /// it: the two keep narrow demodulators while they are neighbours.
     crowd_pair: bool,
+    /// That demodulator's bandwidth (Hz), matched to the pair's spacing.
+    crowd_bw: f32,
+    /// The last 512 ms of raw demodulator output, for finding a second
+    /// carrier inside the passband (see [`Skimmer::sub_peaks`]).
+    raw_ring: VecDeque<Complex32>,
+    sub_checked: usize,
+    /// (offset Hz, times seen in a row) of a second carrier.
+    sub_cand: (f32, u8),
+    /// Made from a second carrier found inside another channel's passband
+    /// (a proven neighbour: pairing applies down to `CROWDED_MIN_HZ`).
+    sub_spawned: bool,
+    /// Slowly decaying maximum of the decoder's SNR: a real signal in this
+    /// passband, even one torn up by a second station (whose instantaneous
+    /// SNR swings between 4 and 30 dB), against a channel on a skirt.
+    sub_snr: f32,
     wide_checked: usize,
     /// Text not yet published (held until the channel qualifies).
     pending_out: String,
@@ -191,6 +206,8 @@ pub struct Skimmer {
     pub waterfall: VecDeque<Vec<f32>>,
     pub events: Vec<TextEvent>,
     pub spots: Vec<Spot>,
+    /// The channel being added comes from `sub_peaks`.
+    spawning: bool,
     /// Recent audio, replayed into newly created channels so the start of a
     /// transmission (before detection triggered) is not lost.
     preroll: VecDeque<f32>,
@@ -234,15 +251,32 @@ const STRONG_FIT: f32 = 0.85;
 /// of 100 Hz. (Closer than the minimum is a strong signal's own spectral
 /// spread, not another station: pairing a 39 dB station with its own
 /// 33 Hz sideband pinned and narrowed it and garbled its copy.)
-const CROWDED_MIN_HZ: f32 = 40.0;
+const CROWDED_MIN_HZ: f32 = 18.0;
+/// ...and for a neighbour the band detector found (see `add_channel`).
+const CROWDED_DETECT_MIN_HZ: f32 = 40.0;
 const CROWDED_HZ: f32 = 60.0;
 const CROWDED_BW: f32 = 50.0;
+/// A pair's demodulator passband as a fraction of its spacing, at least
+/// `CROWDED_BW_MIN` (a 20 Hz passband smears 30 WPM dits, but a partner
+/// 25 Hz away smears everything).
+const CROWDED_BW_FRAC: f32 = 0.8;
+const CROWDED_BW_MIN: f32 = 16.0;
 /// ...when both are within this much of each other in level.
 const CROWDED_DIFF_DB: f32 = 10.0;
 /// At creation (before either has read anything) both must be this strong.
 const CROWDED_START_DB: f32 = 25.0;
 /// How far the AFC may move a crowded channel from where it was created.
 const CROWDED_AFC_HZ: f64 = 6.0;
+/// Raw frames kept per channel (512 ms at 2 ms) and pieces (~14 ms) between looks
+/// for a second carrier (see `sub_peaks`).
+const SUB_RING: usize = 256;
+/// A second carrier must exceed its mirror image about the channel's own
+/// carrier by this power ratio (6 dB): keying sidebands are symmetric.
+const SUB_ASYMMETRY: f32 = 4.0;
+/// The parent must be a real signal in its own passband (decoder SNR, dB),
+/// not a channel on another station's skirt.
+const SUB_MIN_SNR_DB: f32 = 15.0;
+const SUB_FRAMES: usize = 70;
 /// Frames between looks at the unfiltered keying (see `speed_watchdog`).
 const WATCH_FRAMES: usize = 600;
 /// How long a channel keeps its recent words for piecing calls together.
@@ -529,6 +563,7 @@ impl Skimmer {
             waterfall: VecDeque::new(),
             events: Vec::new(),
             spots: Vec::new(),
+            spawning: false,
             preroll: VecDeque::new(),
             suppressed: Vec::new(),
             last_artifact_check: 0.0,
@@ -573,14 +608,25 @@ impl Skimmer {
             10.0 * (self.peak[b] / self.local_floor[b].clamp(nf * 0.1, nf).max(1e-15)).log10()
         };
         let mut crowded = false;
+        let mut crowd_bw = CROWDED_BW;
         if lvl >= CROWDED_START_DB {
             for c in &mut self.channels {
                 let d = (c.demod.freq as f32 - freq).abs();
-                if (CROWDED_MIN_HZ..CROWDED_HZ).contains(&d) && c.level_db >= CROWDED_START_DB && (c.level_db - lvl).abs() <= CROWDED_DIFF_DB {
+                // A neighbour found by the band detector within 40 Hz is more
+                // often a strong signal's own spread than another station;
+                // one found as a second carrier in a passband is proven.
+                let min_hz = if self.spawning || c.sub_spawned { CROWDED_MIN_HZ } else { CROWDED_DETECT_MIN_HZ };
+                if (min_hz..CROWDED_HZ).contains(&d) && c.level_db >= CROWDED_START_DB && (c.level_db - lvl).abs() <= CROWDED_DIFF_DB {
+                    // The passband keeps the partner out: a little under
+                    // the spacing (and the AFC closer still).
+                    let bw = (CROWDED_BW_FRAC * d).clamp(CROWDED_BW_MIN, CROWDED_BW);
+                    let afc = (0.15 * d as f64).clamp(2.0, CROWDED_AFC_HZ);
                     crowded = true;
+                    crowd_bw = crowd_bw.min(bw);
                     c.crowd_pair = true;
-                    c.demod.set_bandwidth(CROWDED_BW);
-                    c.demod.afc_limit = (c.demod.freq - CROWDED_AFC_HZ, c.demod.freq + CROWDED_AFC_HZ);
+                    c.crowd_bw = c.crowd_bw.min(bw);
+                    c.demod.set_bandwidth(c.crowd_bw);
+                    c.demod.afc_limit = (c.demod.freq - afc, c.demod.freq + afc);
                 }
             }
         }
@@ -588,12 +634,13 @@ impl Skimmer {
             let nb: Vec<String> = self.channels.iter().filter(|c| (c.demod.freq as f32 - freq).abs() < CROWDED_HZ).map(|c| format!("{:.0}Hz {:.0}dB", c.demod.freq, c.level_db)).collect();
             eprintln!("new channel t={:.1} {freq:.0} Hz lvl {lvl:.0} dB crowded={crowded} near {nb:?}", self.time);
         }
-        let mut demod = ChannelDemod::new(RATE as f32, freq as f64, if crowded { CROWDED_BW } else { 100.0 }, FRAME);
+        let mut demod = ChannelDemod::new(RATE as f32, freq as f64, if crowded { crowd_bw } else { 100.0 }, FRAME);
         // (The AFC of each is pulled toward the other while both key, so
         // it is held close to the creation frequency, which next to a
         // known channel is the bin centre, not an interpolation.)
         if crowded {
-            demod.afc_limit = (freq as f64 - CROWDED_AFC_HZ, freq as f64 + CROWDED_AFC_HZ);
+            let afc = (0.15 * crowd_bw as f64 / CROWDED_BW_FRAC as f64).clamp(2.0, CROWDED_AFC_HZ);
+            demod.afc_limit = (freq as f64 - afc, freq as f64 + afc);
         }
         let mut decoder = CwDecoder::new(demod.frame_ms(), self.cfg.params.clone(), self.lm.clone());
         // Warm up on the pre-roll audio.
@@ -621,6 +668,12 @@ impl Skimmer {
             wide_checked: 0,
             strong_bw: false,
             crowd_pair: crowded,
+            crowd_bw,
+            raw_ring: VecDeque::with_capacity(SUB_RING),
+            sub_checked: 0,
+            sub_cand: (0.0, 0),
+            sub_spawned: self.spawning,
+            sub_snr: 0.0,
             pending_out: String::new(),
             qualified: pinned || was_revived,
             last_good: self.time,
@@ -763,6 +816,7 @@ impl Skimmer {
         for (i, ch) in self.channels.iter_mut().enumerate() {
             if ch.crowd_pair && !freqs.iter().enumerate().any(|(j, f)| j != i && (f - freqs[i]).abs() < CROWDED_HZ) {
                 ch.crowd_pair = false;
+                ch.crowd_bw = CROWDED_BW;
                 ch.demod.set_bandwidth(100.0);
                 let f = ch.demod.freq;
                 ch.demod.afc_limit = (f - 12.0, f + 12.0);
@@ -803,6 +857,10 @@ impl Skimmer {
                 ch.marks.push_back(ch.decoder.is_mark());
                 ch.amps.push_back(z.norm());
                 ch.wide.push_back(raw.norm());
+                if ch.raw_ring.len() >= SUB_RING {
+                    ch.raw_ring.pop_front();
+                }
+                ch.raw_ring.push_back(raw);
             }
             if ch.decoder.is_mark() {
                 ch.last_mark = now;
@@ -850,6 +908,7 @@ impl Skimmer {
                 Self::deliver(ch, &txt, now, false, &self.lm, self.cfg.dropout_s, &mut self.events, &mut self.spots);
             }
         }
+        self.sub_peaks();
         self.time += samples.len() as f64 / RATE as f64;
         self.housekeeping();
     }
@@ -860,6 +919,93 @@ impl Skimmer {
             ch.decoder.finish();
             let txt = ch.decoder.take_text();
             Self::deliver(ch, &txt, self.time, true, &self.lm, self.cfg.dropout_s, &mut self.events, &mut self.spots);
+        }
+    }
+
+    /// A second station inside a strong channel's passband, too close to
+    /// show as a peak of its own in the band spectrum (under two bins,
+    /// ~30 Hz): looked for in the channel's own raw demodulator output,
+    /// 512 ms at a time (2 Hz resolution), as a second carrier 18-60 Hz
+    /// from the channel's own (the strongest within 15 Hz of the centre)
+    /// within 10 dB of it. Seen three seconds running
+    /// on a channel that is not reading well, it gets a channel of its
+    /// own, and the two are paired with narrow passbands (`add_channel`).
+    fn sub_peaks(&mut self) {
+        let mut found: Vec<f32> = Vec::new();
+        let ms = self.channels.first().map_or(2.0, |c| c.demod.frame_ms());
+        for ch in &mut self.channels {
+            ch.sub_checked += 1;
+            if ch.sub_checked < SUB_FRAMES || ch.raw_ring.len() < SUB_RING {
+                continue;
+            }
+            ch.sub_checked = 0;
+            // Only a real signal in its own passband that is failing to read.
+            let reading_well = ch.qualified && ch.plaus.is_none_or(|p| p >= DOUBTFUL_PLAUS);
+            ch.sub_snr = ch.decoder.snr_db().max(ch.sub_snr * 0.95);
+            if ch.crowd_pair || ch.level_db < CROWDED_START_DB || ch.sub_snr < SUB_MIN_SNR_DB || reading_well {
+                ch.sub_cand = (0.0, 0);
+                continue;
+            }
+            let x: Vec<Complex32> = ch.raw_ring.iter().copied().collect();
+            let power = |hz: f32| -> f32 {
+                let w = -std::f32::consts::TAU * hz * ms / 1000.0;
+                let mut acc = Complex32::new(0.0, 0.0);
+                for (n, v) in x.iter().enumerate() {
+                    let (s, c) = (w * n as f32).sin_cos();
+                    acc += v * Complex32::new(c, s);
+                }
+                acc.norm_sqr()
+            };
+            // Carriers in the passband: local maxima within 10 dB of the
+            // strongest. The channel's own is the one nearest its centre;
+            // a second one at least `CROWDED_MIN_HZ` from it is a partner.
+            let offsets: Vec<f32> = (-48..=48).map(|k| k as f32 * 1.25).collect();
+            let ps: Vec<f32> = offsets.iter().map(|&d| power(d)).collect();
+            let pmax = ps.iter().copied().fold(0.0f32, f32::max).max(1e-20);
+            let peaks: Vec<(f32, f32)> = (2..offsets.len() - 2)
+                .filter(|&i| ps[i] >= pmax * 0.1 && ps[i] >= ps[i - 1] && ps[i] > ps[i + 1] && ps[i] >= ps[i - 2] && ps[i] > ps[i + 2])
+                .map(|i| (offsets[i], ps[i]))
+                .collect();
+            let own = peaks.iter().copied().filter(|(d, _)| d.abs() <= 15.0).max_by(|a, b| a.1.total_cmp(&b.1));
+            // A station's own keying sidebands sit at both sides of its
+            // carrier alike; a second station does not have a mirror image.
+            let at = |hz: f32| -> f32 {
+                let i = ((hz / 1.25).round() as i32 + 48).clamp(0, offsets.len() as i32 - 1) as usize;
+                ps[i]
+            };
+            let best = own.and_then(|(d0, _)| {
+                peaks
+                    .iter()
+                    .copied()
+                    .filter(|(d, p)| (d - d0).abs() >= CROWDED_MIN_HZ && *p >= SUB_ASYMMETRY * at(2.0 * d0 - d))
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(d, _)| (d0, d))
+            });
+            match best {
+                Some((_, d)) if (d - ch.sub_cand.0).abs() < 6.0 => ch.sub_cand = (d, ch.sub_cand.1.saturating_add(1)),
+                Some((_, d)) => ch.sub_cand = (d, 1),
+                None => ch.sub_cand = (0.0, 0),
+            }
+            if ch.sub_cand.1 >= 3 {
+                if let Some((d0, d)) = best {
+                    // Centre on the own carrier first (the AFC had settled
+                    // between the two), then the partner at the true spacing.
+                    let f0 = ch.demod.freq + d0 as f64;
+                    ch.demod.set_freq(f0);
+                    found.push((f0 + (d - d0) as f64) as f32);
+                }
+                ch.sub_cand = (0.0, 0);
+            }
+        }
+        for f in found {
+            if !self.channels.iter().any(|c| (c.demod.freq as f32 - f).abs() < self.cfg.min_spacing * 0.5) {
+                if std::env::var_os("CWSK_DEBUG").is_some() {
+                    eprintln!("sub-peak t={:.1}: second carrier at {f:.0} Hz", self.time);
+                }
+                self.spawning = true;
+                self.add_channel(f, false);
+                self.spawning = false;
+            }
         }
     }
 
