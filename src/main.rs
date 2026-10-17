@@ -44,8 +44,8 @@ struct Settings {
     wf_contrast: f32,
     wf_brightness: f32,
     file_path: String,
-    /// Print the English meaning of CW abbreviations in small text inline.
-    explain_abbrev: bool,
+    /// Font size (points) of the decoded text in the bottom panel.
+    text_size: f32,
     /// Logins for callsign lookups (optional; HamDB needs none).
     lookup: Credentials,
     /// Operator's own locator, for distance and bearing to stations.
@@ -78,7 +78,7 @@ impl Default for Settings {
             wf_contrast: 1.0,
             wf_brightness: 0.0,
             file_path: String::new(),
-            explain_abbrev: true,
+            text_size: 15.0,
             lookup: Credentials::default(),
             my_grid: String::new(),
             activities: activity::defaults(),
@@ -1680,15 +1680,15 @@ impl App {
                     }
                 }
             }
-            ui.checkbox(&mut self.s.explain_abbrev, "Explain abbreviations")
-                .on_hover_text("Show the meaning of CW abbreviations (TNX, QTH, 73…) in small print. Highlighted words always explain themselves on hover.");
+            ui.add(egui::Slider::new(&mut self.s.text_size, 10.0..=32.0).step_by(1.0).text("Text size"))
+                .on_hover_text("Size of the decoded text below. Highlighted abbreviations show their meaning on hover.");
             if ui.small_button("Open folder").on_hover_text(format!("Conversations are saved in {}", log_dir().display())).clicked() {
                 let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
                 let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
             }
         });
         ui.separator();
-        let gloss = self.s.explain_abbrev;
+        let size = self.s.text_size;
         match self.bottom_tab {
             0 => match &self.qso {
                 Some(q) => {
@@ -1696,7 +1696,7 @@ impl App {
                     let rf = q.rf;
                     let mut tune = false;
                     egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                        let (r, call) = cw_text(ui, &text, 15.0, gloss, Sense::click(), "Double-click to tune back to this conversation");
+                        let (r, call) = cw_text(ui, &text, size, Sense::click(), "Double-click to tune back to this conversation");
                         tune = r.double_clicked();
                         if call.is_some() {
                             self.info_call = call;
@@ -1735,7 +1735,7 @@ impl App {
                         let text = q.text.clone();
                         let rf = q.rf;
                         egui::ScrollArea::vertical().id_salt("hist_text").auto_shrink([false, false]).show(ui, |ui| {
-                            let (r, call) = cw_text(ui, &text, 14.0, gloss, Sense::click(), "Double-click to tune to this conversation");
+                            let (r, call) = cw_text(ui, &text, size, Sense::click(), "Double-click to tune to this conversation");
                             if r.double_clicked() {
                                 tune = rf;
                             }
@@ -1774,7 +1774,7 @@ impl App {
                 self.zero_beat(ch.freq);
             }
         });
-        let gloss = self.s.explain_abbrev;
+        let size = self.s.text_size;
         if ch.doubtful {
             ui.label(RichText::new("Text reads poorly (weak or garbled signal): shown dimmed").small().weak());
         }
@@ -1782,7 +1782,7 @@ impl App {
             if ch.doubtful {
                 ui.multiply_opacity(0.6);
             }
-            let (_, call) = cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), 15.0, gloss, Sense::hover(), "");
+            let (_, call) = cw_text(ui, &format!("{}{}", to_display(&ch.text), to_display(&ch.tentative)), size, Sense::hover(), "");
             if call.is_some() {
                 self.info_call = call;
             }
@@ -1918,22 +1918,16 @@ impl App {
     }
 }
 
-/// Decoded CW text with abbreviations, Q-codes and prosigns highlighted.
-/// Hovering one shows its meaning; with `gloss` the meaning is also printed
-/// in small text underneath it (rows holding one get taller to make room).
-/// Callsigns are shown as links; the one clicked is returned.
-/// `hint` is the hover text elsewhere.
-fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, hint: &str) -> (egui::Response, Option<String>) {
-    use egui::text::{LayoutJob, TextFormat, TextWrapping};
-    let mono = egui::FontId::monospace(size);
-    let small_font = egui::FontId::proportional((size * 0.62).max(9.0));
-    let (text_h, small_h) = ui.fonts(|f| (f.row_height(&mono), f.row_height(&small_font)));
-    // Top-aligned so a taller abbreviation leaves the rest of its row in place.
-    let normal = TextFormat { font_id: mono, color: ui.visuals().text_color(), valign: egui::Align::TOP, ..Default::default() };
-    let abbr = TextFormat {
-        color: if ui.visuals().dark_mode { Color32::from_rgb(110, 205, 255) } else { Color32::from_rgb(0, 95, 170) },
-        line_height: gloss.then_some(text_h + small_h + 1.0),
-        ..normal.clone()
+/// Decoded CW text with abbreviations, Q-codes and prosigns highlighted;
+/// hovering one shows its meaning. Callsigns are shown as links; the one
+/// clicked is returned. `hint` is the hover text elsewhere.
+fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, sense: Sense, hint: &str) -> (egui::Response, Option<String>) {
+    use egui::text::{LayoutJob, TextFormat};
+    let normal = TextFormat { font_id: egui::FontId::monospace(size), color: ui.visuals().text_color(), ..Default::default() };
+    let abbr = if ui.visuals().dark_mode {
+        TextFormat { color: Color32::from_rgb(110, 205, 255), background: Color32::from_rgba_unmultiplied(110, 205, 255, 28), ..normal.clone() }
+    } else {
+        TextFormat { color: Color32::from_rgb(0, 95, 170), background: Color32::from_rgba_unmultiplied(0, 95, 170, 24), ..normal.clone() }
     };
     let link = TextFormat { color: CALL_COLOR, underline: Stroke::new(1.0f32, CALL_COLOR.gamma_multiply(0.5)), ..normal.clone() };
     let mut job = LayoutJob::default();
@@ -1983,43 +1977,6 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, gloss: bool, sense: Sense, 
     let clicked = if r.clicked() { r.interact_pointer_pos().and_then(on_call) } else { None };
     if r.hover_pos().and_then(on_call).is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let origin = r.rect.min.to_vec2();
-    // Word boxes (galley coordinates): x range and row top.
-    let boxes: Vec<(f32, f32, f32)> = spans
-        .iter()
-        .map(|(s, _)| {
-            let a = galley.pos_from_ccursor(egui::text::CCursor::new(s.start));
-            let b = galley.pos_from_ccursor(egui::text::CCursor::new(s.end));
-            (a.left(), if (b.top() - a.top()).abs() < 1.0 { b.left() } else { galley.size().x }, a.top())
-        })
-        .collect();
-    let painter = ui.painter();
-    let underline = Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(110, 205, 255, 70));
-    let mut prev_end = f32::NEG_INFINITY;
-    let mut prev_top = f32::NAN;
-    for (i, ((x0, x1, top), (_, m))) in boxes.iter().zip(&spans).enumerate() {
-        let y = top + text_h - 1.0;
-        if !gloss {
-            painter.line_segment([Pos2::new(*x0, y) + origin, Pos2::new(*x1, y) + origin], underline);
-            continue;
-        }
-        if *top != prev_top {
-            prev_end = f32::NEG_INFINITY;
-            prev_top = *top;
-        }
-        // Left-aligned under the word, shortened (…) to stop before the next one.
-        let x = x0.max(prev_end + 6.0);
-        let limit = match boxes.get(i + 1) {
-            Some((nx, _, nt)) if nt == top => nx - 6.0,
-            _ => galley.size().x.max(r.rect.width()),
-        };
-        let w = (limit - x).max(x1 - x0).max(8.0);
-        let mut gj = LayoutJob::simple_singleline(m.clone(), small_font.clone(), ui.visuals().weak_text_color());
-        gj.wrap = TextWrapping::truncate_at_width(w);
-        let g = ui.fonts(|f| f.layout_job(gj));
-        prev_end = x + g.size().x;
-        painter.galley(Pos2::new(x, top + text_h) + origin, g, Color32::GRAY);
     }
     let hit = r.hover_pos().and_then(|p| {
         let c = char_at(p);
@@ -2291,13 +2248,13 @@ mod tests {
     use super::*;
 
     /// Renders `cw_text` offscreen and returns all text that was painted.
-    fn painted(gloss: bool) -> String {
+    fn painted() -> String {
         let ctx = egui::Context::default();
         let mut out = String::new();
         for _ in 0..2 {
             let o = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    cw_text(ui, "[12:00Z] W1AW DE K1ABC TNX FER CALL UR 5NN QTH? 73", 15.0, gloss, Sense::click(), "");
+                    cw_text(ui, "[12:00Z] W1AW DE K1ABC TNX FER CALL UR 5NN QTH? 73", 15.0, Sense::click(), "");
                 });
             });
             out.clear();
@@ -2312,9 +2269,9 @@ mod tests {
     }
 
     #[test]
-    fn glosses_are_painted() {
-        let t = painted(true);
-        assert!(t.contains("thanks") && t.contains("best regards") && t.contains("location?"), "{t}");
-        assert!(!painted(false).contains("thanks"));
+    fn meanings_only_on_hover() {
+        let t = painted();
+        assert!(t.contains("TNX") && t.contains("QTH?"), "{t}");
+        assert!(!t.contains("thanks") && !t.contains("location?"), "{t}");
     }
 }
