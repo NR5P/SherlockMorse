@@ -1,5 +1,7 @@
 //! CW Skimmer – multi-channel Morse decoder with waterfall and CAT control.
 
+mod help;
+
 use cwskimmer::activity::{self, Activity};
 use cwskimmer::audio::{self, ChannelSel, DeviceInfo};
 use cwskimmer::cat::controller::{RigController, RigState};
@@ -238,6 +240,10 @@ struct App {
     last_info_call: Option<String>,
     tx_repeat: Option<Repeat>,
     show_memories: bool,
+    /// Help window: open, chosen topic, search text.
+    show_help: bool,
+    help_topic: usize,
+    help_query: String,
 }
 
 /// The conversation on the operator's own frequency: everything decoded
@@ -411,6 +417,9 @@ impl App {
             last_info_call: None,
             tx_repeat: None,
             show_memories: false,
+            show_help: false,
+            help_topic: 0,
+            help_query: String::new(),
             s,
         };
         app.load_cty();
@@ -1198,6 +1207,7 @@ impl App {
                 let _ = std::process::Command::new(opener).arg(log_dir()).spawn();
             }
             ui.toggle_value(&mut self.show_settings, "⚙ Settings");
+            ui.toggle_value(&mut self.show_help, "? Help").on_hover_text("How to use the program");
         });
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Radio").strong());
@@ -1531,6 +1541,57 @@ impl App {
         if ui.button("Edit keyer memories…").on_hover_text("The messages on F1–F12 (also: right-click a memory button in the transmit panel)").clicked() {
             self.show_memories = true;
         }
+    }
+
+    /// The built-in user guide: topics on the left, the chosen one on the
+    /// right, with a search box that narrows the topics.
+    fn ui_help(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_help;
+        egui::Window::new("Help").id(egui::Id::new("help")).open(&mut open).default_size([820.0, 560.0]).resizable(true).collapsible(false).show(ctx, |ui| {
+            let q = self.help_query.trim().to_lowercase();
+            let hits: Vec<usize> = (0..help::TOPICS.len())
+                .filter(|&i| {
+                    let (t, b) = help::TOPICS[i];
+                    q.is_empty() || t.to_lowercase().contains(&q) || b.to_lowercase().contains(&q)
+                })
+                .collect();
+            if !hits.is_empty() && !hits.contains(&self.help_topic) {
+                self.help_topic = hits[0];
+            }
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(180.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.help_query).hint_text("Search").desired_width(170.0));
+                    ui.add_space(4.0);
+                    for &i in &hits {
+                        if ui.selectable_label(self.help_topic == i, help::TOPICS[i].0).clicked() {
+                            self.help_topic = i;
+                        }
+                    }
+                    if hits.is_empty() {
+                        ui.label(RichText::new("Nothing found").weak());
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(RichText::new(format!("Sherlock Morse {}", env!("CARGO_PKG_VERSION"))).small());
+                    if ui.link(RichText::new("github.com/NR5P/SherlockMorse").small()).clicked() {
+                        open_in_browser("https://github.com/NR5P/SherlockMorse");
+                    }
+                    ui.label(RichText::new("GPL-3.0-or-later").small().weak());
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().id_salt(("help_body", self.help_topic)).auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some((title, body)) = help::TOPICS.get(self.help_topic).filter(|_| !hits.is_empty()) {
+                            ui.heading(*title);
+                            ui.add_space(4.0);
+                            help_body(ui, body, &q);
+                        }
+                    });
+                });
+            });
+        });
+        self.show_help = open;
     }
 
     /// The memory keyer editor.
@@ -2546,6 +2607,68 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, sense: Sense, hint: &str) -
     (r, clicked)
 }
 
+/// Renders a help topic: "## " subheadings, "- " bullets, blank-line
+/// paragraphs. Words matching the search are highlighted.
+fn help_body(ui: &mut egui::Ui, body: &str, query: &str) {
+    let text = |ui: &egui::Ui, s: &str| {
+        use egui::text::{LayoutJob, TextFormat};
+        let normal = TextFormat { font_id: egui::TextStyle::Body.resolve(ui.style()), color: ui.visuals().text_color(), ..Default::default() };
+        let hit = TextFormat { color: Color32::BLACK, background: Color32::from_rgb(255, 200, 80), ..normal.clone() };
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = ui.available_width();
+        let lower = s.to_lowercase();
+        let mut at = 0;
+        // (Lowercasing keeps byte offsets for the ASCII text used here.)
+        if !query.is_empty() && lower.len() == s.len() {
+            while let Some(i) = lower[at..].find(query) {
+                job.append(&s[at..at + i], 0.0, normal.clone());
+                job.append(&s[at + i..at + i + query.len()], 0.0, hit.clone());
+                at += i + query.len();
+            }
+        }
+        job.append(&s[at..], 0.0, normal);
+        job
+    };
+    let mut para = String::new();
+    let mut in_list = false;
+    let flush = |ui: &mut egui::Ui, para: &mut String| {
+        if !para.is_empty() {
+            let job = text(ui, para);
+            ui.label(job);
+            ui.add_space(6.0);
+            para.clear();
+        }
+    };
+    for line in body.lines() {
+        let line = line.trim_end();
+        if in_list && !line.starts_with("- ") {
+            ui.add_space(6.0);
+            in_list = false;
+        }
+        if let Some(h) = line.strip_prefix("## ") {
+            flush(ui, &mut para);
+            ui.add_space(4.0);
+            ui.strong(h);
+        } else if let Some(b) = line.strip_prefix("- ") {
+            flush(ui, &mut para);
+            in_list = true;
+            ui.horizontal_top(|ui| {
+                ui.label("•");
+                let job = text(ui, b);
+                ui.label(job);
+            });
+        } else if line.is_empty() {
+            flush(ui, &mut para);
+        } else {
+            if !para.is_empty() {
+                para.push(' ');
+            }
+            para.push_str(line);
+        }
+    }
+    flush(ui, &mut para);
+}
+
 const CALL_COLOR: Color32 = Color32::from_rgb(255, 210, 90);
 
 /// A callsign drawn as a clickable link.
@@ -2631,6 +2754,9 @@ impl eframe::App for App {
         self.ui_call_info(ctx);
         if self.s.tx_enabled && self.show_memories {
             self.ui_memories(ctx);
+        }
+        if self.show_help {
+            self.ui_help(ctx);
         }
         // A clicked callsign goes into the transmit Call box.
         if self.info_call != self.last_info_call {
