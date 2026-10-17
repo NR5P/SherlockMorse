@@ -20,8 +20,14 @@ pub fn parse_callsign(w: &str) -> Option<String> {
 /// True if the callsign has a known DXCC prefix (built-in cty.dat). Decoding
 /// errors often produce call-shaped strings with impossible prefixes.
 pub fn valid_prefix(call: &str) -> bool {
+    entity(call).is_some()
+}
+
+/// The DXCC entity's primary prefix for a call ("W" for K0II, "EA" for
+/// EA5GS), if its prefix is one.
+pub fn entity(call: &str) -> Option<String> {
     static CTY: std::sync::OnceLock<crate::cty::Cty> = std::sync::OnceLock::new();
-    CTY.get_or_init(crate::cty::Cty::built_in).lookup(call).is_some()
+    CTY.get_or_init(crate::cty::Cty::built_in).lookup(call).map(|c| c.prefix)
 }
 
 /// Edit distance between the Morse renderings of two strings (elements and

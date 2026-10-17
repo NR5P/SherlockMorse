@@ -124,6 +124,9 @@ pub struct Channel {
     pending_join: Option<String>,
     /// Contest exchanges heard here (NAME NUMBER), by name: how often.
     exch: HashMap<String, u32>,
+    /// Own sightings of calls in a glued-letter pair (WN4DW / N4DW), the
+    /// pair's sightings being pooled under one of them.
+    glue_own: HashMap<String, u32>,
     frames: Vec<Complex32>,
     /// Speed-matched filter (I, Q, bandwidth) applied after the fixed
     /// 100 Hz demodulator, so the unfiltered frames stay available.
@@ -696,6 +699,7 @@ impl Skimmer {
             pending_call: None,
             pending_join: None,
             exch: HashMap::new(),
+            glue_own: HashMap::new(),
             frames: Vec::new(),
             start_frames,
         });
@@ -1350,14 +1354,32 @@ impl Skimmer {
                     }
                 }
                 // A letter glued on the front of a call (WN4DW for N4DW, EN2MA
-                // for N2MA: the previous word's tail) or lost from it (T7FT
-                // for YT7FT): one station. The copy heard more often is the
-                // call and the other's sightings count for it; at a tie the
-                // shorter (glue is more common than a lost first letter).
+                // for N2MA: a stray dit, the previous word's tail) or lost
+                // from it (T7FT for YT7FT): one station. Its sightings are
+                // pooled under the copy heard more often by itself, the
+                // shorter at a tie (nine of ten such pairs on the CWT and
+                // night sets were glue), and the pool moves when the other
+                // copy overtakes it ("DE EA5GS" eighteen times after one
+                // A5GS cut out of a garble).
                 let front = |a: &str, b: &str| a.len() == b.len() + 1 && a.ends_with(b) && a.as_bytes()[0].is_ascii_alphabetic();
-                if let Some(other) = ch.call_counts.keys().find(|c| front(c, &call) || front(&call, c)).cloned() {
-                    let (nc, no) = (ch.call_counts.get(&call).copied().unwrap_or(0) + 1, ch.call_counts[&other]);
-                    let keep_other = no > nc || (no == nc && other.len() < call.len());
+                // (Or a call confirmed elsewhere on the band: EK0II on W0ABE's
+                // channel for K0II, a caller spotted on N8KH's.)
+                if !ch.call_counts.contains_key(&call)
+                    && !ch.glue_own.contains_key(&call)
+                    && spots.iter().any(|s| s.confirmed && s.channel != ch.id && front(&call, &s.call) && crate::callsign::standard_shape(&s.call))
+                {
+                    call = call[1..].to_string();
+                }
+                if let Some(other) = ch.call_counts.keys().chain(ch.glue_own.keys()).find(|c| front(c, &call) || front(&call, c)).cloned() {
+                    let other_own = ch.glue_own.get(&other).copied().unwrap_or_else(|| ch.call_counts.get(&other).copied().unwrap_or(0));
+                    ch.glue_own.insert(other.clone(), other_own);
+                    let own = ch.glue_own.entry(call.clone()).or_insert(0);
+                    *own += 1;
+                    let own = *own;
+                    let keep_other = other_own > own || (other_own == own && other.len() < call.len());
+                    if std::env::var_os("CWSK_NOTES").is_some() {
+                        eprintln!("GLUE {:.1} Hz: {call} ({own}) vs {other} ({other_own}) -> {}", ch.demod.freq, if keep_other { &other } else { &call });
+                    }
                     let loser = if keep_other { std::mem::replace(&mut call, other) } else { other };
                     let k = ch.call_counts.remove(&loser).unwrap_or(0);
                     *ch.call_counts.entry(call.clone()).or_insert(0) += k;
@@ -1464,15 +1486,21 @@ impl Skimmer {
                 }
             }
         }
-        // (Two full-length calls rarely come out of noise by chance.)
-        for (a, b) in splits() {
-            if let (Some(x), Some(y)) = (ok(a), ok(b)) {
-                if known(&x) || known(&y) || (x.len() >= 4 && y.len() >= 4) {
-                    return vec![(x, false), (y, false)];
-                }
-            }
-        }
-        Vec::new()
+        // (Two full-length calls rarely come out of noise by chance.) Of
+        // several ways to cut, the one with the known call(s), then two
+        // calls from one country (a station repeating its call, a QSO
+        // partner nearby), then the longer first call: "W0ABEK0II" is
+        // W0ABE K0II, not W0AB EK0II; "EA5BSEA5GS" EA5BS EA5GS, not
+        // EA5BSE A5GS.
+        let same_country = |x: &str, y: &str| crate::callsign::entity(x).is_some_and(|e| crate::callsign::entity(y).as_deref() == Some(e.as_str()));
+        splits()
+            .filter_map(|(a, b)| match (ok(a), ok(b)) {
+                (Some(x), Some(y)) if known(&x) || known(&y) || (x.len() >= 4 && y.len() >= 4) => Some((x, y)),
+                _ => None,
+            })
+            .max_by_key(|(x, y)| (u8::from(known(x)) + u8::from(known(y)), same_country(x, y), x.len()))
+            .map(|(x, y)| vec![(x, false), (y, false)])
+            .unwrap_or_default()
     }
 
     /// Records a sighting of `call` on this channel as a spot; `strong`:
