@@ -1814,15 +1814,20 @@ impl Skimmer {
                 }
             }
         }
-        let until = self.time + 60.0;
         let mut i = 0;
         let (now, events, spots) = (self.time, &mut self.events, &mut self.spots);
         self.channels.retain_mut(|c| {
             let keep = !dead[i];
             i += 1;
             if !keep {
+                // An artefact found young is kept away for a minute; a
+                // channel that lived and was shown is a station's, caught
+                // idling between overs (its noise keyed by a neighbour),
+                // and the next station on that frequency must not be
+                // locked out (K8PK, 33 s after KO4VW's over).
+                let hold = if c.qualified && now - c.created > 20.0 { 10.0 } else { 60.0 };
                 Self::dropping(c, now, events, spots, &format!("artifact or duplicate of a stronger signal{}", why[i - 1]));
-                self.suppressed.push((c.demod.freq as f32, until));
+                self.suppressed.push((c.demod.freq as f32, now + hold));
             }
             keep
         });
