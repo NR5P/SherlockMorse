@@ -122,6 +122,8 @@ pub struct Channel {
     /// A call cut short after DE or CQ (W3P): joined with the next word
     /// if that makes a whole call (W3PYF; a letter gap read as a word gap).
     pending_join: Option<String>,
+    /// Contest exchanges heard here (NAME NUMBER), by name: how often.
+    exch: HashMap<String, u32>,
     frames: Vec<Complex32>,
     /// Speed-matched filter (I, Q, bandwidth) applied after the fixed
     /// 100 Hz demodulator, so the unfiltered frames stay available.
@@ -690,6 +692,7 @@ impl Skimmer {
             prev2_word: String::new(),
             pending_call: None,
             pending_join: None,
+            exch: HashMap::new(),
             frames: Vec::new(),
             start_frames,
         });
@@ -1361,7 +1364,54 @@ impl Skimmer {
                     ch.pending_call = Some(call);
                 }
             }
+            Self::exchange_context(ch, &w, now, spots);
             ch.prev2_word = std::mem::replace(&mut ch.prev_word, w);
+        }
+    }
+
+    /// A call answered with a contest exchange is being addressed, as
+    /// good a sighting as one before DE: the running station sends
+    /// "K0II KEN 3910" to each caller (its exchange repeats, the caller's
+    /// call does not), or "JO7INF 5NN 25". The caller's call is a word
+    /// already recognised here, and the exchange one heard before (any
+    /// NAME NUMBER pair once could be text; the first caller is not
+    /// spotted on the strength of a later repeat, it was two busts for
+    /// no real call).
+    fn exchange_context(ch: &mut Channel, w: &str, now: f64, spots: &mut Vec<Spot>) {
+        let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let prev = ch.prev_word.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+        let prev2 = ch.prev2_word.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+        let recognised = |c: &str| ch.call_counts.contains_key(c) && parse_callsign(c).is_some();
+        let name_ok = |s: &str| {
+            (2..=6).contains(&s.len())
+                && s.bytes().all(|c| c.is_ascii_uppercase())
+                && !matches!(
+                    s,
+                    "DE" | "CQ" | "TU" | "TEST" | "CWT" | "KN" | "BK" | "AR" | "SK" | "AGN" | "QRL" | "QRZ" | "RST" | "NR" | "ES" | "PSE" | "TNX" | "TKS" | "UR" | "QSL" | "QTH" | "GM" | "GA" | "GE" | "GN" | "HR" | "POTA" | "SOTA" | "DX" | "QRS" | "QRQ" | "AS" | "GL" | "OM" | "FB" | "HI" | "CUL" | "CL" | "BT" | "GUD" | "VY" | "NN" | "TT" | "AA" | "ANT" | "RIG" | "WX" | "PWR" | "NAME" | "SRI" | "HW" | "QSO" | "QRM" | "QRN" | "QSB"
+                )
+        };
+        let nr_ok = |s: &str| (2..=5).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_alphanumeric()) && s.bytes().any(|c| c.is_ascii_digit());
+        // "<call> 5NN": the report answers the caller.
+        let report = (w.starts_with("5NN") || w.starts_with("599")) && w.len() <= 6 && w[3..].bytes().all(|c| c.is_ascii_digit() || c == b'N' || c == b'T');
+        if report && recognised(&prev) {
+            Self::spot(ch, prev, now, spots, true);
+            return;
+        }
+        let (name, cand) = if name_ok(&prev) && nr_ok(w) {
+            (prev.clone(), prev2.clone())
+        } else {
+            // The name and number run together ("JOE2884").
+            let k = w.bytes().position(|c| c.is_ascii_digit()).unwrap_or(0);
+            if k > 0 && name_ok(&w[..k]) && nr_ok(&w[k..]) && parse_callsign(w).is_none() {
+                (w[..k].to_string(), prev.clone())
+            } else {
+                return;
+            }
+        };
+        let e = ch.exch.entry(name).or_insert(0);
+        *e += 1;
+        if *e >= 2 && recognised(&cand) {
+            Self::spot(ch, cand, now, spots, true);
         }
     }
 
