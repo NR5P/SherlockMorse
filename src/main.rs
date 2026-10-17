@@ -6,6 +6,7 @@ use cwskimmer::cat::controller::{RigController, RigState};
 use cwskimmer::cat::{self, Mode, RigConfig, RigKind};
 use cwskimmer::cty::{self, Country, Cty};
 use cwskimmer::engine::{Engine, EngineCmd, Snapshot, Source};
+use cwskimmer::keyer::{KeyTiming, Keyer, KeyerConfig, KeyerState, Line};
 use cwskimmer::lm::LanguageModel;
 use cwskimmer::lookup::{self, Credentials, Lookup, LookupState};
 use cwskimmer::morse::to_display;
@@ -54,6 +55,39 @@ struct Settings {
     activities: Vec<Activity>,
     /// Spots list filter: empty shows all, "*" any flagged spot, else one flag's name.
     spot_filter: String,
+    /// Show the transmit panel. Off (the default), no keying port is opened.
+    tx_enabled: bool,
+    /// Operator's callsign, for {MYCALL} in messages.
+    my_call: String,
+    keyer: KeyerConfig,
+    key_timing: KeyTiming,
+    /// Messages on F1..F8.
+    macros: Vec<Macro>,
+    /// Send characters as they are typed instead of a line on Enter.
+    tx_live: bool,
+}
+
+/// A stored message, sent with its button or function key.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+struct Macro {
+    label: String,
+    text: String,
+}
+
+fn default_macros() -> Vec<Macro> {
+    [
+        ("CQ", "CQ CQ CQ DE {MYCALL} {MYCALL} {MYCALL} K"),
+        ("Answer", "{CALL} DE {MYCALL} {MYCALL} K"),
+        ("Report", "{CALL} DE {MYCALL} TNX FER CALL UR RST 599 599 HW? {CALL} DE {MYCALL} K"),
+        ("73", "TNX FER QSO 73 {CALL} DE {MYCALL} <SK>"),
+        ("My call", "{MYCALL}"),
+        ("AGN?", "AGN?"),
+        ("QRL?", "QRL?"),
+        ("TU", "TU"),
+    ]
+    .into_iter()
+    .map(|(l, t)| Macro { label: l.into(), text: t.into() })
+    .collect()
 }
 
 impl Default for Settings {
@@ -83,6 +117,12 @@ impl Default for Settings {
             my_grid: String::new(),
             activities: activity::defaults(),
             spot_filter: String::new(),
+            tx_enabled: false,
+            my_call: String::new(),
+            keyer: KeyerConfig::default(),
+            key_timing: KeyTiming::default(),
+            macros: default_macros(),
+            tx_live: false,
         }
     }
 }
@@ -156,6 +196,17 @@ struct App {
     info_call: Option<String>,
     /// `--screenshot PATH`: save a PNG of the window after a delay and exit.
     screenshot: Option<(std::path::PathBuf, Instant, bool)>,
+    /// Transmit keyer (only while the transmit panel is enabled) and the
+    /// configuration it was started with.
+    keyer: Option<Keyer>,
+    keyer_cfg: KeyerConfig,
+    /// Transmit text box, and (send-as-you-type) what of it was queued.
+    tx_text: String,
+    tx_typed: String,
+    /// Their call, for {CALL}; clicking a callsign fills it.
+    tx_call: String,
+    tx_msg: String,
+    last_info_call: Option<String>,
 }
 
 /// The conversation on the operator's own frequency: everything decoded
@@ -174,6 +225,8 @@ struct Qso {
     /// The station stopped keying for a while since the last text: the
     /// next text starts a new line (a new over).
     paused: bool,
+    /// The last line is our own transmission.
+    tx_line: bool,
 }
 
 impl Qso {
@@ -203,7 +256,7 @@ impl Qso {
                 let calls = stem.split('-').skip(6).map(|c| c.replace('_', "/")).collect();
                 let age = mtime.elapsed().unwrap_or_default();
                 let last_text = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-                Some(Qso { rf, started_utc, last_text, away_since: None, text, calls, path, paused: false })
+                Some(Qso { rf, started_utc, last_text, away_since: None, text, calls, path, paused: false, tx_line: false })
             })
             .collect()
     }
@@ -318,6 +371,13 @@ impl App {
             cty_rx: None,
             info_call: None,
             screenshot: None,
+            keyer: None,
+            keyer_cfg: KeyerConfig::default(),
+            tx_text: String::new(),
+            tx_typed: String::new(),
+            tx_call: String::new(),
+            tx_msg: String::new(),
+            last_info_call: None,
             s,
         };
         app.load_cty();
@@ -772,6 +832,61 @@ impl App {
             return;
         }
         let rf = self.rf_of(audio);
+        self.qso_open(rf);
+        let now = Instant::now();
+        let Some(q) = self.qso.as_mut() else { return };
+        // A new line when the station paused (someone else, or a new
+        // over), not merely because text arrived in bursts: the decoder
+        // holds words back a few seconds in case of an error sign.
+        if q.text.is_empty() || std::mem::take(&mut q.paused) || std::mem::take(&mut q.tx_line) || q.last_text.elapsed() > Duration::from_secs(30) {
+            let (_, t) = utc_now();
+            if !q.text.is_empty() {
+                q.text.push('\n');
+            }
+            q.text.push_str(&format!("[{}Z] ", &t[..5]));
+        }
+        q.text.push_str(&to_display(text));
+        q.last_text = now;
+        q.away_since = None;
+        // Only calls that are confirmed (spotted twice) or heard twice in
+        // this conversation: a single garbled sighting is often noise.
+        for w in text.split_whitespace() {
+            if let Some(c) = cwskimmer::callsign::parse_callsign(w) {
+                let spotted = self.spots.iter().any(|r| r.confirmed && r.call == c);
+                let twice = q.text.split_whitespace().filter(|x| *x == c).count() >= 2;
+                // (Our own call is in the conversation through what we sent.)
+                let mine = c.eq_ignore_ascii_case(self.s.my_call.trim());
+                if !q.calls.contains(&c) && !mine && cwskimmer::callsign::valid_prefix(&c) && (spotted || twice) {
+                    q.calls.push(c);
+                }
+            }
+        }
+        q.save();
+    }
+
+    /// Our own sent text, added to the conversation on the VFO frequency.
+    fn qso_tx(&mut self, text: &str) {
+        let rf = self.rf_of(self.pitch());
+        self.qso_open(rf);
+        let Some(q) = self.qso.as_mut() else { return };
+        if !q.tx_line {
+            let (_, t) = utc_now();
+            if !q.text.is_empty() {
+                q.text.push('\n');
+            }
+            q.text.push_str(&format!("[{}Z] TX: ", &t[..5]));
+            q.tx_line = true;
+        }
+        q.text.push_str(&to_display(text));
+        q.last_text = Instant::now();
+        q.away_since = None;
+        q.paused = false;
+        q.save();
+    }
+
+    /// Makes `self.qso` the conversation at `rf`: the current one, a recent
+    /// one resumed, or a new one.
+    fn qso_open(&mut self, rf: Option<u64>) {
         let now = Instant::now();
         let same = self.qso.as_ref().is_some_and(|q| match (q.rf, rf) {
             (Some(a), Some(b)) => (a as i64 - b as i64).abs() <= 150,
@@ -790,35 +905,10 @@ impl App {
                 self.qso = Some(q);
             }
         }
-        let q = self.qso.get_or_insert_with(|| {
+        self.qso.get_or_insert_with(|| {
             let (d, t) = utc_now();
-            Qso { rf, started_utc: format!("{d} {t}"), last_text: now, away_since: None, text: String::new(), calls: Vec::new(), path: std::path::PathBuf::new(), paused: false }
+            Qso { rf, started_utc: format!("{d} {t}"), last_text: now, away_since: None, text: String::new(), calls: Vec::new(), path: std::path::PathBuf::new(), paused: false, tx_line: false }
         });
-        // A new line when the station paused (someone else, or a new
-        // over), not merely because text arrived in bursts: the decoder
-        // holds words back a few seconds in case of an error sign.
-        if q.text.is_empty() || std::mem::take(&mut q.paused) || q.last_text.elapsed() > Duration::from_secs(30) {
-            let (_, t) = utc_now();
-            if !q.text.is_empty() {
-                q.text.push('\n');
-            }
-            q.text.push_str(&format!("[{}Z] ", &t[..5]));
-        }
-        q.text.push_str(&to_display(text));
-        q.last_text = now;
-        q.away_since = None;
-        // Only calls that are confirmed (spotted twice) or heard twice in
-        // this conversation: a single garbled sighting is often noise.
-        for w in text.split_whitespace() {
-            if let Some(c) = cwskimmer::callsign::parse_callsign(w) {
-                let spotted = self.spots.iter().any(|r| r.confirmed && r.call == c);
-                let twice = q.text.split_whitespace().filter(|x| *x == c).count() >= 2;
-                if !q.calls.contains(&c) && cwskimmer::callsign::valid_prefix(&c) && (spotted || twice) {
-                    q.calls.push(c);
-                }
-            }
-        }
-        q.save();
     }
 
     /// Finalizes the current conversation into the history.
@@ -1295,6 +1385,307 @@ impl App {
             }
         }
         ui.label(RichText::new("Decoder parameters apply to newly detected signals.").small().weak());
+        ui.add_space(6.0);
+        ui.strong("Transmit");
+        ui.checkbox(&mut self.s.tx_enabled, "Show the transmit panel (CW keying)")
+            .on_hover_text("For sending CW from the keyboard. Off: the panel is hidden and no keying port is ever opened.");
+        if self.s.tx_enabled {
+            self.ui_tx_settings(ui);
+        }
+    }
+
+    fn ui_tx_settings(&mut self, ui: &mut egui::Ui) {
+        let before = self.s.key_timing.clone();
+        egui::Grid::new("tx_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("My call");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.my_call).desired_width(90.0).hint_text("N0CALL"));
+            if r.changed() {
+                self.s.my_call = self.s.my_call.trim().to_uppercase();
+            }
+            ui.end_row();
+            ui.label("Key with");
+            let port_label = |p: &str, d: &str| {
+                let d = d.replace("⚠ secondary port (PTT/keying, not CAT)", "keying/PTT port");
+                if d.is_empty() { p.to_string() } else { format!("{p}  {d}") }
+            };
+            let cur = if self.s.keyer.test_mode() { "Nothing (test mode)".to_string() } else { self.s.keyer.port.clone() };
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("key_port").width(170.0).selected_text(cur).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.s.keyer.port, String::new(), "Nothing (test mode)");
+                    for (p, d) in &self.ports {
+                        ui.selectable_value(&mut self.s.keyer.port, p.clone(), port_label(p, d));
+                    }
+                });
+                if ui.small_button("⟳").on_hover_text("Rescan serial ports").clicked() {
+                    self.ports = cat::list_ports();
+                }
+            });
+            ui.end_row();
+            if !self.s.keyer.test_mode() {
+                ui.label("Key line");
+                ui.horizontal(|ui| {
+                    for l in [Line::Dtr, Line::Rts] {
+                        ui.radio_value(&mut self.s.keyer.line, l, l.label());
+                    }
+                });
+                ui.end_row();
+                ui.label("PTT line").on_hover_text("Only for radios without break-in: hold the other line as PTT around each transmission");
+                ui.horizontal(|ui| {
+                    let other = if self.s.keyer.line == Line::Dtr { Line::Rts } else { Line::Dtr };
+                    if self.s.keyer.ptt == Some(self.s.keyer.line) {
+                        self.s.keyer.ptt = Some(other);
+                    }
+                    ui.radio_value(&mut self.s.keyer.ptt, None, "none (break-in)");
+                    ui.radio_value(&mut self.s.keyer.ptt, Some(other), other.label());
+                });
+                ui.end_row();
+                if self.s.keyer.ptt.is_some() {
+                    ui.label("PTT lead / tail (ms)");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.s.keyer.ptt_lead_ms).range(0.0..=500.0).speed(1.0));
+                        ui.add(egui::DragValue::new(&mut self.s.keyer.ptt_tail_ms).range(0.0..=2000.0).speed(5.0));
+                    });
+                    ui.end_row();
+                }
+            }
+            let t = &mut self.s.key_timing;
+            ui.label("Speed (WPM)");
+            ui.add(egui::Slider::new(&mut t.wpm, 5.0..=60.0).step_by(1.0));
+            ui.end_row();
+            ui.label("Weight (%)").on_hover_text("50 is standard. Higher makes every dit and dah longer and the gaps shorter by the same time.");
+            ui.add(egui::Slider::new(&mut t.weight, 25.0..=75.0).step_by(1.0));
+            ui.end_row();
+            ui.label("Dah length (dits)");
+            ui.add(egui::Slider::new(&mut t.dah, 2.5..=4.5).step_by(0.1));
+            ui.end_row();
+            ui.label("Letter gap (dits)").on_hover_text("3 is standard. Longer gaps between letters and words, at the same character speed, is Farnsworth spacing.");
+            ui.add(egui::Slider::new(&mut t.letter_gap, 2.0..=12.0).step_by(0.1));
+            ui.end_row();
+            ui.label("Word gap (dits)").on_hover_text("7 is standard");
+            ui.add(egui::Slider::new(&mut t.word_gap, 5.0..=30.0).step_by(0.1));
+            ui.end_row();
+            if t.word_gap < t.letter_gap {
+                t.word_gap = t.letter_gap;
+            }
+            ui.label("Key compensation (ms)").on_hover_text("Added to every dit and dah, for a radio whose break-in shortens them. Usually 0.");
+            ui.add(egui::Slider::new(&mut t.comp_ms, 0.0..=15.0).step_by(0.5));
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            let t = &self.s.key_timing;
+            if (t.letter_gap, t.word_gap) != (3.0, 7.0) {
+                ui.label(RichText::new(format!("Overall speed with these gaps: about {:.1} WPM", t.effective_wpm())).small());
+            }
+            if ui.small_button("Default timing").clicked() {
+                self.s.key_timing = KeyTiming { wpm: self.s.key_timing.wpm, ..Default::default() };
+            }
+        });
+        if self.s.key_timing != before {
+            if let Some(k) = &self.keyer {
+                k.set_timing(self.s.key_timing.clone());
+            }
+        }
+        ui.label(
+            RichText::new("FTDX3000: choose its second (Standard / keying) COM port, set Menu 065 PC KEYING to DTR and press BK-IN to transmit. With BK-IN off the radio only plays its sidetone — a safe first test.")
+                .small()
+                .weak(),
+        );
+        egui::CollapsingHeader::new("Messages (F1–F8)").id_salt("tx_macros").show(ui, |ui| {
+            ui.label(RichText::new("{MYCALL} is your call, {CALL} the Call box (clicking a callsign fills it). Prosigns: <AR> <SK> <BT> <KN> <BK>.").small().weak());
+            egui::Grid::new("macros").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
+                for (i, m) in self.s.macros.iter_mut().enumerate() {
+                    ui.label(format!("F{}", i + 1));
+                    ui.add(egui::TextEdit::singleline(&mut m.label).desired_width(56.0).hint_text("label"));
+                    ui.add(egui::TextEdit::singleline(&mut m.text).desired_width(220.0));
+                    ui.end_row();
+                }
+            });
+            if ui.button("Restore defaults").clicked() {
+                self.s.macros = default_macros();
+            }
+        });
+    }
+
+    /// Starts, restarts (after a configuration change, once idle) or stops
+    /// the keyer to match the settings.
+    fn sync_keyer(&mut self) {
+        if !self.s.tx_enabled {
+            self.keyer = None;
+            return;
+        }
+        if self.keyer.is_some() && self.keyer_cfg == self.s.keyer {
+            return;
+        }
+        if self.keyer.as_ref().is_some_and(|k| k.snapshot().busy()) {
+            return;
+        }
+        // Dropping the old keyer closes its port first.
+        self.keyer = None;
+        self.keyer_cfg = self.s.keyer.clone();
+        self.keyer = Some(Keyer::start(self.s.keyer.clone(), self.s.key_timing.clone()));
+    }
+
+    /// Expands {MYCALL} and {CALL} and queues the text.
+    fn tx_send(&mut self, text: &str) {
+        let Some(k) = &self.keyer else { return };
+        let port = self.s.keyer.port.trim();
+        if !port.is_empty() && self.rig.is_some() && self.s.rig.kind != RigKind::Hamlib && port == self.s.rig.port.trim() {
+            self.tx_msg = format!("{port} is the CAT port: choose the radio's keying port in Settings > Transmit");
+            return;
+        }
+        let mut t = text.to_uppercase();
+        for (key, val, missing) in [
+            ("{MYCALL}", self.s.my_call.trim(), "Set your call in Settings > Transmit"),
+            ("{CALL}", self.tx_call.trim(), "The Call box is empty"),
+        ] {
+            if t.contains(key) {
+                if val.is_empty() {
+                    self.tx_msg = missing.into();
+                    return;
+                }
+                t = t.replace(key, &val.to_uppercase());
+            }
+        }
+        self.tx_msg.clear();
+        k.send(&t);
+    }
+
+    fn tx_abort(&mut self) {
+        if let Some(k) = &self.keyer {
+            k.abort();
+        }
+    }
+
+    /// Function keys send messages, Esc stops.
+    fn tx_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.tx_abort();
+        }
+        const F: [egui::Key; 8] = [egui::Key::F1, egui::Key::F2, egui::Key::F3, egui::Key::F4, egui::Key::F5, egui::Key::F6, egui::Key::F7, egui::Key::F8];
+        for (i, key) in F.iter().enumerate() {
+            if ctx.input(|inp| inp.key_pressed(*key)) {
+                if let Some(m) = self.s.macros.get(i) {
+                    let text = format!("{} ", m.text);
+                    self.tx_send(&text);
+                }
+            }
+        }
+    }
+
+    fn ui_tx(&mut self, ui: &mut egui::Ui) {
+        let st: KeyerState = self.keyer.as_ref().map(|k| k.snapshot()).unwrap_or_default();
+        let test = self.s.keyer.test_mode();
+        ui.horizontal_wrapped(|ui| {
+            let (bg, fg) = match (st.key_down, st.busy()) {
+                (true, _) if test => (Color32::from_rgb(200, 130, 20), Color32::BLACK),
+                (true, _) => (Color32::from_rgb(210, 30, 30), Color32::WHITE),
+                (false, true) => (Color32::from_rgb(110, 40, 40), Color32::WHITE),
+                _ => (Color32::from_gray(45), Color32::from_gray(120)),
+            };
+            ui.label(RichText::new(" TX ").monospace().strong().color(fg).background_color(bg))
+                .on_hover_text(if test { "Test mode: nothing is keyed" } else { "Lit while the key is down" });
+            ui.label("Call");
+            if ui.add(egui::TextEdit::singleline(&mut self.tx_call).desired_width(80.0).hint_text("their call")).changed() {
+                self.tx_call = self.tx_call.trim().to_uppercase();
+            }
+            let mut send: Option<String> = None;
+            for (i, m) in self.s.macros.iter().enumerate() {
+                if m.label.trim().is_empty() && m.text.trim().is_empty() {
+                    continue;
+                }
+                if ui.button(format!("F{} {}", i + 1, m.label)).on_hover_text(&m.text).clicked() {
+                    send = Some(format!("{} ", m.text));
+                }
+            }
+            if let Some(t) = send {
+                self.tx_send(&t);
+            }
+            ui.separator();
+            ui.label("WPM");
+            if ui.add(egui::DragValue::new(&mut self.s.key_timing.wpm).range(5.0..=60.0).speed(0.2).fixed_decimals(0)).changed() {
+                self.s.key_timing.wpm = self.s.key_timing.wpm.round();
+                if let Some(k) = &self.keyer {
+                    k.set_timing(self.s.key_timing.clone());
+                }
+            }
+            if ui.button(RichText::new("■ Stop").strong()).on_hover_text("Stop sending now (Esc)").clicked() {
+                self.tx_abort();
+            }
+        });
+        ui.horizontal(|ui| {
+            let hint = if self.s.tx_live { "Type: each letter is sent as you type it" } else { "Type a message, Enter sends it" };
+            let w = (ui.available_width() - 210.0).max(120.0);
+            let r = ui.add(egui::TextEdit::singleline(&mut self.tx_text).desired_width(w).font(egui::TextStyle::Monospace).hint_text(hint));
+            if r.changed() {
+                self.tx_text = self.tx_text.to_uppercase();
+                if self.s.tx_live {
+                    self.tx_live_update();
+                }
+            }
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = !self.s.tx_live && ui.button("Send").on_hover_text("Send the message (Enter)").clicked();
+            if enter || clicked {
+                if self.s.tx_live {
+                    if let Some(k) = &self.keyer {
+                        k.send(" ");
+                    }
+                } else if !self.tx_text.trim().is_empty() {
+                    let t = format!("{} ", self.tx_text.trim());
+                    self.tx_send(&t);
+                }
+                self.tx_text.clear();
+                self.tx_typed.clear();
+                r.request_focus();
+            }
+            if ui.checkbox(&mut self.s.tx_live, "Send as I type").on_hover_text("Each letter goes out as soon as it is typed; Backspace takes back letters not yet sent").changed() {
+                self.tx_typed = if self.s.tx_live { self.tx_text.clone() } else { String::new() };
+            }
+        });
+        // What is on the air: sent dimmed, the letter being sent lit, the queue plain.
+        ui.horizontal_wrapped(|ui| {
+            use egui::text::{LayoutJob, TextFormat};
+            let font = egui::FontId::monospace(14.0);
+            let mut job = LayoutJob::default();
+            let fmt = |c: Color32, bg: Color32| TextFormat { font_id: font.clone(), color: c, background: bg, ..Default::default() };
+            let (sent, now, queued) = (&st.text[..st.sent], &st.text[st.sent..st.next], st.pending());
+            let base = ui.visuals().text_color();
+            job.append(sent, 0.0, fmt(base.gamma_multiply(0.45), Color32::TRANSPARENT));
+            job.append(now, 0.0, fmt(Color32::BLACK, Color32::from_rgb(255, 200, 80)));
+            job.append(queued, 0.0, fmt(base, Color32::TRANSPARENT));
+            if !st.text.is_empty() {
+                ui.label(job);
+            }
+            if let Some(e) = &st.error {
+                ui.label(RichText::new(e).color(Color32::LIGHT_RED));
+            } else if !self.tx_msg.is_empty() {
+                ui.label(RichText::new(&self.tx_msg).color(Color32::LIGHT_RED));
+            } else if test {
+                ui.label(RichText::new("Test mode — the radio is not keyed. Choose a keying port in Settings > Transmit.").small().color(Color32::from_rgb(230, 160, 60)));
+            } else if st.text.is_empty() {
+                let t = &self.s.key_timing;
+                ui.label(
+                    RichText::new(format!("Keys {} on {}{}", self.s.keyer.line.label(), self.s.keyer.port, if (t.letter_gap, t.word_gap) != (3.0, 7.0) { format!("   overall {:.0} WPM", t.effective_wpm()) } else { String::new() }))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+    }
+
+    /// Send-as-you-type: queues what was added to the box, takes back what
+    /// was deleted (if not yet sent).
+    fn tx_live_update(&mut self) {
+        let Some(k) = &self.keyer else { return };
+        let common = self.tx_typed.chars().zip(self.tx_text.chars()).take_while(|(a, b)| a == b).count();
+        let removed = self.tx_typed.chars().count() - common;
+        if removed > 0 {
+            k.retract(removed);
+        }
+        let added: String = self.tx_text.chars().skip(common).collect();
+        if !added.is_empty() {
+            k.send(&added);
+        }
+        self.tx_typed = self.tx_text.clone();
     }
 
     /// Editable list of activity flags.
@@ -2028,6 +2419,13 @@ fn open_in_browser(url: &str) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.sync_keyer();
+        if let Some(sent) = self.keyer.as_ref().map(|k| k.take_sent()).filter(|t| !t.is_empty()) {
+            self.qso_tx(&sent);
+        }
+        if self.s.tx_enabled {
+            self.tx_keys(ctx);
+        }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(2.0);
             self.ui_top(ui);
@@ -2052,6 +2450,13 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_settings(ui));
             });
         }
+        if self.s.tx_enabled {
+            egui::TopBottomPanel::bottom("tx").show(ctx, |ui| {
+                ui.add_space(2.0);
+                self.ui_tx(ui);
+                ui.add_space(2.0);
+            });
+        }
         egui::SidePanel::right("spots").default_width(370.0).resizable(true).show(ctx, |ui| self.ui_spots(ui));
         egui::TopBottomPanel::bottom("selected").resizable(true).default_height(150.0).show(ctx, |ui| self.ui_bottom(ui));
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2061,6 +2466,13 @@ impl eframe::App for App {
             self.ui_channels(ui);
         });
         self.ui_call_info(ctx);
+        // A clicked callsign goes into the transmit Call box.
+        if self.info_call != self.last_info_call {
+            if let (Some(c), true) = (&self.info_call, self.s.tx_enabled) {
+                self.tx_call = c.clone();
+            }
+            self.last_info_call = self.info_call.clone();
+        }
         if let (Some(rd), Some((_, started))) = (&mut self.rec_display, &self.recording) {
             let _ = &rd.log;
             let t = started.elapsed().as_secs_f32();
@@ -2114,6 +2526,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Key up and close the keying port before anything else.
+        self.keyer = None;
         self.flush_log_lines(true);
         self.qso_finish();
         if let Some(e) = &self.engine {

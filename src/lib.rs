@@ -11,6 +11,7 @@ pub mod cat;
 pub mod decoder;
 pub mod dsp;
 pub mod engine;
+pub mod keyer;
 pub mod lm;
 pub mod lookup;
 pub mod morse;

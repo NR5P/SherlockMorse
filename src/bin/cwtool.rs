@@ -7,6 +7,7 @@ use cwskimmer::cat::{self, RigConfig, RigKind};
 use cwskimmer::cty::Cty;
 use cwskimmer::decoder::DecoderParams;
 use cwskimmer::dsp::resample::Resampler;
+use cwskimmer::keyer::{KeyEvent, KeyOutput, KeyTiming, Keyer, KeyerConfig, Recorder};
 use cwskimmer::lm::LanguageModel;
 use cwskimmer::skimmer::{Skimmer, SkimmerConfig, RATE};
 use cwskimmer::synth::{self, Scene, SignalSpec};
@@ -138,6 +139,31 @@ enum Cmd {
         /// Seconds to check from the start of the file.
         #[arg(long, default_value_t = 8.0)]
         duration: f32,
+    },
+    /// Run the transmit keyer in test mode (nothing is keyed): time its
+    /// real line changes against the plan, render them as a tone and
+    /// decode that with the skimmer.
+    TxTest {
+        #[arg(long, default_value = "CQ CQ DE NR5P NR5P <AR> K")]
+        text: String,
+        #[arg(long, default_value_t = 20.0)]
+        wpm: f32,
+        #[arg(long, default_value_t = 50.0)]
+        weight: f32,
+        #[arg(long, default_value_t = 3.0)]
+        dah: f32,
+        #[arg(long, default_value_t = 3.0)]
+        letter_gap: f32,
+        #[arg(long, default_value_t = 7.0)]
+        word_gap: f32,
+        /// Key compensation (ms).
+        #[arg(long, default_value_t = 0.0)]
+        comp: f32,
+        #[arg(long, default_value_t = 20.0)]
+        snr: f32,
+        /// Also save the rendered audio.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// List audio input devices (best radio match marked).
     Devices,
@@ -471,6 +497,7 @@ fn main() -> Result<()> {
                 println!("{f:7.1} Hz  {ons:3} marks  duty {duty:.2}  {snr:4.1} dB");
             }
         }
+        Cmd::TxTest { text, wpm, weight, dah, letter_gap, word_gap, comp, snr, out } => tx_test(&text, KeyTiming { wpm, weight, dah, letter_gap, word_gap, comp_ms: comp }, snr, out)?,
         Cmd::Waterfall { file, out, skip, duration } => {
             let (samples, rate) = cwskimmer::audiofile::read_audio(&file)?;
             let s0 = ((skip * rate as f32) as usize).min(samples.len());
@@ -662,6 +689,94 @@ fn keyed_tones(audio: &[f32]) -> Vec<(f32, usize, f32, f32)> {
     }
     found.sort_by(|a, b| b.3.total_cmp(&a.3));
     found
+}
+
+fn tx_test(text: &str, timing: KeyTiming, snr: f32, out: Option<PathBuf>) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let rec = Recorder::default();
+    let r2 = rec.clone();
+    let keyer = Keyer::with_output(Box::new(move || Ok(Box::new(r2.clone()) as Box<dyn KeyOutput>)), KeyerConfig::default(), timing.clone());
+    let plan = timing.timeline(&text.to_ascii_uppercase());
+    let plan_s: f64 = plan.iter().map(|e| e.1).sum::<f64>() / 1000.0;
+    println!("{:.1} WPM, effective {:.1} WPM (PARIS with these gaps); plan {plan_s:.1} s", timing.wpm, timing.effective_wpm());
+    keyer.send(text);
+    let t0 = Instant::now();
+    while keyer.snapshot().busy() && t0.elapsed() < Duration::from_secs_f64(plan_s * 2.0 + 2.0) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let sent = keyer.take_sent();
+    let keys: Vec<(f64, bool)> = {
+        let ev = rec.0.lock();
+        let start = ev.first().map(|e| e.0).ok_or_else(|| anyhow!("nothing was keyed"))?;
+        ev.iter()
+            .filter_map(|(t, e)| match e {
+                KeyEvent::Key(d) => Some(((*t - start).as_secs_f64(), *d)),
+                KeyEvent::Ptt(_) => None,
+            })
+            .collect()
+    };
+    drop(keyer);
+    // Edge timing against the plan.
+    let mut errs = Vec::new();
+    let mut at = 0.0;
+    for (i, ((t, _), (_, ms))) in keys.iter().zip(&plan).enumerate() {
+        let e = t * 1000.0 - at;
+        if std::env::var_os("CWSK_TXDEBUG").is_some() && e.abs() > 2.0 {
+            eprintln!("edge {i}: {e:+.2} ms");
+        }
+        errs.push(e.abs());
+        at += ms;
+    }
+    errs.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| errs.get(((errs.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0);
+    println!("{} edges (plan {}), error vs plan: median {:.2} ms, 99% {:.2} ms, max {:.2} ms", keys.len(), plan.len(), pct(0.5), pct(0.99), pct(1.0));
+    println!("sent:    {sent}");
+    // Render the recorded keying as a 700 Hz tone with 5 ms edges.
+    let fs = 8000.0f64;
+    let n = ((keys.last().map(|k| k.0).unwrap_or(0.0) + 1.5) * fs) as usize;
+    let lead = (0.5 * fs) as usize;
+    let mut env = vec![0.0f32; n + lead];
+    for w in keys.chunks(2) {
+        if let [(a, true), (b, false)] = w {
+            for e in env.iter_mut().take(lead + (b * fs) as usize).skip(lead + (a * fs) as usize) {
+                *e = 1.0;
+            }
+        }
+    }
+    let k = (0.005 * fs) as usize;
+    let mut audio = vec![0.0f32; env.len()];
+    let mut acc = 0.0f32;
+    for i in 0..env.len() {
+        acc += env[i] - if i >= k { env[i - k] } else { 0.0 };
+        let ph = std::f64::consts::TAU * 700.0 * i as f64 / fs;
+        audio[i] = 0.1 * (acc / k as f32) * ph.sin() as f32;
+    }
+    let sigma = synth::noise_sigma_for(0.1, snr, fs as f32);
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(1);
+    let normal = rand_distr::Normal::new(0.0f32, sigma)?;
+    for v in audio.iter_mut() {
+        *v += rand_distr::Distribution::sample(&normal, &mut rng);
+    }
+    if let Some(p) = &out {
+        cwskimmer::audiofile::write_wav(p, &audio, fs as u32)?;
+        println!("wrote {}", p.display());
+    }
+    let cfg = SkimmerConfig { auto_detect: false, params: DecoderParams::from_env(), ..Default::default() };
+    let mut sk = Skimmer::new(cfg, Arc::new(LanguageModel::new()));
+    sk.add_channel(700.0, true);
+    let mut rs = Resampler::new(fs as u32, RATE);
+    let mut buf = Vec::new();
+    for chunk in audio.chunks(800).chain(std::iter::once(&vec![0.0f32; 24000][..])) {
+        buf.clear();
+        rs.process(chunk, &mut buf);
+        sk.process(&buf);
+    }
+    sk.finish();
+    let decoded: String = sk.events.drain(..).filter(|e| e.note.is_none()).map(|e| e.text).collect();
+    let decoded = cwskimmer::morse::to_display(decoded.trim());
+    println!("decoded: {decoded}");
+    println!("CER vs sent text: {:.1}%", synth::cer(&normalize_ref(text), &normalize_ref(&decoded)) * 100.0);
+    Ok(())
 }
 
 fn normalize_ref(s: &str) -> String {

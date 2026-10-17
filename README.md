@@ -73,6 +73,8 @@ tested on Linux so far.
   rate.
 - **Audio files** (WAV/MP3/FLAC/OGG/M4A) can be played through the skimmer
   for practice or testing.
+- **Optional CW transmit** from the keyboard, hidden unless you turn it on
+  (see [Transmitting](#transmitting-optional)).
 
 ## Yaesu FTDX3000 setup
 
@@ -85,11 +87,13 @@ tested on Linux so far.
    - **CAT RATE**: 38400 (the default is 4800; any rate works, as long as the
      program uses the same one).
    - **CAT RTS**: **OFF**. The program keeps RTS and DTR low on every
-     port so it can never key the transmitter. With CAT RTS on, the radio
-     would wait for RTS and ignore CAT commands.
+     port so it can never key the transmitter (unless you turn on
+     transmitting and choose a keying port yourself). With CAT RTS on, the
+     radio would wait for RTS and ignore CAT commands.
    - Use only the **Enhanced** port (`/dev/ttyUSB0`) for CAT. The Standard
      port (`/dev/ttyUSB1`) can key PTT/CW through RTS/DTR. The program
-     labels it, refuses to connect to it, and auto-detect never probes it.
+     labels it, refuses to connect to it for CAT, and auto-detect never
+     probes it.
    - **CW PITCH**: note the value (default 700 Hz) and enter it under
      ⚙ Settings → CW pitch so that click-to-tune lands signals exactly.
    - USB audio output level (**USB OUT LEVEL** in the CW/DATA menus) about
@@ -100,6 +104,35 @@ tested on Linux so far.
    selected automatically.
 5. Put the radio in CW with a wide filter (2.4–3 kHz) so the skimmer sees
    the whole passband.
+
+## Transmitting (optional)
+
+Most people only listen, so transmitting is off and out of sight by
+default. To send CW from the keyboard, tick **⚙ Settings → Transmit → Show
+the transmit panel**. A panel appears under the decoded text with a text
+box, a **Call** box and eight message buttons (F1–F8).
+
+- Type a line and press **Enter** to send it, or tick **Send as I type** to
+  send each letter as you type it (Backspace takes back letters not yet
+  sent). **Esc** or **■ Stop** stops at once.
+- Messages can use `{MYCALL}` (your call, set in Settings) and `{CALL}` (the
+  Call box; clicking any callsign fills it). Prosigns: `<AR>` `<SK>` `<BT>`
+  `<KN>` `<BK>` (or `+` for AR, `=` for BT).
+- Timing is made by the program, so all of it is adjustable: speed (also in
+  the panel), weight, dah length, letter and word gaps (Farnsworth spacing)
+  and key compensation. The defaults are standard Morse at 20 WPM.
+- What you send is added to the conversation log as `TX:` lines.
+- Until you choose a keying port the panel runs in **test mode**: the timing
+  runs and the text is shown being sent, but nothing is keyed.
+
+The radio is keyed through the DTR or RTS line of a serial port, which most
+radios accept. The port is opened only when you first send something, and
+the line is held low at all other times. **FTDX3000:** in Settings → Transmit
+choose its second (Standard) COM port (`/dev/ttyUSB1`), key line **DTR**, and
+set **Menu 065 PC KEYING** to **DTR**. The radio transmits only with **BK-IN**
+on. With BK-IN off it just plays its sidetone, which is a safe way to check
+the keying first. For a radio without break-in, choose the other line as PTT;
+it is held through each transmission, with adjustable lead and tail times.
 
 ## Building
 
@@ -130,6 +163,7 @@ cwtool bench --compare-lm           # synthetic benchmark suite
 cwtool weak rec.wav --freq 750 --noise band*.wav   # fade a recording into real band noise
 cwtool keying clip.wav              # any CW (on/off keyed tones) in a short clip?
 cwtool cty DL/W1ABC VP8LP           # DXCC country, zones and position of calls
+cwtool tx-test --wpm 25 --text "CQ DE N0CALL"   # time the transmit keyer (keys nothing) and decode its output
 ```
 
 ## How well it decodes
@@ -229,6 +263,7 @@ sound card / file ─► resampler (8 kHz) ─► FFT 512 ─► waterfall + sig
 | `src/skimmer.rs` | signal detection, channel lifecycle, spots |
 | `src/dsp/` | resampler, channel demodulator, spectrum |
 | `src/cat/` | radio protocols, auto-detect, polling thread |
+| `src/keyer.rs` | CW transmit keyer: text to timing, DTR/RTS keying |
 | `src/audio.rs` | sound card capture and auto-selection |
 | `src/synth.rs` | impaired-CW synthesizer used by tests and the benchmark |
 | `src/main.rs` | egui user interface |
