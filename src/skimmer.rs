@@ -230,6 +230,9 @@ pub struct Skimmer {
 const PREROLL_SECS: f32 = 1.5;
 /// Frames of mark history kept per channel (5 s).
 const MARK_HIST: usize = 2500;
+/// A channel this far over the noise floor is a station, not the noise
+/// keyed by the receiver's AGC (AGC junk was 5-14 dB; stations 20-40).
+const AGC_JUNK_DB: f32 = 15.0;
 
 pub fn bin_hz() -> f32 {
     RATE as f32 / FFT_SIZE as f32
@@ -1346,6 +1349,20 @@ impl Skimmer {
                         }
                     }
                 }
+                // A letter glued on the front of a call (WN4DW for N4DW, EN2MA
+                // for N2MA: the previous word's tail) or lost from it (T7FT
+                // for YT7FT): one station. The copy heard more often is the
+                // call and the other's sightings count for it; at a tie the
+                // shorter (glue is more common than a lost first letter).
+                let front = |a: &str, b: &str| a.len() == b.len() + 1 && a.ends_with(b) && a.as_bytes()[0].is_ascii_alphabetic();
+                if let Some(other) = ch.call_counts.keys().find(|c| front(c, &call) || front(&call, c)).cloned() {
+                    let (nc, no) = (ch.call_counts.get(&call).copied().unwrap_or(0) + 1, ch.call_counts[&other]);
+                    let keep_other = no > nc || (no == nc && other.len() < call.len());
+                    let loser = if keep_other { std::mem::replace(&mut call, other) } else { other };
+                    let k = ch.call_counts.remove(&loser).unwrap_or(0);
+                    *ch.call_counts.entry(call.clone()).or_insert(0) += k;
+                    spots.retain(|s| !(s.channel == ch.id && s.call == loser));
+                }
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
                 if voted.is_some() {
@@ -1719,6 +1736,7 @@ impl Skimmer {
     fn reject_artifacts(&mut self) {
         let n = self.channels.len();
         let mut dead = vec![false; n];
+        let mut why = vec![String::new(); n];
         for (si, strong) in self.channels.iter().enumerate() {
             let len = strong.marks.len();
             if len < 500 || dead[si] {
@@ -1783,9 +1801,16 @@ impl Skimmer {
                 // moves against the strong one's; a real weak station's own
                 // keying dominates its envelope instead. (On 40 m at night
                 // next to W1AW: dozens of junk channels, all -0.24..-0.45.)
-                let agc = much_stronger && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
+                // Only a channel down at the noise: the AGC makes "keying"
+                // out of noise, not out of a station 10-20 dB under the
+                // strong one, whose envelope also dips with its marks. (A
+                // CWT: K4NMR at 40 dB beside KG9X at 52 was dropped for a
+                // minute at a time, and QSO partners at home likewise.)
+                let agc = much_stronger && weak.level_db < AGC_JUNK_DB && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
                 if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc) {
                     dead[wi] = true;
+                    let rule = if agc { "agc" } else if twin && corr > 0.7 { "twin" } else if inside_frac > 0.92 { "inside" } else { "corr" };
+                    why[wi] = format!(" ({rule}, {:.0} Hz at {:.0} dB)", strong.demod.freq, strong.level_db);
                 }
             }
         }
@@ -1796,7 +1821,7 @@ impl Skimmer {
             let keep = !dead[i];
             i += 1;
             if !keep {
-                Self::dropping(c, now, events, spots, "artifact or duplicate of a stronger signal");
+                Self::dropping(c, now, events, spots, &format!("artifact or duplicate of a stronger signal{}", why[i - 1]));
                 self.suppressed.push((c.demod.freq as f32, until));
             }
             keep
