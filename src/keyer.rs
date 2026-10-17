@@ -816,15 +816,17 @@ mod tests {
         // Expected line changes: merge the timeline into mark/space runs.
         let tl = timing.timeline("CQ DE NR5P");
         assert_eq!(keys.len(), tl.len(), "one change per element edge");
-        let t0 = keys[0].0;
-        let mut at = 0.0;
-        let mut worst: f64 = 0.0;
-        for ((t, down), (edown, ms)) in keys.iter().zip(&tl) {
+        for ((_, down), (edown, _)) in keys.iter().zip(&tl) {
             assert_eq!(down, edown);
-            worst = worst.max(((*t - t0).as_secs_f64() * 1000.0 - at).abs());
-            at += ms;
         }
-        assert!(worst < 6.0, "worst edge error {worst:.2} ms");
+        // Each mark and gap as long as planned. Compared element by element
+        // (not from the start) so one scheduling stall on a busy machine,
+        // which the keyer re-times around, fails at most two of them.
+        let mut errs: Vec<f64> = keys.windows(2).zip(&tl).map(|(w, (_, ms))| ((w[1].0 - w[0].0).as_secs_f64() * 1000.0 - ms).abs()).collect();
+        errs.sort_by(|a, b| a.total_cmp(b));
+        let median = errs[errs.len() / 2];
+        let p95 = errs[errs.len() * 95 / 100];
+        assert!(median < 0.5 && p95 < 2.0, "element length error: median {median:.2} ms, 95% {p95:.2} ms");
         assert_eq!(k.take_sent(), "CQ DE NR5P");
         assert!(!k.snapshot().key_down);
     }

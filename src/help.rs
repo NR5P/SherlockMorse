@@ -90,23 +90,11 @@ Abbreviations (QTH, RST, TNX …) are highlighted: hover them for their meaning.
     ),
     (
         "Settings",
-        "⚙ Settings opens the settings panel on the left. Decoder settings apply to signals detected after the change.
+        "⚙ Settings opens the settings panel on the left. Every setting has a small circled ? next to its name: click it to see what the setting does and how to adjust it. All of them are listed below.
 
-- CW pitch: must match the radio's CW pitch so clicking tunes exactly. With auto ticked it is read from the radio.
-- Passband: the audio range searched for signals.
-- Detection threshold: how far above the noise a keyed signal must be to get a decoder. Lower finds weaker signals and more junk.
-- Max decoders: the most signals decoded at once.
-- Row dropout: how long a station's row stays through a fade.
-- Sensitive slicer (experimental): copies more of weak and fluttering signals, but shows more junk rows.
-- Squelch: lower decodes weaker signals but more noise garbage.
-- Text prediction: how much the language model may correct the timing. 0 is timing only.
-- Show RF frequency: show signals as radio frequencies instead of audio Hz.
-- Waterfall brightness and contrast.
-- Always drive RTS / DTR high: normally leave both off.
-- Station lookup: your grid square, and optional QRZ.com and HamQTH logins.
-- Country file: download the newest cty.dat.
-- Activity flags: the words that mark a station as POTA, SKCC, a contest and so on. Patterns are separated by commas, may be several words, and * matches anything.
-- Transmit: shows the transmit panel and its settings (see Transmitting).",
+Decoder settings apply to signals detected after the change; press Clear to restart every decoder with the new values.
+
+Restore default settings, at the bottom of the panel, puts every setting back to its default after asking. Your call, grid, logins, radio and audio choices, keying port and keyer memories are kept.",
     ),
     (
         "Transmitting",
@@ -190,4 +178,252 @@ Raise the Detection threshold or the Squelch, or turn off the Sensitive slicer.
 - FTDX3000: Menu 065 PC KEYING must match the key line (DTR), and BK-IN must be on to transmit.
 - A red message under the transmit box gives the reason a port could not be opened.",
     ),
+];
+
+/// One setting's explanation: what it does and how to adjust it. Shown
+/// by the (?) next to the setting and listed in the Settings help topic.
+pub struct Setting {
+    pub key: &'static str,
+    pub section: &'static str,
+    pub label: &'static str,
+    pub text: &'static str,
+}
+
+pub fn setting(key: &str) -> Option<&'static Setting> {
+    SETTINGS.iter().find(|s| s.key == key)
+}
+
+pub const SETTINGS: &[Setting] = &[
+    Setting {
+        key: "pitch",
+        section: "Receiving",
+        label: "CW pitch",
+        text: "The audio tone a signal has when the radio is tuned exactly to it (the radio's CW pitch or sidetone). Clicking a signal to tune moves it to this pitch, and the conversation follows the station on this pitch.
+
+- Set it to the same value as the radio (FTDX3000: Menu 054 CW PITCH, default 700 Hz).
+- Tick auto to read it from the radio over CAT (Yaesu); the box is then not needed.
+- If clicked stations end up slightly off, this does not match the radio.",
+    },
+    Setting {
+        key: "passband",
+        section: "Receiving",
+        label: "Passband",
+        text: "The range of audio frequencies searched for signals (default 250 to 2800 Hz).
+
+- Match it to the radio's filter: with a 2.4 kHz filter there is nothing useful above about 2700 Hz.
+- Raise the lower edge if hum or low-frequency noise makes junk decoders.
+- Narrow it to decode only part of the passband.",
+    },
+    Setting {
+        key: "detect_db",
+        section: "Receiving",
+        label: "Detection threshold",
+        text: "How far a keyed signal must rise above the noise (in dB) before a decoder is started on it. Default 12 dB.
+
+- Lower it (8 to 10) to catch weaker signals; you also get more rows of noise and junk.
+- Raise it (14 to 18) on a noisy or crowded band to show only the clearer signals.",
+    },
+    Setting {
+        key: "max_channels",
+        section: "Receiving",
+        label: "Max decoders",
+        text: "The most signals decoded at the same time (default 40). Each decoder uses some processor time.
+
+- Lower it on a slow computer, or if the program falls behind the audio.
+- Raise it for a crowded contest band.",
+    },
+    Setting {
+        key: "dropout",
+        section: "Receiving",
+        label: "Row dropout",
+        text: "How many seconds a station's row stays on screen while its signal is too weak to read (a fade), before it is hidden. Default 30 s.
+
+- Raise it to keep stations visible through long fades (QSB).
+- Lower it (or 0) for a list that only shows what is readable right now.",
+    },
+    Setting {
+        key: "viterbi",
+        section: "Receiving",
+        label: "Sensitive slicer (experimental)",
+        text: "A different way of deciding where each dit and dah starts and ends: it weighs each whole element against the noise instead of deciding moment by moment. Off by default.
+
+- Turn it on for weak or fluttering signals: it copies more of them and spots more calls correctly.
+- It also shows more rows of junk, so leave it off on a busy or noisy band.",
+    },
+    Setting {
+        key: "squelch",
+        section: "Receiving",
+        label: "Squelch",
+        text: "How sure the decoder must be that it hears keying before it prints text (default 2.3).
+
+- Lower it (toward 1.6) to read weaker signals; more noise turns into stray letters (E, T, I).
+- Raise it (toward 3 to 4) if noise prints garbage between transmissions.",
+    },
+    Setting {
+        key: "lm_weight",
+        section: "Receiving",
+        label: "Text prediction",
+        text: "How much the built-in language model (which knows typical CW words, abbreviations and callsigns) may override the timing when the code is unclear. Default 0.5.
+
+- 0 decodes from timing alone: best for random text such as code groups or unusual languages.
+- Higher values clean up poor copy into likely words, but can also turn real oddities into the expected word. Above 1 is rarely better.",
+    },
+    Setting {
+        key: "show_rf",
+        section: "Receiving",
+        label: "Show RF frequency",
+        text: "Show signals by their radio frequency (kHz) when the radio is connected, instead of by their audio tone (Hz). On by default; without CAT, audio Hz is always shown.",
+    },
+    Setting {
+        key: "waterfall",
+        section: "Receiving",
+        label: "Waterfall brightness / contrast",
+        text: "Only the look of the waterfall; decoding is not affected.
+
+- Brightness (left slider): move it right if the waterfall is too dark, left if the noise is too bright.
+- Contrast (right slider): move it right to make signals stand out from the noise more sharply.",
+    },
+    Setting {
+        key: "rts_dtr",
+        section: "Receiving",
+        label: "Always drive RTS / DTR high",
+        text: "Keeps the RTS or DTR line of the CAT port switched on. Leave both off.
+
+- Some radios ignore CAT until RTS is on (FTDX3000 with CAT RTS = ENABLE); the program already raises RTS by itself in that case, on the CAT port only.
+- On many radios these lines key the transmitter, so only tick one if the radio's manual requires it for CAT.",
+    },
+    Setting {
+        key: "my_grid",
+        section: "Station lookup",
+        label: "My grid",
+        text: "Your Maidenhead grid locator (for example EM12ab). With it set, station information and country hovers show the distance and beam heading to the other station. Four or six characters.",
+    },
+    Setting {
+        key: "logins",
+        section: "Station lookup",
+        label: "QRZ.com and HamQTH logins",
+        text: "Optional accounts for the station information window. US and Canadian calls work without any account (HamDB).
+
+- A free QRZ.com account adds name and country for calls worldwide; a QRZ subscription adds full details and photos.
+- A free HamQTH.com account adds worldwide data and photos.
+- Enter the username and password of the account; leave them empty if you have none. Passwords are stored unencrypted in the settings file.",
+    },
+    Setting {
+        key: "cty",
+        section: "Country file",
+        label: "Country file",
+        text: "The list that turns a callsign into its country (AD1C's cty.dat, as used by loggers). A copy is built in, so it works offline.
+
+- Press Update now and then (new DXpeditions, changed prefixes) to download the newest copy from country-files.com.",
+    },
+    Setting {
+        key: "activities",
+        section: "Activity flags",
+        label: "Activity flags",
+        text: "Coloured flags on stations that send certain words, such as POTA, SKCC or a contest name. The spots list can be filtered by flag.
+
+- Each flag has a name, a colour and patterns. Patterns are separated by commas, may be several words (CQ POTA), and * matches anything (K-*).
+- Untick a flag to hide it, ✖ deletes it, Add makes a new one, Restore defaults brings back the built-in list.",
+    },
+    Setting {
+        key: "tx_enabled",
+        section: "Transmit",
+        label: "Show the transmit panel",
+        text: "Shows the panel for sending CW from the keyboard, with the memory keyer. Off by default: most people only listen. While it is off the panel is hidden and no keying port is ever opened.",
+    },
+    Setting {
+        key: "my_call",
+        section: "Transmit",
+        label: "My call",
+        text: "Your callsign. It replaces {MYCALL} in keyer memories and typed text. Memories that use {MYCALL} are not sent until it is set.",
+    },
+    Setting {
+        key: "key_with",
+        section: "Transmit",
+        label: "Key with",
+        text: "The serial port whose DTR or RTS line keys the transmitter.
+
+- Nothing (test mode): everything works but nothing is keyed. Good for trying the panel.
+- FTDX3000: its second (Standard) port, /dev/ttyUSB1 on Linux, marked keying/PTT port. Not the CAT port.
+- Other radios: the port of their USB keying interface, or the radio's own port if its manual allows CW keying by DTR/RTS there.
+- The port is opened only when you first send something.",
+    },
+    Setting {
+        key: "key_line",
+        section: "Transmit",
+        label: "Key line",
+        text: "Which line of the port keys the CW: DTR or RTS. It must match the radio.
+
+- FTDX3000: DTR, with Menu 065 PC KEYING set to DTR.
+- Most interfaces key on DTR; check the interface's manual if nothing happens.",
+    },
+    Setting {
+        key: "ptt_line",
+        section: "Transmit",
+        label: "PTT line",
+        text: "For radios without CW break-in: the other line is held as PTT (transmit) through each transmission.
+
+- none (break-in): the radio switches to transmit by itself when keyed (FTDX3000 with BK-IN on). Use this when the radio has break-in.
+- DTR / RTS: choose this if the radio only transmits while its PTT is held.",
+    },
+    Setting {
+        key: "ptt_times",
+        section: "Transmit",
+        label: "PTT lead / tail",
+        text: "With a PTT line: lead is how long PTT is held before the first dit (default 50 ms), tail how long after the last one (default 200 ms).
+
+- Raise the lead if the first dit is clipped (the radio or amplifier relay is still switching).
+- Raise the tail to stay in transmit through short pauses between words.",
+    },
+    Setting {
+        key: "wpm",
+        section: "Transmit",
+        label: "Speed (WPM)",
+        text: "Sending speed in words per minute (default 20). Also in the transmit panel, and changeable during a message. A good rule is to send no faster than the station you are working.",
+    },
+    Setting {
+        key: "weight",
+        section: "Transmit",
+        label: "Weight",
+        text: "How heavy the code sounds. 50% is standard: a dit is as long as the gap after it.
+
+- Raise it (55 to 60) to make every dit and dah longer and the gaps shorter by the same time: heavier, punchier code that cuts through noise.
+- Lower it for lighter code. The speed stays the same either way.",
+    },
+    Setting {
+        key: "dah",
+        section: "Transmit",
+        label: "Dah length",
+        text: "Length of a dah in dits (default 3, the standard). Some operators like a slightly longer dah (3.2 to 3.5) for a more distinct rhythm. Changing it changes the speed slightly.",
+    },
+    Setting {
+        key: "letter_gap",
+        section: "Transmit",
+        label: "Letter gap",
+        text: "The gap between letters, in dits (default 3, the standard).
+
+- Raise it to space letters out while each letter keeps its full speed (Farnsworth spacing). This helps slower readers and practice; the overall speed is shown below.
+- Below 3 runs letters together and makes the code harder to read.",
+    },
+    Setting {
+        key: "word_gap",
+        section: "Transmit",
+        label: "Word gap",
+        text: "The gap between words, in dits (default 7, the standard). Raise it along with the letter gap for Farnsworth spacing, or on its own to make words stand apart. It is never shorter than the letter gap.",
+    },
+    Setting {
+        key: "comp",
+        section: "Transmit",
+        label: "Key compensation",
+        text: "Milliseconds added to every dit and dah (and taken from the gap after it). Usually 0.
+
+- Some radios' break-in (QSK) clips the start of each element, making dits sound thin at high speed; add a few ms (2 to 8) to make up for it.
+- Check with the radio's monitor or another receiver: dits should sound as long as the gaps between them.",
+    },
+    Setting {
+        key: "memories",
+        section: "Transmit",
+        label: "Keyer memories",
+        text: "Opens the editor for the messages on F1 to F12 (also: right-click a memory button in the transmit panel). See the Memory keyer help topic.",
+    },
 ];

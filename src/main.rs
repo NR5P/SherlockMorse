@@ -242,6 +242,7 @@ struct App {
     show_memories: bool,
     /// Help window: open, chosen topic, search text.
     show_help: bool,
+    confirm_reset: bool,
     help_topic: usize,
     help_query: String,
 }
@@ -418,6 +419,7 @@ impl App {
             tx_repeat: None,
             show_memories: false,
             show_help: false,
+            confirm_reset: false,
             help_topic: 0,
             help_query: String::new(),
             s,
@@ -1331,7 +1333,7 @@ impl App {
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         egui::Grid::new("settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("CW pitch (Hz)");
+            setting_label(ui, "pitch", "CW pitch (Hz)");
             ui.horizontal(|ui| {
                 let from_radio = self.s.auto_pitch && self.rig.is_some() && self.rig_state.pitch.is_some();
                 if from_radio {
@@ -1343,41 +1345,41 @@ impl App {
                 ui.checkbox(&mut self.s.auto_pitch, "auto").on_hover_text("Read the CW pitch from the radio over CAT (Yaesu)");
             });
             ui.end_row();
-            ui.label("Passband (Hz)");
+            setting_label(ui, "passband", "Passband (Hz)");
             ui.horizontal(|ui| {
                 changed |= ui.add(egui::DragValue::new(&mut self.s.min_freq).range(100.0..=1500.0).speed(10.0)).changed();
                 ui.label("–");
                 changed |= ui.add(egui::DragValue::new(&mut self.s.max_freq).range(800.0..=3900.0).speed(10.0)).changed();
             });
             ui.end_row();
-            ui.label("Detection threshold (dB)");
+            setting_label(ui, "detect_db", "Detection threshold (dB)");
             changed |= ui.add(egui::Slider::new(&mut self.s.detect_db, 4.0..=20.0)).changed();
             ui.end_row();
-            ui.label("Max decoders");
+            setting_label(ui, "max_channels", "Max decoders");
             changed |= ui.add(egui::Slider::new(&mut self.s.max_channels, 1..=80)).changed();
             ui.end_row();
-            ui.label("Row dropout (s)").on_hover_text("How long a station's row stays visible through a fade (keying too weak to read) before it is hidden");
+            setting_label(ui, "dropout", "Row dropout (s)");
             changed |= ui.add(egui::Slider::new(&mut self.s.dropout_s, 0.0..=60.0)).changed();
             ui.end_row();
-            ui.label("Sensitive slicer (experimental)").on_hover_text("Decide marks and spaces by weighing each whole element against the noise instead of frame by frame: copies more of weak and fluttering signals and spots more calls correctly, but shows more junk rows");
+            setting_label(ui, "viterbi", "Sensitive slicer (experimental)");
             changed |= ui.checkbox(&mut self.s.viterbi, "").changed();
             ui.end_row();
-            ui.label("Squelch");
+            setting_label(ui, "squelch", "Squelch");
             changed |= ui.add(egui::Slider::new(&mut self.s.squelch, 1.6..=4.0)).on_hover_text("Lower decodes weaker signals but more noise garbage").changed();
             ui.end_row();
-            ui.label("Text prediction (LM weight)");
+            setting_label(ui, "lm_weight", "Text prediction (LM weight)");
             changed |= ui.add(egui::Slider::new(&mut self.s.lm_weight, 0.0..=2.0)).on_hover_text("0 = timing only; higher trusts the language model more").changed();
             ui.end_row();
-            ui.label("Show RF frequency");
+            setting_label(ui, "show_rf", "Show RF frequency");
             ui.checkbox(&mut self.s.show_rf, "");
             ui.end_row();
-            ui.label("Waterfall brightness / contrast");
+            setting_label(ui, "waterfall", "Waterfall brightness / contrast");
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.s.wf_brightness, -20.0..=20.0).show_value(false));
                 ui.add(egui::Slider::new(&mut self.s.wf_contrast, 0.3..=3.0).show_value(false));
             });
             ui.end_row();
-            ui.label("Always drive RTS / DTR high");
+            setting_label(ui, "rts_dtr", "Always drive RTS / DTR high");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.s.rig.assert_rts, "RTS")
                     .on_hover_text("Normally leave OFF: the RTS handshake is raised automatically on the CAT port if the radio needs it (CAT RTS = ON), and never on a PTT/keying port.");
@@ -1386,7 +1388,10 @@ impl App {
             ui.end_row();
         });
         ui.add_space(6.0);
-        ui.strong("Station lookup");
+        ui.horizontal(|ui| {
+            ui.strong("Station lookup");
+            info_hint(ui, "logins");
+        });
         ui.label(
             RichText::new("Click a callsign for name, location and photo. US/Canada calls work without an account (HamDB). Add a free QRZ.com and/or HamQTH.com login for DX stations and photos.")
                 .small()
@@ -1394,7 +1399,7 @@ impl App {
         );
         let before = self.s.lookup.clone();
         egui::Grid::new("lookup").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-            ui.label("My grid");
+            setting_label(ui, "my_grid", "My grid");
             ui.add(egui::TextEdit::singleline(&mut self.s.my_grid).desired_width(70.0).hint_text("FN31pr"))
                 .on_hover_text("Your Maidenhead locator, to show distance and beam heading");
             ui.end_row();
@@ -1410,7 +1415,10 @@ impl App {
         });
         ui.label(RichText::new("Passwords are stored unencrypted in the app's settings file.").small().weak());
         ui.add_space(6.0);
-        ui.strong("Country file");
+        ui.horizontal(|ui| {
+            ui.strong("Country file");
+            info_hint(ui, "cty");
+        });
         ui.horizontal(|ui| {
             ui.label(format!("{} countries", self.cty.len()));
             let busy = self.cty_rx.is_some();
@@ -1435,23 +1443,75 @@ impl App {
         ui.label(RichText::new("Decoder parameters apply to newly detected signals.").small().weak());
         ui.add_space(6.0);
         ui.strong("Transmit");
-        ui.checkbox(&mut self.s.tx_enabled, "Show the transmit panel (CW keying)")
-            .on_hover_text("For sending CW from the keyboard. Off: the panel is hidden and no keying port is ever opened.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.s.tx_enabled, "Show the transmit panel (CW keying)");
+            info_hint(ui, "tx_enabled");
+        });
         if self.s.tx_enabled {
             self.ui_tx_settings(ui);
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        if self.confirm_reset {
+            ui.label(RichText::new("Put every setting in this panel back to its default? Your call, grid, logins, radio and audio choices, keying port and keyer memories are kept.").small());
+            ui.horizontal(|ui| {
+                if ui.button("Restore defaults").clicked() {
+                    self.reset_settings();
+                    self.confirm_reset = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_reset = false;
+                }
+            });
+        } else if ui.small_button("Restore default settings…").clicked() {
+            self.confirm_reset = true;
+        }
+    }
+
+    /// Puts the settings in the panel back to their defaults, keeping the
+    /// operator's own details and connections.
+    fn reset_settings(&mut self) {
+        let d = Settings::default();
+        let s = &mut self.s;
+        s.pitch = d.pitch;
+        s.auto_pitch = d.auto_pitch;
+        s.min_freq = d.min_freq;
+        s.max_freq = d.max_freq;
+        s.detect_db = d.detect_db;
+        s.max_channels = d.max_channels;
+        s.dropout_s = d.dropout_s;
+        s.viterbi = d.viterbi;
+        s.squelch = d.squelch;
+        s.lm_weight = d.lm_weight;
+        s.show_rf = d.show_rf;
+        s.wf_contrast = d.wf_contrast;
+        s.wf_brightness = d.wf_brightness;
+        s.rig.assert_rts = false;
+        s.rig.assert_dtr = false;
+        s.activities = d.activities;
+        s.key_timing = d.key_timing;
+        s.keyer.ptt_lead_ms = d.keyer.ptt_lead_ms;
+        s.keyer.ptt_tail_ms = d.keyer.ptt_tail_ms;
+        s.repeat_stop_on_answer = d.repeat_stop_on_answer;
+        s.tx_live = d.tx_live;
+        if let Some(e) = &self.engine {
+            e.send(EngineCmd::Config(self.skimmer_config()));
+        }
+        if let Some(k) = &self.keyer {
+            k.set_timing(self.s.key_timing.clone());
         }
     }
 
     fn ui_tx_settings(&mut self, ui: &mut egui::Ui) {
         let before = self.s.key_timing.clone();
         egui::Grid::new("tx_settings").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            ui.label("My call");
+            setting_label(ui, "my_call", "My call");
             let r = ui.add(egui::TextEdit::singleline(&mut self.s.my_call).desired_width(90.0).hint_text("N0CALL"));
             if r.changed() {
                 self.s.my_call = self.s.my_call.trim().to_uppercase();
             }
             ui.end_row();
-            ui.label("Key with");
+            setting_label(ui, "key_with", "Key with");
             let port_label = |p: &str, d: &str| {
                 let d = d.replace("⚠ secondary port (PTT/keying, not CAT)", "keying/PTT port");
                 if d.is_empty() { p.to_string() } else { format!("{p}  {d}") }
@@ -1470,14 +1530,14 @@ impl App {
             });
             ui.end_row();
             if !self.s.keyer.test_mode() {
-                ui.label("Key line");
+                setting_label(ui, "key_line", "Key line");
                 ui.horizontal(|ui| {
                     for l in [Line::Dtr, Line::Rts] {
                         ui.radio_value(&mut self.s.keyer.line, l, l.label());
                     }
                 });
                 ui.end_row();
-                ui.label("PTT line").on_hover_text("Only for radios without break-in: hold the other line as PTT around each transmission");
+                setting_label(ui, "ptt_line", "PTT line");
                 ui.horizontal(|ui| {
                     let other = if self.s.keyer.line == Line::Dtr { Line::Rts } else { Line::Dtr };
                     if self.s.keyer.ptt == Some(self.s.keyer.line) {
@@ -1488,7 +1548,7 @@ impl App {
                 });
                 ui.end_row();
                 if self.s.keyer.ptt.is_some() {
-                    ui.label("PTT lead / tail (ms)");
+                    setting_label(ui, "ptt_times", "PTT lead / tail (ms)");
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut self.s.keyer.ptt_lead_ms).range(0.0..=500.0).speed(1.0));
                         ui.add(egui::DragValue::new(&mut self.s.keyer.ptt_tail_ms).range(0.0..=2000.0).speed(5.0));
@@ -1497,25 +1557,25 @@ impl App {
                 }
             }
             let t = &mut self.s.key_timing;
-            ui.label("Speed (WPM)");
+            setting_label(ui, "wpm", "Speed (WPM)");
             ui.add(egui::Slider::new(&mut t.wpm, 5.0..=60.0).step_by(1.0));
             ui.end_row();
-            ui.label("Weight (%)").on_hover_text("50 is standard. Higher makes every dit and dah longer and the gaps shorter by the same time.");
+            setting_label(ui, "weight", "Weight (%)");
             ui.add(egui::Slider::new(&mut t.weight, 25.0..=75.0).step_by(1.0));
             ui.end_row();
-            ui.label("Dah length (dits)");
+            setting_label(ui, "dah", "Dah length (dits)");
             ui.add(egui::Slider::new(&mut t.dah, 2.5..=4.5).step_by(0.1));
             ui.end_row();
-            ui.label("Letter gap (dits)").on_hover_text("3 is standard. Longer gaps between letters and words, at the same character speed, is Farnsworth spacing.");
+            setting_label(ui, "letter_gap", "Letter gap (dits)");
             ui.add(egui::Slider::new(&mut t.letter_gap, 2.0..=12.0).step_by(0.1));
             ui.end_row();
-            ui.label("Word gap (dits)").on_hover_text("7 is standard");
+            setting_label(ui, "word_gap", "Word gap (dits)");
             ui.add(egui::Slider::new(&mut t.word_gap, 5.0..=30.0).step_by(0.1));
             ui.end_row();
             if t.word_gap < t.letter_gap {
                 t.word_gap = t.letter_gap;
             }
-            ui.label("Key compensation (ms)").on_hover_text("Added to every dit and dah, for a radio whose break-in shortens them. Usually 0.");
+            setting_label(ui, "comp", "Key compensation (ms)");
             ui.add(egui::Slider::new(&mut t.comp_ms, 0.0..=15.0).step_by(0.5));
             ui.end_row();
         });
@@ -1538,9 +1598,12 @@ impl App {
                 .small()
                 .weak(),
         );
-        if ui.button("Edit keyer memories…").on_hover_text("The messages on F1–F12 (also: right-click a memory button in the transmit panel)").clicked() {
-            self.show_memories = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Edit keyer memories…").clicked() {
+                self.show_memories = true;
+            }
+            info_hint(ui, "memories");
+        });
     }
 
     /// The built-in user guide: topics on the left, the chosen one on the
@@ -1552,7 +1615,8 @@ impl App {
             let hits: Vec<usize> = (0..help::TOPICS.len())
                 .filter(|&i| {
                     let (t, b) = help::TOPICS[i];
-                    q.is_empty() || t.to_lowercase().contains(&q) || b.to_lowercase().contains(&q)
+                    let in_settings = t == "Settings" && help::SETTINGS.iter().any(|s| s.label.to_lowercase().contains(&q) || s.text.to_lowercase().contains(&q));
+                    q.is_empty() || t.to_lowercase().contains(&q) || b.to_lowercase().contains(&q) || in_settings
                 })
                 .collect();
             if !hits.is_empty() && !hits.contains(&self.help_topic) {
@@ -1586,6 +1650,19 @@ impl App {
                             ui.heading(*title);
                             ui.add_space(4.0);
                             help_body(ui, body, &q);
+                            if *title == "Settings" {
+                                let mut section = "";
+                                for st in help::SETTINGS {
+                                    if st.section != section {
+                                        section = st.section;
+                                        ui.add_space(6.0);
+                                        ui.heading(RichText::new(section).size(17.0));
+                                    }
+                                    ui.add_space(2.0);
+                                    ui.strong(st.label);
+                                    help_body(ui, st.text, &q);
+                                }
+                            }
                         }
                     });
                 });
@@ -1912,6 +1989,7 @@ impl App {
     /// Editable list of activity flags.
     fn ui_activity_settings(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(RichText::new("Activity flags").strong()).id_salt("activity_flags").show(ui, |ui| {
+            info_hint(ui, "activities");
             ui.label(
                 RichText::new("Stations sending these words get a flag. Separate patterns with commas; a pattern can be several words (\"CQ POTA\") and * matches anything (\"K-*\").")
                     .small()
@@ -2607,6 +2685,38 @@ fn cw_text(ui: &mut egui::Ui, text: &str, size: f32, sense: Sense, hint: &str) -
     (r, clicked)
 }
 
+/// A setting's name followed by its (?) hint.
+fn setting_label(ui: &mut egui::Ui, key: &str, text: &str) {
+    ui.horizontal(|ui| {
+        ui.label(text);
+        info_hint(ui, key);
+    });
+}
+
+/// A small (?) that opens a note on what a setting does and how to adjust it.
+fn info_hint(ui: &mut egui::Ui, key: &str) {
+    let Some(s) = help::setting(key) else { return };
+    // A small circled "?", drawn (the fonts have no ⓘ).
+    let (rect, r) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::click());
+    let col = if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    ui.painter().circle_stroke(rect.center(), 5.5, Stroke::new(1.0f32, col));
+    ui.painter().text(rect.center() + Vec2::new(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(9.0), col);
+    let r = r.on_hover_text("What is this? (click)");
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let id = ui.make_persistent_id(("setting_hint", key));
+    if r.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(id));
+    }
+    egui::popup_below_widget(ui, id, &r, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_width(340.0);
+        ui.strong(s.label);
+        ui.add_space(2.0);
+        help_body(ui, s.text, "");
+    });
+}
+
 /// Renders a help topic: "## " subheadings, "- " bullets, blank-line
 /// paragraphs. Words matching the search are highlighted.
 fn help_body(ui: &mut egui::Ui, body: &str, query: &str) {
@@ -2667,6 +2777,9 @@ fn help_body(ui: &mut egui::Ui, body: &str, query: &str) {
         }
     }
     flush(ui, &mut para);
+    if in_list {
+        ui.add_space(6.0);
+    }
 }
 
 const CALL_COLOR: Color32 = Color32::from_rgb(255, 210, 90);

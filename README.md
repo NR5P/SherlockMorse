@@ -76,7 +76,9 @@ tested on Linux so far.
 - **Optional CW transmit** from the keyboard, hidden unless you turn it on
   (see [Transmitting](#transmitting-optional)).
 - **Built-in help:** the **? Help** button opens a searchable guide to
-  every part of the program.
+  every part of the program. In Settings, the small circled **?** next to
+  each setting explains what it does and how to adjust it, and **Restore
+  default settings** puts them all back.
 
 ## Yaesu FTDX3000 setup
 
