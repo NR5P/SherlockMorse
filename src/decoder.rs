@@ -22,6 +22,10 @@ use crate::lm::LanguageModel;
 use crate::morse::{can_extend, MorseLookup, BK, ERROR};
 use std::sync::Arc;
 
+/// The echo threshold needs a signal this strong (dB over the noise): on a
+/// weak one the noise itself keeps short gaps off the floor.
+const ECHO_MIN_SNR_DB: f32 = 25.0;
+
 #[derive(Clone, Debug)]
 pub struct DecoderParams {
     /// Weight of the language model relative to timing likelihoods.
@@ -40,6 +44,12 @@ pub struct DecoderParams {
     pub squelch_close: f32,
     /// Threshold position between noise (0) and signal (1).
     pub threshold: f32,
+    /// Threshold when a multipath echo fills the gaps between elements
+    /// deep enough to merge them at `threshold`: used on a strong signal
+    /// in proportion to the share of its short gaps that stay above 0.3 of
+    /// the span (W1AW on 40 m at night: 15% of them; without the echo under
+    /// 5%). 0 = off.
+    pub echo_threshold: f32,
     /// Per-frame decay of the signal level toward the noise floor
     /// (lets the threshold follow QSB fades).
     pub sig_decay: f32,
@@ -145,6 +155,7 @@ impl DecoderParams {
                     "sig_track" => p.sig_track = v,
                     "sig_attack" => p.sig_attack = v,
                     "debounce" => p.debounce = v,
+                    "echo_threshold" => p.echo_threshold = v,
                     "soft_weight" => p.soft_weight = v,
                     "insert_penalty" => p.insert_penalty = v,
                     "clipped_dit" => p.clipped_dit = v,
@@ -176,6 +187,7 @@ impl Default for DecoderParams {
             squelch_open: 2.3,
             squelch_close: 1.9,
             threshold: 0.5,
+            echo_threshold: 0.6,
             sig_decay: 0.0015,
             bw_factor: 1.6,
             min_bw: 30.0,
@@ -1172,6 +1184,15 @@ pub struct CwDecoder {
     init_buf: Vec<f32>,
     block: Vec<f32>,
     block_p25: std::collections::VecDeque<f32>,
+    /// Threshold fraction in use (see `strong_threshold`), and a frame
+    /// counter for refreshing it.
+    thr_frac: f32,
+    thr_frames: u32,
+    /// The current gap's lowest envelope (fraction of the span) and length
+    /// in frames; the running share of short gaps that stayed above 0.3.
+    gap_min: f32,
+    gap_len: u32,
+    fill: f32,
     squelch_open: bool,
     gate: bool,
     erasure: bool,
@@ -1221,6 +1242,7 @@ pub struct CwDecoder {
 
 impl CwDecoder {
     pub fn new(frame_ms: f32, params: DecoderParams, lm: Arc<LanguageModel>) -> Self {
+        let thr_frac = params.threshold;
         Self {
             frame_ms,
             params,
@@ -1231,6 +1253,11 @@ impl CwDecoder {
             init_buf: Vec::new(),
             block: Vec::with_capacity(100),
             block_p25: Default::default(),
+            thr_frac,
+            thr_frames: 0,
+            gap_min: 1.0,
+            gap_len: 0,
+            fill: 0.0,
             squelch_open: false,
             gate: true,
             erasure: false,
@@ -1495,7 +1522,38 @@ impl CwDecoder {
             self.squelch_open = true;
         }
         let span = self.sig - nm;
-        let thr = nm + self.params.threshold * span;
+        // On a strong signal the threshold sits higher: a multipath echo
+        // (W1AW on 40 m at night, 25-35 dB) fills the gaps between elements
+        // to 0.1-0.8 of the mark level and half way up merges them (F read
+        // as R, O as M: 62% CER, 33% at 0.6). A weak signal's marks waver
+        // and need the low threshold.
+        if span > 0.0 {
+            if self.state {
+                if self.gap_len > 0 {
+                    // A gap just ended. Short ones (between elements) should
+                    // reach the noise; an echo keeps them part way up, and
+                    // the ones it keeps above the threshold are never seen.
+                    if (self.gap_len as f32) * self.frame_ms < 150.0 {
+                        self.fill += 0.03 * (f32::from(u8::from(self.gap_min > 0.3)) - self.fill);
+                    }
+                    self.gap_min = 1.0;
+                    self.gap_len = 0;
+                }
+            } else {
+                self.gap_min = self.gap_min.min((x - nm) / span);
+                self.gap_len += 1;
+            }
+        }
+        self.thr_frames += 1;
+        if self.thr_frames % 50 == 0 {
+            self.thr_frac = if self.params.echo_threshold > 0.0 && self.snr_db() >= ECHO_MIN_SNR_DB {
+                let t = ((self.fill - 0.09) / 0.06).clamp(0.0, 1.0);
+                self.params.threshold + t * (self.params.echo_threshold - self.params.threshold)
+            } else {
+                self.params.threshold
+            };
+        }
+        let thr = nm + self.thr_frac * span;
         let hyst = 0.1 * span;
         let want = if !self.squelch_open || !self.gate {
             false
