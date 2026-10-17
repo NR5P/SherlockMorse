@@ -121,7 +121,8 @@ pub struct Channel {
     pending_call: Option<String>,
     /// A call cut short after DE or CQ (W3P): joined with the next word
     /// if that makes a whole call (W3PYF; a letter gap read as a word gap).
-    pending_join: Option<String>,
+    /// (The call, and whether its own sighting is to be retracted on a join.)
+    pending_join: Option<(String, bool)>,
     /// Contest exchanges heard here (NAME NUMBER), by name: how often.
     exch: HashMap<String, u32>,
     /// Own sightings of calls in a glued-letter pair (WN4DW / N4DW), the
@@ -1285,15 +1286,26 @@ impl Skimmer {
                     Self::spot(ch, c, now, spots, true);
                 }
             }
-            if let Some(c) = ch.pending_join.take() {
+            if let Some((c, retract)) = ch.pending_join.take() {
                 let joined = format!("{c}{bare}");
+                let word_of_its_own = matches!(bare, "E" | "T" | "K" | "R" | "N" | "I" | "ES" | "DE" | "TU" | "UR" | "GM" | "GA" | "GE" | "GN" | "OK" | "HR" | "HW" | "OM" | "FB" | "CQ" | "BK" | "KN" | "AR" | "SK" | "TT" | "NN" | "AS" | "CL" | "VY" | "DX" | "QRL" | "QRZ" | "QSL" | "QTH" | "PSE" | "TNX" | "RST" | "AGN" | "NR" | "WX" | "HI");
                 if (1..=3).contains(&bare.len())
+                    && (!retract || (bare.len() <= 2 && !word_of_its_own))
                     && parse_callsign(&joined).as_deref() == Some(joined.as_str())
                     && crate::callsign::standard_shape(&joined)
                     && crate::callsign::valid_prefix(&joined)
                 {
+                    // (The cut call was counted, and maybe spotted, as a
+                    // call of its own: that sighting is this one.)
+                    if retract {
+                        if let Some(n) = ch.call_counts.get_mut(&c) {
+                            *n = n.saturating_sub(1);
+                        }
+                        spots.retain(|s| !(s.channel == ch.id && s.call == c && s.count <= 1));
+                    }
                     *ch.call_counts.entry(joined.clone()).or_insert(0) += 1;
-                    Self::spot(ch, joined, now, spots, true);
+                    // (A cut call joined keeps its own context: none.)
+                    Self::spot(ch, joined, now, spots, !retract);
                     ch.prev2_word = std::mem::replace(&mut ch.prev_word, w);
                     continue;
                 }
@@ -1385,6 +1397,10 @@ impl Skimmer {
                     *ch.call_counts.entry(call.clone()).or_insert(0) += k;
                     spots.retain(|s| !(s.channel == ch.id && s.call == loser));
                 }
+                // A call cut short by a letter gap ("VA3R A" for VA3RA, "M5T
+                // XJ"): joined with the next word if that makes a call and
+                // the next word is not one of its own (E, T, K, R, N, ES...).
+                let cut = !crate::callsign::standard_shape(&call) || ch.call_counts.get(&call).is_none_or(|&n| n == 0);
                 let n = ch.call_counts.entry(call.clone()).or_insert(0);
                 *n += 1;
                 if voted.is_some() {
@@ -1395,7 +1411,11 @@ impl Skimmer {
                 let cq_word = ch.prev2_word == "CQ" && (2..=5).contains(&ch.prev_word.len()) && ch.prev_word.bytes().all(|c| c.is_ascii_uppercase());
                 let strong_ctx = repeated || signing || cq_word || matches!(ch.prev_word.as_str(), "DE" | "CQ" | "TEST" | "TU");
                 if strong_ctx && !repeated && call.len() <= 4 && !crate::callsign::standard_shape(&call) {
-                    ch.pending_join = Some(call.clone());
+                    ch.pending_join = Some((call.clone(), false));
+                } else if cut && !strong_ctx {
+                    // (Not a call that came signing or called: "DE W3IQ W M"
+                    // is W3IQ and a stray letter.)
+                    ch.pending_join = Some((call.clone(), true));
                 }
                 if *n >= 2 || strong_ctx {
                     Self::spot(ch, call, now, spots, strong_ctx);
