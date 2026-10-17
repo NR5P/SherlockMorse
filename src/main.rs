@@ -61,17 +61,45 @@ struct Settings {
     my_call: String,
     keyer: KeyerConfig,
     key_timing: KeyTiming,
-    /// Messages on F1..F8.
+    /// Memory keyer: messages on F1..F12.
     macros: Vec<Macro>,
+    /// A repeating memory stops when text is decoded on our frequency.
+    repeat_stop_on_answer: bool,
     /// Send characters as they are typed instead of a line on Enter.
     tx_live: bool,
 }
 
-/// A stored message, sent with its button or function key.
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+/// A keyer memory, sent with its button or function key.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 struct Macro {
     label: String,
     text: String,
+    /// Send again this many seconds after it ends, until stopped (0: once).
+    repeat_s: f32,
+}
+
+const MAX_MEMORIES: usize = 12;
+const F_KEYS: [egui::Key; MAX_MEMORIES] = [
+    egui::Key::F1,
+    egui::Key::F2,
+    egui::Key::F3,
+    egui::Key::F4,
+    egui::Key::F5,
+    egui::Key::F6,
+    egui::Key::F7,
+    egui::Key::F8,
+    egui::Key::F9,
+    egui::Key::F10,
+    egui::Key::F11,
+    egui::Key::F12,
+];
+
+/// A memory being repeated (auto-CQ).
+struct Repeat {
+    memory: usize,
+    /// When the keyer last fell idle.
+    idle_since: Option<Instant>,
 }
 
 fn default_macros() -> Vec<Macro> {
@@ -86,7 +114,7 @@ fn default_macros() -> Vec<Macro> {
         ("TU", "TU"),
     ]
     .into_iter()
-    .map(|(l, t)| Macro { label: l.into(), text: t.into() })
+    .map(|(l, t)| Macro { label: l.into(), text: t.into(), repeat_s: 0.0 })
     .collect()
 }
 
@@ -122,6 +150,7 @@ impl Default for Settings {
             keyer: KeyerConfig::default(),
             key_timing: KeyTiming::default(),
             macros: default_macros(),
+            repeat_stop_on_answer: true,
             tx_live: false,
         }
     }
@@ -207,6 +236,8 @@ struct App {
     tx_call: String,
     tx_msg: String,
     last_info_call: Option<String>,
+    tx_repeat: Option<Repeat>,
+    show_memories: bool,
 }
 
 /// The conversation on the operator's own frequency: everything decoded
@@ -378,6 +409,8 @@ impl App {
             tx_call: String::new(),
             tx_msg: String::new(),
             last_info_call: None,
+            tx_repeat: None,
+            show_memories: false,
             s,
         };
         app.load_cty();
@@ -830,6 +863,11 @@ impl App {
     fn qso_feed(&mut self, audio: f32, text: &str) {
         if (audio - self.pitch()).abs() > 75.0 {
             return;
+        }
+        // Someone answered a repeating CQ (text between our calls).
+        if self.s.repeat_stop_on_answer && self.tx_repeat.as_ref().is_some_and(|r| r.idle_since.is_some()) && !text.trim().is_empty() {
+            self.tx_repeat = None;
+            self.tx_msg = "Repeat stopped: a station is sending on your frequency".into();
         }
         let rf = self.rf_of(audio);
         self.qso_open(rf);
@@ -1490,20 +1528,70 @@ impl App {
                 .small()
                 .weak(),
         );
-        egui::CollapsingHeader::new("Messages (F1–F8)").id_salt("tx_macros").show(ui, |ui| {
-            ui.label(RichText::new("{MYCALL} is your call, {CALL} the Call box (clicking a callsign fills it). Prosigns: <AR> <SK> <BT> <KN> <BK>.").small().weak());
-            egui::Grid::new("macros").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
-                for (i, m) in self.s.macros.iter_mut().enumerate() {
-                    ui.label(format!("F{}", i + 1));
-                    ui.add(egui::TextEdit::singleline(&mut m.label).desired_width(56.0).hint_text("label"));
-                    ui.add(egui::TextEdit::singleline(&mut m.text).desired_width(220.0));
-                    ui.end_row();
-                }
+        if ui.button("Edit keyer memories…").on_hover_text("The messages on F1–F12 (also: right-click a memory button in the transmit panel)").clicked() {
+            self.show_memories = true;
+        }
+    }
+
+    /// The memory keyer editor.
+    fn ui_memories(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_memories;
+        egui::Window::new("Keyer memories").id(egui::Id::new("keyer_memories")).open(&mut open).resizable(false).default_width(700.0).show(ctx, |ui| {
+            ui.label(
+                RichText::new("Press the function key or click the button to send. {MYCALL} is your call, {CALL} the Call box (clicking a callsign fills it). Prosigns: <AR> <SK> <BT> <KN> <BK>. A repeat time sends the memory again that many seconds after it ends, until Esc, Stop, typing or another message — for calling CQ.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            let mut remove = None;
+            let mut swap = None;
+            let n = self.s.macros.len();
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new("Label").strong()));
+                ui.add_sized([400.0, 18.0], egui::Label::new(RichText::new("Text").strong()));
+                ui.strong("Repeat (s)").on_hover_text("0 = send once");
             });
-            if ui.button("Restore defaults").clicked() {
-                self.s.macros = default_macros();
+            for (i, m) in self.s.macros.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([20.0, 20.0], egui::Label::new(format!("F{}", i + 1)));
+                    ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(&mut m.label).hint_text("label"));
+                    if ui.add_sized([400.0, 20.0], egui::TextEdit::singleline(&mut m.text).font(egui::TextStyle::Monospace)).changed() {
+                        m.text = m.text.to_uppercase();
+                    }
+                    ui.add_sized([60.0, 20.0], egui::DragValue::new(&mut m.repeat_s).range(0.0..=120.0).speed(0.2).fixed_decimals(0));
+                    if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("Move up").clicked() {
+                        swap = Some((i - 1, i));
+                    }
+                    if ui.add_enabled(i + 1 < n, egui::Button::new("⏷").small()).on_hover_text("Move down").clicked() {
+                        swap = Some((i, i + 1));
+                    }
+                    if ui.small_button("✖").on_hover_text("Delete this memory").clicked() {
+                        remove = Some(i);
+                    }
+                });
             }
+            if let Some((a, b)) = swap {
+                self.s.macros.swap(a, b);
+                self.tx_repeat = None;
+            }
+            if let Some(i) = remove {
+                self.s.macros.remove(i);
+                self.tx_repeat = None;
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.s.macros.len() < MAX_MEMORIES, egui::Button::new("Add")).clicked() {
+                    self.s.macros.push(Macro::default());
+                }
+                if ui.button("Restore defaults").on_hover_text("Replace these memories with the built-in ones").clicked() {
+                    self.s.macros = default_macros();
+                    self.tx_repeat = None;
+                }
+                ui.checkbox(&mut self.s.repeat_stop_on_answer, "Stop repeating when someone answers")
+                    .on_hover_text("Stop a repeating memory when text is decoded on your frequency between calls");
+            });
         });
+        self.show_memories = open;
     }
 
     /// Starts, restarts (after a configuration change, once idle) or stops
@@ -1525,13 +1613,70 @@ impl App {
         self.keyer = Some(Keyer::start(self.s.keyer.clone(), self.s.key_timing.clone()));
     }
 
-    /// Expands {MYCALL} and {CALL} and queues the text.
+    /// Sends text typed or chosen by the operator (stops a repeating memory).
     fn tx_send(&mut self, text: &str) {
-        let Some(k) = &self.keyer else { return };
+        self.tx_repeat = None;
+        self.tx_queue(text);
+    }
+
+    /// Sends a keyer memory; one with a repeat time starts repeating.
+    fn tx_memory(&mut self, i: usize) {
+        let Some(m) = self.s.macros.get(i).cloned() else { return };
+        if m.text.trim().is_empty() {
+            return;
+        }
+        // The same memory again while it repeats: carry on repeating.
+        let keep = self.tx_repeat.as_ref().is_some_and(|r| r.memory == i);
+        self.tx_repeat = None;
+        if self.tx_queue(&format!("{} ", m.text)) && (m.repeat_s > 0.0 || keep) {
+            self.tx_repeat = Some(Repeat { memory: i, idle_since: None });
+        }
+    }
+
+    /// Re-sends the repeating memory once the keyer has been idle for its
+    /// repeat time.
+    fn tx_repeat_tick(&mut self) {
+        let Some(r) = &mut self.tx_repeat else { return };
+        let st = self.keyer.as_ref().map(|k| k.snapshot());
+        let Some(st) = st else {
+            self.tx_repeat = None;
+            return;
+        };
+        if st.error.is_some() {
+            self.tx_repeat = None;
+            return;
+        }
+        if st.busy() {
+            r.idle_since = None;
+            return;
+        }
+        let since = *r.idle_since.get_or_insert_with(Instant::now);
+        let i = r.memory;
+        let Some(m) = self.s.macros.get(i).cloned() else {
+            self.tx_repeat = None;
+            return;
+        };
+        if m.repeat_s <= 0.0 || m.text.trim().is_empty() {
+            self.tx_repeat = None;
+        } else if since.elapsed().as_secs_f32() >= m.repeat_s {
+            if self.tx_queue(&format!("{} ", m.text)) {
+                if let Some(r) = &mut self.tx_repeat {
+                    r.idle_since = None;
+                }
+            } else {
+                self.tx_repeat = None;
+            }
+        }
+    }
+
+    /// Expands {MYCALL} and {CALL} and queues the text. False if it could
+    /// not be sent (the reason is in `tx_msg`).
+    fn tx_queue(&mut self, text: &str) -> bool {
+        let Some(k) = &self.keyer else { return false };
         let port = self.s.keyer.port.trim();
         if !port.is_empty() && self.rig.is_some() && self.s.rig.kind != RigKind::Hamlib && port == self.s.rig.port.trim() {
             self.tx_msg = format!("{port} is the CAT port: choose the radio's keying port in Settings > Transmit");
-            return;
+            return false;
         }
         let mut t = text.to_uppercase();
         for (key, val, missing) in [
@@ -1541,16 +1686,18 @@ impl App {
             if t.contains(key) {
                 if val.is_empty() {
                     self.tx_msg = missing.into();
-                    return;
+                    return false;
                 }
                 t = t.replace(key, &val.to_uppercase());
             }
         }
         self.tx_msg.clear();
         k.send(&t);
+        true
     }
 
     fn tx_abort(&mut self) {
+        self.tx_repeat = None;
         if let Some(k) = &self.keyer {
             k.abort();
         }
@@ -1561,13 +1708,9 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.tx_abort();
         }
-        const F: [egui::Key; 8] = [egui::Key::F1, egui::Key::F2, egui::Key::F3, egui::Key::F4, egui::Key::F5, egui::Key::F6, egui::Key::F7, egui::Key::F8];
-        for (i, key) in F.iter().enumerate() {
+        for (i, key) in F_KEYS.iter().enumerate() {
             if ctx.input(|inp| inp.key_pressed(*key)) {
-                if let Some(m) = self.s.macros.get(i) {
-                    let text = format!("{} ", m.text);
-                    self.tx_send(&text);
-                }
+                self.tx_memory(i);
             }
         }
     }
@@ -1588,17 +1731,27 @@ impl App {
             if ui.add(egui::TextEdit::singleline(&mut self.tx_call).desired_width(80.0).hint_text("their call")).changed() {
                 self.tx_call = self.tx_call.trim().to_uppercase();
             }
-            let mut send: Option<String> = None;
-            for (i, m) in self.s.macros.iter().enumerate() {
+            let mut send: Option<usize> = None;
+            let repeating = self.tx_repeat.as_ref().map(|r| r.memory);
+            for (i, m) in self.s.macros.iter().enumerate().take(MAX_MEMORIES) {
                 if m.label.trim().is_empty() && m.text.trim().is_empty() {
                     continue;
                 }
-                if ui.button(format!("F{} {}", i + 1, m.label)).on_hover_text(&m.text).clicked() {
-                    send = Some(format!("{} ", m.text));
+                let label = format!("F{} {}{}", i + 1, m.label, if m.repeat_s > 0.0 { " ⟳" } else { "" });
+                let hover = if m.repeat_s > 0.0 { format!("{}\n\nRepeats every {:.0} s until stopped (Esc)", m.text, m.repeat_s) } else { m.text.clone() };
+                let r = ui.add(egui::Button::new(label).selected(repeating == Some(i))).on_hover_text(format!("{hover}\nRight-click to edit"));
+                if r.clicked() {
+                    send = Some(i);
+                }
+                if r.secondary_clicked() {
+                    self.show_memories = true;
                 }
             }
-            if let Some(t) = send {
-                self.tx_send(&t);
+            if ui.small_button("✏").on_hover_text("Edit the keyer memories").clicked() {
+                self.show_memories = true;
+            }
+            if let Some(i) = send {
+                self.tx_memory(i);
             }
             ui.separator();
             ui.label("WPM");
@@ -1617,6 +1770,8 @@ impl App {
             let w = (ui.available_width() - 210.0).max(120.0);
             let r = ui.add(egui::TextEdit::singleline(&mut self.tx_text).desired_width(w).font(egui::TextStyle::Monospace).hint_text(hint));
             if r.changed() {
+                // Typing takes over from a repeating memory.
+                self.tx_repeat = None;
                 self.tx_text = self.tx_text.to_uppercase();
                 if self.s.tx_live {
                     self.tx_live_update();
@@ -1657,6 +1812,11 @@ impl App {
             }
             if let Some(e) = &st.error {
                 ui.label(RichText::new(e).color(Color32::LIGHT_RED));
+            } else if let Some(m) = self.tx_repeat.as_ref().and_then(|r| self.s.macros.get(r.memory).map(|m| (r, m))) {
+                let (r, m) = m;
+                let left = r.idle_since.map(|t| (m.repeat_s - t.elapsed().as_secs_f32()).max(0.0));
+                let when = left.map(|l| format!(", again in {l:.0} s")).unwrap_or_default();
+                ui.label(RichText::new(format!("Repeating F{} {}{when} — Esc stops", r.memory + 1, m.label)).color(Color32::from_rgb(255, 200, 80)));
             } else if !self.tx_msg.is_empty() {
                 ui.label(RichText::new(&self.tx_msg).color(Color32::LIGHT_RED));
             } else if test {
@@ -2425,6 +2585,9 @@ impl eframe::App for App {
         }
         if self.s.tx_enabled {
             self.tx_keys(ctx);
+            self.tx_repeat_tick();
+        } else {
+            self.tx_repeat = None;
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -2466,6 +2629,9 @@ impl eframe::App for App {
             self.ui_channels(ui);
         });
         self.ui_call_info(ctx);
+        if self.s.tx_enabled && self.show_memories {
+            self.ui_memories(ctx);
+        }
         // A clicked callsign goes into the transmit Call box.
         if self.info_call != self.last_info_call {
             if let (Some(c), true) = (&self.info_call, self.s.tx_enabled) {

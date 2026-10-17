@@ -110,14 +110,20 @@ tested on Linux so far.
 Most people only listen, so transmitting is off and out of sight by
 default. To send CW from the keyboard, tick **⚙ Settings → Transmit → Show
 the transmit panel**. A panel appears under the decoded text with a text
-box, a **Call** box and eight message buttons (F1–F8).
+box, a **Call** box and the memory keyer buttons (F1–F12).
 
 - Type a line and press **Enter** to send it, or tick **Send as I type** to
   send each letter as you type it (Backspace takes back letters not yet
   sent). **Esc** or **■ Stop** stops at once.
-- Messages can use `{MYCALL}` (your call, set in Settings) and `{CALL}` (the
-  Call box; clicking any callsign fills it). Prosigns: `<AR>` `<SK>` `<BT>`
-  `<KN>` `<BK>` (or `+` for AR, `=` for BT).
+- **Memory keyer:** up to 12 memories for CQ, reports, 73 and the like,
+  sent with their button or function key. Right-click a button (or ✏) to
+  edit, add, delete or reorder them. Give a memory a **repeat** time to
+  call CQ automatically: it is sent again that many seconds after it ends,
+  until Esc, Stop, typing, another message, or (optionally) a station
+  answering on your frequency.
+- Memories and typed text can use `{MYCALL}` (your call, set in Settings)
+  and `{CALL}` (the Call box; clicking any callsign fills it). Prosigns:
+  `<AR>` `<SK>` `<BT>` `<KN>` `<BK>` (or `+` for AR, `=` for BT).
 - Timing is made by the program, so all of it is adjustable: speed (also in
   the panel), weight, dah length, letter and word gaps (Farnsworth spacing)
   and key compensation. The defaults are standard Morse at 20 WPM.
