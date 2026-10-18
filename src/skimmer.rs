@@ -824,6 +824,7 @@ impl Skimmer {
         // keeps its narrow demodulator until no channel is within
         // `CROWDED_HZ` of it any more.
         let freqs: Vec<f32> = self.channels.iter().map(|c| c.demod.freq as f32).collect();
+        let levels: Vec<f32> = self.channels.iter().map(|c| c.level_db).collect();
         for (i, ch) in self.channels.iter_mut().enumerate() {
             if ch.crowd_pair && !freqs.iter().enumerate().any(|(j, f)| j != i && (f - freqs[i]).abs() < CROWDED_HZ) {
                 ch.crowd_pair = false;
@@ -834,6 +835,9 @@ impl Skimmer {
             }
             ch.frames.clear();
             ch.demod.process(samples, &mut ch.frames);
+            // The wide frames carry everything in the 100 Hz demodulator:
+            // beside a stronger station they show its keying, not ours.
+            let wide_ok = ch.qualified && !freqs.iter().zip(&levels).enumerate().any(|(j, (f, l))| j != i && (f - freqs[i]).abs() < 80.0 && *l > ch.level_db - 3.0);
             ch.decoder.set_erasure((self.burst && (5..60).contains(&self.burst_hops)) || all_muted);
             for i in 0..ch.frames.len() {
                 let raw = ch.frames[i];
@@ -841,7 +845,9 @@ impl Skimmer {
                     Some((li, lq, _)) => Complex32::new(li.process(raw.re), lq.process(raw.im)),
                     None => raw,
                 };
-                ch.decoder.push_frame(z.norm());
+                // The wide frames sharpen timing, so only for a shown channel:
+                // a junk channel beside a strong signal would read as Morse.
+                ch.decoder.push_frame_wide(z.norm(), if wide_ok { raw.norm() } else { f32::NAN });
                 if let Some(f) = &mut ch.start_frames {
                     f.push(raw);
                     // Keep the start only until the channel is shown, and

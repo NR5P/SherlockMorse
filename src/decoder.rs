@@ -102,6 +102,19 @@ pub struct DecoderParams {
     pub vit_lag: f32,
     /// Apply the squelch to the Viterbi search once the speed is known.
     pub vit_squelch: f32,
+    /// Re-measure each mark's edges on the wide (pre-filter) envelope when
+    /// it stands this many times above its own noise (0 = off): the narrow
+    /// speed-matched filter that finds marks also smears them (a bug's
+    /// 45 ms dits read 75-120 ms). Experimental: at 3 the echo-filled 40 m
+    /// W1AW copy improved 33 -> 30% CER, but on another night recording
+    /// W1AW's skirt channels then read as fast junk calls (8 instead of 1).
+    pub wide_edges: f32,
+    /// ... only on a signal whose short gaps an echo fills this often (the
+    /// `fill` share): elsewhere the narrow filter's timing reads as well.
+    pub wide_fill: f32,
+    /// Mean log-likelihood gain per gap after a dash needed to model those
+    /// gaps apart from the other element gaps (a bug's).
+    pub dgap_gain: f32,
 }
 
 /// Post-filter floor for a strong signal (Hz; passes 40 WPM). A channel
@@ -166,6 +179,9 @@ impl DecoderParams {
                     "vit_cap" => p.vit_cap = v,
                     "vit_lag" => p.vit_lag = v,
                     "vit_squelch" => p.vit_squelch = v,
+                    "wide_edges" => p.wide_edges = v,
+                    "wide_fill" => p.wide_fill = v,
+                    "dgap_gain" => p.dgap_gain = v,
 
                     _ => eprintln!("unknown param {k}"),
                 }
@@ -207,6 +223,9 @@ impl Default for DecoderParams {
             vit_cap: 10.0,
             vit_lag: 4.0,
             vit_squelch: 1.0,
+            wide_edges: 0.0,
+            wide_fill: 0.06,
+            dgap_gain: 0.03,
 
         }
     }
@@ -218,6 +237,10 @@ pub struct TimingModel {
     pub dot: f32,
     pub dash: f32,
     pub egap: f32,
+    /// Gap after a dash inside a character: a bug's dashes and the gaps
+    /// after them are hand-timed (KB1FGC: 45 ms after a dit, 100-130 ms
+    /// after a dash), a keyer's equal `egap`.
+    pub dgap: f32,
     pub cgap: f32,
     /// This sender's word gap relative to the nominal one (7/3 of the
     /// character gap), learned from the gaps read as word gaps. Hand
@@ -227,7 +250,7 @@ pub struct TimingModel {
 
 impl TimingModel {
     fn from_dot(dot: f32) -> Self {
-        Self { dot, dash: 3.0 * dot, egap: dot, cgap: 3.0 * dot, wscale: 1.0 }
+        Self { dot, dash: 3.0 * dot, egap: dot, dgap: dot, cgap: 3.0 * dot, wscale: 1.0 }
     }
     pub fn wgap(&self) -> f32 {
         // Word gaps scale with character gaps (keeps Farnsworth consistent).
@@ -297,6 +320,10 @@ pub struct BeamDecoder {
     /// Smoothed fraction of runs that fit Morse timing (0..1).
     pub fit: f32,
     pub fit_n: u32,
+    /// The last mark was read as a dash (for `adapt`).
+    last_dash: bool,
+    /// Smoothed gain of modelling the gaps after dashes apart (`dgap_active`).
+    dg_gain: f32,
 }
 
 impl BeamDecoder {
@@ -313,6 +340,8 @@ impl BeamDecoder {
             cword: Vec::new(),
             fit: 0.6,
             fit_n: 0,
+            last_dash: false,
+            dg_gain: 0.0,
         }
     }
 
@@ -344,10 +373,37 @@ impl BeamDecoder {
 
     /// Returns log-likelihoods for (element gap, character gap, word gap).
     fn space_options(&self, sp: f32) -> [f32; 3] {
+        self.space_options_after(sp, false)
+    }
+
+    /// A separate gap after dashes only for a sender who clearly keys one
+    /// (a bug) on clean timing: on noise it lets junk read as letters.
+    /// It must explain this sender's gaps after dashes clearly better than
+    /// the common element gap (`dg_gain`, mean log-likelihood gain per such
+    /// gap): learned from the gaps, it fits noise a little better too.
+    fn dgap_active(&self) -> bool {
+        self.timing.dgap > 1.3 * self.timing.egap && self.dg_gain > self.params.dgap_gain
+    }
+
+    /// Best log-likelihood of a space over (element, character, word gap)
+    /// with the element gap centred at `eg`.
+    fn space_best(&self, sp: f32, eg: f32) -> f32 {
         let t = &self.timing;
         let s = self.params.sigma_space;
         let wg = t.wgap();
-        let e = lognorm(sp, t.egap, s) + (0.55f32).ln();
+        let e = lognorm(sp, eg, s) + (0.55f32).ln();
+        let c = lognorm(sp, t.cgap, s) + (0.33f32).ln();
+        let w = if sp >= wg { -s.ln() } else { lognorm(sp, wg, s) } + (0.12f32).ln();
+        e.max(c).max(w)
+    }
+
+    /// `space_options` for a space following a dash (`after_dash`) or a dot.
+    fn space_options_after(&self, sp: f32, after_dash: bool) -> [f32; 3] {
+        let t = &self.timing;
+        let s = self.params.sigma_space;
+        let wg = t.wgap();
+        let dg = if after_dash && self.dgap_active() { t.dgap } else { t.egap };
+        let e = lognorm(sp, dg, s) + (0.55f32).ln();
         let c = lognorm(sp, t.cgap, s) + (0.33f32).ln();
         let w = if sp >= wg { -s.ln() } else { lognorm(sp, wg, s) } + (0.12f32).ln();
         [e, c, w]
@@ -574,7 +630,7 @@ impl BeamDecoder {
             Run::Mark(m) => {
                 for h in &self.hyps {
                     if h.pend_space > 0.0 {
-                        let opts = self.space_options(h.pend_space);
+                        let opts = self.space_options_after(h.pend_space, h.len > 0 && h.bits & 1 == 1);
                         for (k, &ll) in opts.iter().enumerate() {
                             let mut n = h.clone();
                             n.score += ll;
@@ -778,7 +834,7 @@ impl BeamDecoder {
         let ll = match run {
             Run::Mark(m) => Some(self.mark_options(m).iter().map(|o| o.1).fold(f32::MIN, f32::max) + self.params.sigma_mark.ln()),
             Run::Space(sp) if sp < self.timing.wgap() * 2.0 => {
-                let o = self.space_options(sp);
+                let o = self.space_options_after(sp, self.last_dash);
                 Some(o[0].max(o[1] - (0.33f32 / 0.55).ln()).max(o[2] - (0.12f32 / 0.55).ln()) - (0.55f32).ln() + self.params.sigma_space.ln())
             }
             _ => None,
@@ -789,11 +845,18 @@ impl BeamDecoder {
             self.fit += 0.05 * (hit - self.fit);
             self.fit_n += 1;
         }
+        if let Run::Space(sp) = run {
+            if self.last_dash && sp < self.timing.cgap {
+                let d = self.space_best(sp, self.timing.dgap) - self.space_best(sp, self.timing.egap);
+                self.dg_gain += 0.05 * (d - self.dg_gain);
+            }
+        }
         let a = 0.08;
         match run {
             Run::Mark(m) => {
                 let opts = self.mark_options(m);
                 let t = &mut self.timing;
+                self.last_dash = opts[1].1 > opts[0].1;
                 if opts[1].1 > opts[0].1 {
                     if m < t.dot * 6.0 {
                         t.dash += a * (m - t.dash);
@@ -806,17 +869,26 @@ impl BeamDecoder {
                 t.dash = t.dash.clamp(t.dot * 2.0, t.dot * 5.0);
             }
             Run::Space(s) => {
-                let o = self.space_options(s);
+                let o = self.space_options_after(s, self.last_dash);
+                let split = self.dgap_active();
                 let t = &mut self.timing;
                 if o[0] >= o[1] && o[0] >= o[2] {
                     if s > t.dot * 0.4 {
-                        t.egap += a * (s - t.egap);
+                        // The element gap keeps learning from every gap
+                        // unless the gaps after dashes are modelled apart.
+                        if self.last_dash {
+                            t.dgap += a * (s - t.dgap);
+                        }
+                        if !self.last_dash || !split {
+                            t.egap += a * (s - t.egap);
+                        }
                     }
                 } else if o[1] >= o[2] {
                     t.cgap += a * (s - t.cgap);
                 }
                 t.egap = t.egap.clamp(t.dot * 0.5, t.dot * 2.0);
                 t.cgap = t.cgap.clamp(t.dot * 2.0, t.dot * 25.0);
+                t.dgap = t.dgap.clamp(t.dot * 0.5, (t.dot * 3.0).min(0.7 * t.cgap).max(t.dot * 0.5));
             }
             Run::Flush => {}
         }
@@ -991,6 +1063,19 @@ pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     if let Some(v) = early_cgap(&mut long, tm.dot) {
         tm.cgap = v.clamp(tm.dot * 2.0, tm.dot * 25.0);
     }
+    // Gaps right after dashes, short of a character gap.
+    let dmax = (3.0 * tm.dot).min(0.7 * tm.cgap);
+    let mut dg: Vec<f32> = runs
+        .windows(2)
+        .filter_map(|w| match (w[0], w[1]) {
+            (Run::Mark(m), Run::Space(s)) if m >= 2.0 * tm.dot && s >= 0.5 * tm.dot && s < dmax => Some(s),
+            _ => None,
+        })
+        .collect();
+    tm.dgap = match median(&mut dg) {
+        Some(v) if dg.len() >= 3 => v.clamp(tm.dot * 0.5, dmax.max(tm.dot * 0.5)),
+        _ => tm.egap,
+    };
     Some(tm)
 }
 
@@ -1238,6 +1323,19 @@ pub struct CwDecoder {
     /// samples per second the frames carry.
     bw: f32,
     vit_out: Vec<(bool, f32)>,
+    /// Wide envelope frames (NaN where not given) and its noise floor
+    /// (minimum statistics like `noise_q`), for `wide_edges`.
+    wide: std::collections::VecDeque<f32>,
+    wide_block: Vec<f32>,
+    wide_p25: std::collections::VecDeque<f32>,
+    wide_noise: f32,
+    /// Frames sliced so far, and the first frame of the current mark.
+    fidx: u64,
+    mark_start: u64,
+    /// The space before the current mark, held until the mark's edges are
+    /// known; and the shift owed to the space after the last mark (ms).
+    pend_space: Option<(f32, Option<Vec<f32>>)>,
+    carry_ms: f32,
 }
 
 impl CwDecoder {
@@ -1287,6 +1385,14 @@ impl CwDecoder {
             vfsm: 0,
             bw: 100.0,
             vit_out: Vec::new(),
+            wide: Default::default(),
+            wide_block: Vec::with_capacity(100),
+            wide_p25: Default::default(),
+            wide_noise: 0.0,
+            fidx: 0,
+            mark_start: 0,
+            pend_space: None,
+            carry_ms: 0.0,
         }
     }
 
@@ -1495,6 +1601,14 @@ impl CwDecoder {
 
     /// Feeds one envelope amplitude frame.
     pub fn push_frame(&mut self, x: f32) {
+        self.push_frame_wide(x, f32::NAN);
+    }
+
+    /// `push_frame` with the same frame's wide (pre-filter) envelope.
+    pub fn push_frame_wide(&mut self, x: f32, w: f32) {
+        if self.params.wide_edges > 0.0 {
+            self.track_wide(w);
+        }
         let x = x.max(1e-12);
         let vit = self.params.viterbi > 0.0;
         if self.erasure {
@@ -1684,12 +1798,96 @@ impl CwDecoder {
         ((frac * dot / self.frame_ms).round() as u32).clamp(1, 20)
     }
 
+    /// Noise floor of the wide envelope, by minimum statistics as in
+    /// `track_levels`.
+    fn track_wide(&mut self, w: f32) {
+        if self.wide.len() >= 4096 {
+            self.wide.pop_front();
+        }
+        self.wide.push_back(w);
+        if !w.is_finite() {
+            return;
+        }
+        self.wide_block.push(w);
+        if self.wide_block.len() >= 100 {
+            let mut b = std::mem::take(&mut self.wide_block);
+            b.sort_by(|a, c| a.total_cmp(c));
+            self.wide_p25.push_back(b[b.len() / 4]);
+            if self.wide_p25.len() > 8 {
+                self.wide_p25.pop_front();
+            }
+            self.wide_noise = self.wide_p25.iter().copied().fold(f32::MAX, f32::min);
+            b.clear();
+            self.wide_block = b;
+        }
+    }
+
+    /// Where the mark the narrow slicer found in frames `start..end` begins
+    /// and ends on the wide envelope: (start shift, end shift) in ms, 0 when
+    /// the wide envelope is not clearly out of its noise there. The narrow
+    /// filter delays the mark by its group delay (4th-order low-pass,
+    /// ~0.42 / cut-off) and stretches it at both ends.
+    fn wide_shift(&self, start: u64, end: u64) -> (f32, f32) {
+        let fm = self.frame_ms;
+        let n = self.wide.len() as u64;
+        // `wide` holds frames fidx-n+1 ..= fidx (wide pushed before slicing).
+        let first = self.fidx + 1 - n.min(self.fidx + 1);
+        let dot = self.beam.as_ref().map(|b| b.timing.dot).unwrap_or(0.0);
+        if dot <= 0.0 || self.wide_noise <= 0.0 || end <= start || start < first + 64 || self.fill < self.params.wide_fill || self.snr_db() < ECHO_MIN_SNR_DB {
+            return (0.0, 0.0);
+        }
+        let delay = ((0.42 / (self.bw / 2.0)) * 1000.0 / fm).round() as u64;
+        let at = |i: u64| self.wide[(i - first) as usize];
+        let (s, e) = (start.saturating_sub(delay), end.saturating_sub(delay));
+        if s < first || e > self.fidx + 1 {
+            return (0.0, 0.0);
+        }
+        // Mark level: median over the middle half of the delayed window.
+        let q = (e - s) / 4;
+        let mut mid: Vec<f32> = (s + q..e - q).map(at).filter(|v| v.is_finite()).collect();
+        if mid.len() < 2 {
+            return (0.0, 0.0);
+        }
+        mid.sort_by(|a, b| a.total_cmp(b));
+        let level = mid[mid.len() / 2];
+        let nm = self.wide_noise * 1.65;
+        if level < self.params.wide_edges * nm {
+            return (0.0, 0.0);
+        }
+        let thr = nm + 0.5 * (level - nm);
+        // The first and last sustained crossing (k frames above the
+        // threshold) within the delayed window widened by under half a dot:
+        // dips inside the mark (fades, echoes) do not matter, and the
+        // neighbouring elements (a dot's gap away) stay out of reach.
+        let reach = (0.4 * dot / fm).round() as u64;
+        let lo = s.saturating_sub(reach).max(first);
+        let hi = (e + reach).min(self.fidx + 1);
+        let k = ((0.25 * dot / fm).round() as u64).max(2);
+        let above = |i: u64| (i..i + k).all(|j| j < hi && at(j) > thr);
+        let Some(a) = (lo..hi).find(|&i| above(i)) else { return (0.0, 0.0) };
+        let Some(b) = (lo..hi).rev().find(|&i| i + 1 >= k && i + 1 - k >= lo && above(i + 1 - k)).map(|i| i + 1) else {
+            return (0.0, 0.0);
+        };
+        if b <= a {
+            return (0.0, 0.0);
+        }
+        // Mostly re-timing: keep what the narrow slicer saw roughly intact.
+        let (old, new) = ((end - start) as f32, (b - a) as f32);
+        if new < 0.3 * old || new > 1.6 * old + 2.0 {
+            return (0.0, 0.0);
+        }
+        // Shifts relative to the delayed window: every mark is delayed
+        // alike, so the runs' lengths come out right.
+        ((a as f32 - s as f32) * fm, (b as f32 - e as f32) * fm)
+    }
+
     fn slice(&mut self, want: bool, ev: f32) {
         let c = self.confirm_frames();
         self.slice_n(want, ev, c);
     }
 
     fn slice_n(&mut self, want: bool, ev: f32, confirm: u32) {
+        self.fidx += 1;
         self.run_z.push(ev);
         // A silence after a flush is never reported: keep only what a
         // pending transition could need.
@@ -1729,11 +1927,33 @@ impl CwDecoder {
             self.state = want;
             self.run_frames = self.cand;
             self.cand = 0;
+            // Only while wide frames come in (a shown channel): holding the
+            // space back changes when the others see the runs.
+            let refine = self.params.wide_edges > 0.0 && self.params.viterbi <= 0.0 && self.wide.back().is_some_and(|w| w.is_finite());
             if was_mark {
                 self.total_marks += 1;
-                self.on_run(Run::Mark(dur), Some(prof));
-            } else if !self.flushed {
-                self.on_run(Run::Space(dur), Some(prof));
+                if let Some((sp, sprof)) = self.pend_space.take() {
+                    let end = self.fidx + 1 - u64::from(self.run_frames);
+                    let (a, b) = if refine { self.wide_shift(self.mark_start, end) } else { (0.0, 0.0) };
+                    self.on_run(Run::Space((sp + a).max(self.frame_ms)), sprof);
+                    self.on_run(Run::Mark((dur - a + b).max(self.frame_ms)), Some(prof));
+                    self.carry_ms = -b;
+                } else {
+                    self.on_run(Run::Mark(dur), Some(prof));
+                }
+            } else {
+                if refine {
+                    self.mark_start = self.fidx + 1 - u64::from(self.run_frames);
+                }
+                if !self.flushed {
+                    let d = (dur + std::mem::take(&mut self.carry_ms)).max(self.frame_ms);
+                    if refine {
+                        self.pend_space = Some((d, Some(prof)));
+                    } else {
+                        self.on_run(Run::Space(d), Some(prof));
+                    }
+                }
+                self.carry_ms = 0.0;
             }
             self.flushed = false;
         } else if !self.state && !self.flushed {
@@ -1753,6 +1973,7 @@ impl CwDecoder {
             let dur = self.run_frames as f32 * self.frame_ms;
             if dur > (wg * 1.6).max(typical * 1.6).max(250.0) {
                 self.run_z.clear();
+                let dur = (dur + std::mem::take(&mut self.carry_ms)).max(self.frame_ms);
                 self.on_run(Run::Space(dur), None);
                 self.on_run(Run::Flush, None);
                 self.flushed = true;

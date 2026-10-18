@@ -6,6 +6,7 @@ recordings in `testdata/` (not in git: off-air audio and ARRL files).
 | Script | What it measures |
 |---|---|
 | `regress.sh` | Everything below plus `cwtool bench`, the ARRL files and the live recordings. Run for any decoder change. |
+| `cwtool fists` | Not a script: synthetic sending styles of different people (keyers of all weights, straight keys, bugs, sideswiper, Farnsworth, run-together words) at +6 and −6 dB, CER per fist. Part of `regress.sh`. |
 | `weakbench.sh` | ARRL practice files faded into real 40 m band noise (`cwtool weak`), CER at −4/−8/−11 dB. |
 | `w1aw80.sh` | W1AW received on 80 m at night, against the bulletin's published text. |
 | `semicer.py` | CER of decoded lines against the best-matching stretch of a reference text. |

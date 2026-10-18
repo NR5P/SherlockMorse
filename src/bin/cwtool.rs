@@ -82,6 +82,16 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
+    /// Score different sending styles (keyer, straight key, bug, sideswiper,
+    /// odd spacing) at a good and a poor signal: CER per fist
+    Fists {
+        /// Trials per fist and signal level.
+        #[arg(long, default_value_t = 8)]
+        trials: u64,
+        /// Only fists whose name contains this.
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// Render a waterfall PNG of an audio file (for inspecting recordings).
     Waterfall {
         file: PathBuf,
@@ -340,6 +350,7 @@ fn main() -> Result<()> {
             println!("wrote {} ({:.1} s)", out.display(), s.len() as f32 / scene.rate as f32);
         }
         Cmd::Bench { trials, compare_lm, only, verbose } => bench(trials, compare_lm, only, verbose),
+        Cmd::Fists { trials, only } => fists(trials, only),
         Cmd::Weak { signal, freq, noise, snr, reference, skip, duration, verbose, trials } => {
             let load = |p: &PathBuf, skip: f32, dur: Option<f32>| -> Result<Vec<f32>> {
                 let (x, rate) = cwskimmer::audiofile::read_audio(p)?;
@@ -978,6 +989,51 @@ fn run_scene(scene: &Scene, lm: Arc<LanguageModel>, verbose: bool) -> Vec<f32> {
             c
         })
         .collect()
+}
+
+/// Sending styles of different people ("fists"), each at a good and a poor
+/// signal: (name, spec builder). Hand senders differ in weighting, dash
+/// length, spacing and steadiness; a bug sends machine dits and hand dashes.
+fn fist_styles() -> Vec<(&'static str, fn(String, f32) -> SignalSpec)> {
+    vec![
+        ("keyer-20", |t, snr| SignalSpec { text: t, wpm: 20.0, snr_db: snr, ..Default::default() }),
+        ("keyer-32", |t, snr| SignalSpec { text: t, wpm: 32.0, snr_db: snr, ..Default::default() }),
+        ("keyer-heavy", |t, snr| SignalSpec { text: t, wpm: 24.0, snr_db: snr, weight: 1.35, ..Default::default() }),
+        ("keyer-light", |t, snr| SignalSpec { text: t, wpm: 24.0, snr_db: snr, weight: 0.7, ..Default::default() }),
+        ("straight-15", |t, snr| SignalSpec { text: t, wpm: 15.0, snr_db: snr, jitter: 0.15, dash_ratio: 3.4, ..Default::default() }),
+        ("straight-sloppy", |t, snr| SignalSpec { text: t, wpm: 14.0, snr_db: snr, jitter: 0.25, dash_ratio: 3.8, weight: 1.2, char_gap: 4.0, ..Default::default() }),
+        ("straight-slow", |t, snr| SignalSpec { text: t, wpm: 9.0, snr_db: snr, jitter: 0.18, dash_ratio: 3.6, char_gap: 4.5, word_gap: 10.0, ..Default::default() }),
+        ("bug-22", |t, snr| SignalSpec { text: t, wpm: 22.0, snr_db: snr, jitter: 0.04, dash_ratio: 4.5, dash_gap: 2.0, dash_jitter: 0.2, char_gap: 4.5, ..Default::default() }),
+        ("bug-heavy", |t, snr| SignalSpec { text: t, wpm: 25.0, snr_db: snr, jitter: 0.04, dash_ratio: 5.5, dash_gap: 2.5, dash_jitter: 0.25, char_gap: 5.0, word_gap: 9.0, ..Default::default() }),
+        ("sideswiper", |t, snr| SignalSpec { text: t, wpm: 18.0, snr_db: snr, jitter: 0.2, dash_ratio: 2.6, weight: 1.15, ..Default::default() }),
+        ("farnsworth", |t, snr| SignalSpec { text: t, wpm: 18.0, snr_db: snr, farnsworth_wpm: Some(10.0), ..Default::default() }),
+        ("run-together", |t, snr| SignalSpec { text: t, wpm: 20.0, snr_db: snr, jitter: 0.12, char_gap: 2.4, word_gap: 4.0, ..Default::default() }),
+    ]
+}
+
+fn fists(trials: u64, only: Option<String>) {
+    let lm = Arc::new(LanguageModel::new());
+    println!("{:<16} {:>8} {:>8}", "fist", "+6 dB", "-6 dB");
+    let (mut tot, mut n) = ([0.0f32; 2], 0);
+    for (name, make) in fist_styles() {
+        if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
+            continue;
+        }
+        let mut m = [0.0f32; 2];
+        for (k, snr) in [6.0f32, -6.0].into_iter().enumerate() {
+            let mut cers = Vec::new();
+            for t in 0..trials {
+                let scene = one(make(text(t + 1), snr), 1000 + t);
+                cers.extend(run_scene(&scene, lm.clone(), false));
+            }
+            m[k] = cers.iter().sum::<f32>() / cers.len().max(1) as f32;
+            tot[k] += m[k];
+        }
+        n += 1;
+        println!("{:<16} {:>7.1}% {:>7.1}%", name, m[0] * 100.0, m[1] * 100.0);
+    }
+    let n = n.max(1) as f32;
+    println!("{:<16} {:>7.1}% {:>7.1}%", "MEAN", tot[0] / n * 100.0, tot[1] / n * 100.0);
 }
 
 fn bench(trials: u64, compare_lm: bool, only: Option<String>, verbose: bool) {

@@ -25,6 +25,12 @@ pub struct SignalSpec {
     pub word_gap: f32,
     /// Mark weighting: >1 lengthens marks and shortens spaces.
     pub weight: f32,
+    /// Gap after a dash inside a character, in dots (1 nominal; a bug
+    /// sender's hand-timed dashes leave 2-3).
+    pub dash_gap: f32,
+    /// Extra log-normal jitter on dashes and the gaps after them only (a
+    /// bug: machine dits, hand dashes).
+    pub dash_jitter: f32,
     /// Farnsworth overall speed (stretches character/word gaps).
     pub farnsworth_wpm: Option<f32>,
     /// Relative speed change from start to end of the message.
@@ -56,6 +62,8 @@ impl Default for SignalSpec {
             char_gap: 3.0,
             word_gap: 7.0,
             weight: 1.0,
+            dash_gap: 1.0,
+            dash_jitter: 0.0,
             farnsworth_wpm: None,
             drift: 0.0,
             qsb_depth: 0.0,
@@ -98,6 +106,8 @@ pub fn timeline(spec: &SignalSpec, rng: &mut StdRng) -> Vec<(bool, f32)> {
     let mut out = Vec::new();
     let mut nchar = 0usize;
     let j = |rng: &mut StdRng| if spec.jitter > 0.0 { jit.sample(rng).exp() } else { 1.0 };
+    let djit = Normal::new(0.0f32, spec.dash_jitter.max(1e-6)).unwrap();
+    let jd = |rng: &mut StdRng| if spec.dash_jitter > 0.0 { djit.sample(rng).exp() } else { 1.0 };
     for (wi, w) in words.iter().enumerate() {
         for (ci, c) in w.bytes().enumerate() {
             let progress = nchar as f32 / total_chars as f32;
@@ -118,12 +128,16 @@ pub fn timeline(spec: &SignalSpec, rng: &mut StdRng) -> Vec<(bool, f32)> {
                 out.push((false, (spec.word_gap * gap_unit - wshift) * j(rng)));
             }
             let Some(pat) = pattern_for(c) else { continue };
+            let mut prev_dash = false;
             for (ei, e) in pat.bytes().enumerate() {
                 if ei > 0 {
-                    out.push((false, (dot - wshift).max(dot * 0.2) * j(rng)));
+                    let g = if prev_dash { spec.dash_gap * dot * jd(rng) } else { dot };
+                    out.push((false, (g - wshift).max(dot * 0.2) * j(rng)));
                 }
-                let len = if e == b'-' { spec.dash_ratio * dot } else { dot };
+                let dash = e == b'-';
+                let len = if dash { spec.dash_ratio * dot * jd(rng) } else { dot };
                 out.push((true, (len + wshift) * j(rng)));
+                prev_dash = dash;
             }
             nchar += 1;
         }
