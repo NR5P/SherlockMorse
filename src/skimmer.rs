@@ -1785,6 +1785,8 @@ impl Skimmer {
         let n = self.channels.len();
         let mut dead = vec![false; n];
         let mut why = vec![String::new(); n];
+        // Removed for keying against the strong signal (marks in its gaps).
+        let mut anti = vec![false; n];
         for (si, strong) in self.channels.iter().enumerate() {
             let len = strong.marks.len();
             if len < 500 || dead[si] {
@@ -1843,6 +1845,16 @@ impl Skimmer {
                 // even if it happens to send at the same time (weak1: a
                 // 2170 Hz station 1.5 kHz from a QSO, 93% "inside").
                 let far_and_clean = df > 400.0 && weak.decoder.fit().0 >= MIN_FIT;
+                // Against a busy strong signal "inside" means little: with
+                // its dilated marks covering 90% of the time, a station
+                // keying on its own lands 90% inside. An artefact misses the
+                // strong signal's gaps far more completely than chance, or
+                // sits close by, or fades with it (1458 Hz under a 1206 Hz
+                // ragchew, 95% inside at 90% cover: dropped for good).
+                let cov_frac = covered as f32 / wl.max(1) as f32;
+                let avoids_gaps = df <= 200.0
+                    || (tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) > 0.15)
+                    || 1.0 - inside_frac < 0.3 * (1.0 - cov_frac);
                 // The receiver's AGC turns the gain down while the strong
                 // station keys, so band noise elsewhere dips in step with
                 // it: inverted "keying" that decodes as junk. Its envelope
@@ -1855,8 +1867,9 @@ impl Skimmer {
                 // CWT: K4NMR at 40 dB beside KG9X at 52 was dropped for a
                 // minute at a time, and QSO partners at home likewise.)
                 let agc = much_stronger && weak.level_db < AGC_JUNK_DB && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
-                if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc) {
+                if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && avoids_gaps && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc) {
                     dead[wi] = true;
+                    anti[wi] = inside_frac < 0.3 && !agc && weak.qualified;
                     let rule = if agc { "agc" } else if twin && corr > 0.7 { "twin" } else if inside_frac > 0.92 { "inside" } else { "corr" };
                     why[wi] = format!(" ({rule}, {:.0} Hz at {:.0} dB)", strong.demod.freq, strong.level_db);
                 }
@@ -1873,7 +1886,11 @@ impl Skimmer {
                 // idling between overs (its noise keyed by a neighbour),
                 // and the next station on that frequency must not be
                 // locked out (K8PK, 33 s after KO4VW's over).
-                let hold = if c.qualified && now - c.created > 20.0 { 10.0 } else { 60.0 };
+                // Likewise a channel keying in the strong signal's gaps: that
+                // is the AGC pumping an idle frequency, not an artefact made
+                // by the strong signal, and the station that was there may
+                // come back out of a fade (KB1FGC, locked out mid-over).
+                let hold = if (c.qualified && now - c.created > 20.0) || anti[i - 1] { 10.0 } else { 60.0 };
                 Self::dropping(c, now, events, spots, &format!("artifact or duplicate of a stronger signal{}", why[i - 1]));
                 self.suppressed.push((c.demod.freq as f32, now + hold));
             }

@@ -1375,6 +1375,13 @@ impl CwDecoder {
         String::from_utf8_lossy(&std::mem::take(&mut self.text)).into_owned()
     }
 
+    /// A strong signal keyed with clean Morse timing: a word of lone dahs
+    /// from it is sent (cut zero, "T" in a QSO), not noise. (Lone E's stay
+    /// dropped: blips read as E even on a good signal.)
+    fn solid_keying(&self) -> bool {
+        self.beam.as_ref().is_some_and(|b| b.fit >= 0.85) && self.snr_db() >= 20.0
+    }
+
     /// Moves complete words from the beam into the output, dropping noise
     /// artefacts and applying the error sign.
     fn release_words(&mut self) {
@@ -1391,7 +1398,7 @@ impl CwDecoder {
                 if body[..e].is_empty() {
                     self.held.clear();
                 }
-            } else if !is_noise_word(body) {
+            } else if !is_noise_word(body) || (body.iter().all(|&c| c == b'T') && self.solid_keying()) {
                 self.text.append(&mut self.held);
                 // A human copying fills in a garbled letter from the word;
                 // do the same when the fix is unambiguous.
