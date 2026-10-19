@@ -69,6 +69,27 @@ struct Settings {
     repeat_stop_on_answer: bool,
     /// Send characters as they are typed instead of a line on Enter.
     tx_live: bool,
+    /// Revision of these settings, for `migrate` (0 in files saved before
+    /// it existed).
+    #[serde(default)]
+    settings_rev: u32,
+}
+
+/// Current `Settings::settings_rev`.
+const SETTINGS_REV: u32 = 1;
+
+impl Settings {
+    /// Brings settings saved by an older version up to date. Rev 1: the
+    /// LM weight default went from 0.7 to 0.5 in 0.2.0 (0.7 spots twice as
+    /// many wrong calls and doubles the error on hand-checked off-air
+    /// passages), but a saved 0.7 kept the old value; one the operator set
+    /// to anything else is left alone.
+    fn migrate(&mut self) {
+        if self.settings_rev < 1 && (self.lm_weight - 0.7).abs() < 1e-4 {
+            self.lm_weight = 0.5;
+        }
+        self.settings_rev = SETTINGS_REV;
+    }
 }
 
 /// A keyer memory, sent with its button or function key.
@@ -138,6 +159,7 @@ impl Default for Settings {
             squelch: 2.3,
             lm_weight: 0.5,
             show_rf: true,
+            settings_rev: SETTINGS_REV,
             auto_pitch: true,
             wf_contrast: 1.0,
             wf_brightness: 0.0,
@@ -359,7 +381,8 @@ fn wf_width() -> usize {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let s: Settings = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
+        let mut s: Settings = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
+        s.migrate();
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = Vec2::new(6.0, 4.0);
         cc.egui_ctx.set_style(style);
@@ -3065,6 +3088,22 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_old_lm_weight_only() {
+        let load = |json: &str| {
+            let mut s: Settings = serde_json::from_str(json).unwrap();
+            s.migrate();
+            (s.lm_weight, s.settings_rev)
+        };
+        // Saved by an older version with the old default: moved to 0.5.
+        assert_eq!(load(r#"{"lm_weight":0.7}"#), (0.5, SETTINGS_REV));
+        // Chosen by the operator: kept.
+        assert_eq!(load(r#"{"lm_weight":0.9}"#), (0.9, SETTINGS_REV));
+        // 0.7 set again after the migration: kept.
+        assert_eq!(load(r#"{"lm_weight":0.7,"settings_rev":1}"#), (0.7, SETTINGS_REV));
+        assert_eq!(Settings::default().settings_rev, SETTINGS_REV);
+    }
 
     /// Renders `cw_text` offscreen and returns all text that was painted.
     fn painted() -> String {
