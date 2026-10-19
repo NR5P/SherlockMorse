@@ -119,6 +119,9 @@ pub struct DecoderParams {
     /// it may be dismissed as a noise blip (`explain_blip`; 0 = off).
     pub blip_rel: f32,
     pub blip_knee: f32,
+    /// Margin (log-score) by which the bug reading of a start must beat the
+    /// ordinary one to be kept (`estimate_bug`; 0 = off).
+    pub bug_boot: f32,
 }
 
 /// Post-filter floor for a strong signal (Hz; passes 40 WPM). A channel
@@ -188,6 +191,7 @@ impl DecoderParams {
                     "dgap_gain" => p.dgap_gain = v,
                     "blip_rel" => p.blip_rel = v,
                     "blip_knee" => p.blip_knee = v,
+                    "bug_boot" => p.bug_boot = v,
 
                     _ => eprintln!("unknown param {k}"),
                 }
@@ -234,6 +238,7 @@ impl Default for DecoderParams {
             dgap_gain: 0.03,
             blip_rel: 1.5,
             blip_knee: 0.3,
+            bug_boot: 3.0,
 
         }
     }
@@ -334,6 +339,13 @@ pub struct BeamDecoder {
     dg_gain: f32,
     /// Amplitude evidence per ms of the last few marks.
     dit_ev: f32,
+    /// Log-score of the best hypothesis since the start (the hypotheses'
+    /// own scores are renormalised): how well this timing model explains
+    /// the runs, to compare two readings of the same start.
+    pub total: f64,
+    /// Bootstrapped as a bug (`estimate_bug`): machine dits, hand dashes,
+    /// the gap after dashes modelled apart from the start.
+    pub bug: bool,
 }
 
 impl BeamDecoder {
@@ -353,6 +365,8 @@ impl BeamDecoder {
             last_dash: false,
             dg_gain: 0.0,
             dit_ev: 0.0,
+            total: 0.0,
+            bug: false,
         }
     }
 
@@ -393,7 +407,7 @@ impl BeamDecoder {
     /// the common element gap (`dg_gain`, mean log-likelihood gain per such
     /// gap): learned from the gaps, it fits noise a little better too.
     fn dgap_active(&self) -> bool {
-        self.timing.dgap > 1.3 * self.timing.egap && self.dg_gain > self.params.dgap_gain
+        self.timing.dgap > 1.3 * self.timing.egap && (self.bug || self.dg_gain > self.params.dgap_gain)
     }
 
     /// Best log-likelihood of a space over (element, character, word gap)
@@ -804,6 +818,7 @@ impl BeamDecoder {
     fn prune(&mut self) {
         self.hyps.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
         let best = self.hyps[0].score;
+        self.total += f64::from(best);
         let mut seen = std::collections::HashSet::with_capacity(self.hyps.len());
         let width = self.params.beam_width;
         self.hyps.retain(|h| h.score > best - 30.0 && seen.insert(h.key()));
@@ -900,7 +915,7 @@ impl BeamDecoder {
                 let t = &mut self.timing;
                 self.last_dash = opts[1].1 > opts[0].1;
                 if opts[1].1 > opts[0].1 {
-                    if m < t.dot * 6.0 {
+                    if m < t.dot * if self.bug { 9.0 } else { 6.0 } {
                         t.dash += a * (m - t.dash);
                     }
                 } else if m > t.dot * 0.5 {
@@ -908,7 +923,7 @@ impl BeamDecoder {
                 }
                 // Keep the model sane.
                 t.dot = t.dot.clamp(20.0, 240.0);
-                t.dash = t.dash.clamp(t.dot * 2.0, t.dot * 5.0);
+                t.dash = t.dash.clamp(t.dot * 2.0, t.dot * if self.bug { 8.0 } else { 5.0 });
             }
             Run::Space(s) => {
                 let o = self.space_options_after(s, self.last_dash);
@@ -1049,6 +1064,73 @@ fn boot_long_gaps(runs: &[Run]) -> usize {
 }
 
 /// Maximum-likelihood speed estimate from a set of runs.
+/// Timing of a bug (semi-automatic key): machine-made dits, all alike,
+/// under hand-timed dashes 3.5 or more times longer, with longer gaps after
+/// the dashes. `estimate_timing` drops such short dits as noise blips (under
+/// 1/4.5 of the long marks) and reads the dashes as dots (KB1FGC: 92 ms
+/// "dots" for his 48 ms dits). None unless the marks split that way.
+pub fn estimate_bug(runs: &[Run]) -> Option<TimingModel> {
+    let mut marks: Vec<f32> = runs.iter().filter_map(|r| if let Run::Mark(m) = r { Some(*m) } else { None }).filter(|&m| m >= 16.0).collect();
+    if marks.len() < 8 {
+        return None;
+    }
+    marks.sort_by(|a, b| a.total_cmp(b));
+    // Two groups on log durations.
+    let lv: Vec<f32> = marks.iter().map(|m| m.ln()).collect();
+    let (mut lo, mut hi) = (lv[lv.len() / 5], lv[lv.len() * 9 / 10]);
+    let mut split = 0;
+    for _ in 0..10 {
+        let mid = 0.5 * (lo + hi);
+        split = lv.partition_point(|&x| x < mid);
+        if split < 3 || lv.len() - split < 2 {
+            return None;
+        }
+        lo = lv[..split].iter().sum::<f32>() / split as f32;
+        hi = lv[split..].iter().sum::<f32>() / (lv.len() - split) as f32;
+    }
+    let dits = &marks[..split];
+    let dashes = &marks[split..];
+    let dot = dits[dits.len() / 2];
+    let dash = dashes[dashes.len() / 2];
+    // Machine dits: tightly grouped and no faster than ~40 WPM (in noise,
+    // blips can group tightly too, with the real dits and dashes then
+    // lumped as "dashes": 20 and 72 ms for weak Farnsworth). The dashes
+    // are one group as well, however hand-timed.
+    let (q1, q3) = (dits[dits.len() / 4], dits[dits.len() * 3 / 4]);
+    let (d1, d3) = (dashes[dashes.len() / 4], dashes[dashes.len() * 3 / 4]);
+    if dash < 3.5 * dot || q3 > 1.4 * q1 || d3 > 2.0 * d1 || !(30.0..=150.0).contains(&dot) {
+        return None;
+    }
+    let cut = (dot * dash).sqrt();
+    let med = |v: &mut Vec<f32>| -> Option<f32> {
+        if v.len() < 2 {
+            return None;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        Some(v[v.len() / 2])
+    };
+    let after = |dash_side: bool| -> Vec<f32> {
+        runs.windows(2)
+            .filter_map(|w| match (w[0], w[1]) {
+                (Run::Mark(m), Run::Space(s)) if (m >= cut) == dash_side && m >= 16.0 => Some(s),
+                _ => None,
+            })
+            .collect()
+    };
+    let (ad, aa) = (after(false), after(true));
+    let egap = med(&mut ad.iter().copied().filter(|&s| s < 2.2 * dot).collect()).unwrap_or(dot);
+    // Character gaps from the gaps after dits (there they stand well apart
+    // from the element gaps; after dashes they nearly meet: 120-185 against
+    // 230 ms): the lower third, as words gaps are fewer.
+    let mut long: Vec<f32> = ad.iter().copied().filter(|&s| s >= 2.2 * dot.max(egap)).collect();
+    long.sort_by(|a, b| a.total_cmp(b));
+    let cgap = long.get(long.len() / 3).copied().unwrap_or(3.0 * dot.max(egap)).max(2.0 * dot);
+    // Too few yet (a start has a handful): half the character gap, as
+    // bugs leave (KB1FGC 100-130 of 250 ms); it adapts from there.
+    let dgap = med(&mut aa.iter().copied().filter(|&s| s < 0.85 * cgap).collect()).unwrap_or(0.5 * cgap).clamp(egap, (0.85 * cgap).max(egap));
+    Some(TimingModel { dot, dash, egap, dgap, cgap, wscale: 1.0 })
+}
+
 pub fn estimate_timing(runs: &[Run]) -> Option<TimingModel> {
     let total_marks = runs.iter().filter(|r| matches!(r, Run::Mark(_))).count();
     if total_marks < 4 {
@@ -2050,7 +2132,13 @@ impl CwDecoder {
     fn release_over(&mut self) {
         let Some(buf) = self.over_buf.take() else { return };
         let runs: Vec<Run> = buf.iter().map(|(r, _)| *r).filter(|r| !matches!(r, Run::Flush)).collect();
-        if let (Some(tm), Some(b)) = (estimate_timing(&runs), self.beam.as_mut()) {
+        // After a pause a bug's reading stays while the over still looks
+        // like one; another station takes the ordinary path below.
+        let still_bug = self.beam.as_ref().is_some_and(|b| b.bug) && estimate_bug(&runs).is_some();
+        if let Some(b) = self.beam.as_mut().filter(|b| b.bug && !still_bug) {
+            b.bug = false;
+        }
+        if let (Some(tm), Some(b)) = (estimate_timing(&runs).filter(|_| !still_bug), self.beam.as_mut()) {
             let r = tm.dot / b.timing.dot;
             if !(0.8..=1.25).contains(&r) && better(&runs, b.timing.dot, tm.dot) {
                 if std::env::var_os("CWSK_DEBUG").is_some() {
@@ -2091,14 +2179,33 @@ impl CwDecoder {
                     if std::env::var_os("CWSK_DEBUG").is_some() {
                         eprintln!("boot: {:?} wpm={:.1} snr={:.1}dB runs={:?}", tm, tm.wpm(), self.snr_db(), &self.boot);
                     }
-                    let mut b = BeamDecoder::new(self.params.clone(), self.lm.clone(), tm);
+                    let flush = matches!(run, Run::Flush);
+                    let boot = std::mem::take(&mut self.boot);
                     let profs = std::mem::take(&mut self.boot_prof);
-                    for (r, p) in std::mem::take(&mut self.boot).into_iter().zip(profs) {
-                        b.adapt(r);
-                        b.push_soft(r, p.as_deref());
-                    }
-                    if matches!(run, Run::Flush) {
-                        b.push(Run::Flush);
+                    let replay = |b: &mut BeamDecoder| {
+                        for (r, p) in boot.iter().zip(&profs) {
+                            b.adapt(*r);
+                            b.push_soft(*r, p.as_deref());
+                        }
+                        if flush {
+                            b.push(Run::Flush);
+                        }
+                    };
+                    let mut b = BeamDecoder::new(self.params.clone(), self.lm.clone(), tm.clone());
+                    replay(&mut b);
+                    // A bug read with ordinary timing loses its dits: decode
+                    // the start both ways and keep the reading that explains
+                    // the runs better.
+                    if let Some(tb) = estimate_bug(&boot).filter(|tb| self.params.bug_boot > 0.0 && tb.dot < 0.8 * tm.dot) {
+                        let mut bb = BeamDecoder::new(self.params.clone(), self.lm.clone(), tb);
+                        bb.bug = true;
+                        replay(&mut bb);
+                        if std::env::var_os("CWSK_DEBUG").is_some() {
+                            eprintln!("boot as bug: {:?} total {:.1} vs {:.1}", bb.timing, bb.total, b.total);
+                        }
+                        if bb.total > b.total + f64::from(self.params.bug_boot) {
+                            b = bb;
+                        }
                     }
                     self.beam = Some(b);
                 } else if matches!(run, Run::Flush) {
@@ -2120,10 +2227,45 @@ impl CwDecoder {
         // Periodically re-estimate speed in case a different operator (or
         // a speed change) appears on this frequency.
         let poor_fit = self.beam.as_ref().is_some_and(|b| b.fit < 0.7);
+        // A bug keeps its reading: the ordinary estimate would drop its dits
+        // again (KB1FGC re-estimated to 110-160 ms "dots").
+        if self.beam.as_ref().is_some_and(|b| b.bug) {
+            self.marks_since_check = 0;
+        }
         if self.marks_since_check >= if poor_fit { 8 } else { 16 } {
             self.marks_since_check = 0;
             let hist: Vec<Run> = self.history.iter().copied().collect();
-            if let Some(tm) = estimate_timing(&hist) {
+            // A bug the start missed (bootstrapped on noise before the
+            // station came up, or on too few dits): replay the recent runs
+            // under its reading and the current one, and switch if it
+            // explains them clearly better.
+            let mut to_bug = None;
+            if let (Some(tb), Some(b)) = (estimate_bug(&hist).filter(|_| self.params.bug_boot > 0.0), self.beam.as_ref()) {
+                if !(0.8..=1.25).contains(&(tb.dot / b.timing.dot)) {
+                    let score = |tm: TimingModel, bug: bool| {
+                        let mut x = BeamDecoder::new(self.params.clone(), self.lm.clone(), tm);
+                        x.bug = bug;
+                        for r in &hist {
+                            x.adapt(*r);
+                            x.push_soft(*r, None);
+                        }
+                        x.total
+                    };
+                    let (sb, sc) = (score(tb.clone(), true), score(b.timing.clone(), false));
+                    if std::env::var_os("CWSK_DEBUG").is_some() {
+                        eprintln!("re-estimate as bug: {tb:?} total {sb:.1} vs {sc:.1}");
+                    }
+                    if sb > sc + f64::from(self.params.bug_boot) {
+                        to_bug = Some(tb);
+                    }
+                }
+            }
+            if let Some(tb) = to_bug {
+                let b = self.beam.as_mut().unwrap();
+                b.timing = tb;
+                b.bug = true;
+                self.history.clear();
+            } else if let Some(tm) = estimate_timing(&hist) {
                 let b = self.beam.as_mut().unwrap();
                 let r = tm.dot / b.timing.dot;
                 // Switch speed when the new estimate is clearly more likely,
