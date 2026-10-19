@@ -85,6 +85,8 @@ pub struct Channel {
     /// The last 512 ms of raw demodulator output, for finding a second
     /// carrier inside the passband (see [`Skimmer::sub_peaks`]).
     raw_ring: VecDeque<Complex32>,
+    /// Baseband frames before the post filter, aligned with `marks`.
+    rawc: VecDeque<Complex32>,
     sub_checked: usize,
     /// (offset Hz, times seen in a row) of a second carrier.
     sub_cand: (f32, u8),
@@ -468,6 +470,61 @@ struct Retired {
 /// noise the receiver's AGC pumps moves against a strong signal, an
 /// unrelated station does not. (Over the whole span, two stations simply
 /// taking turns would look anti-correlated too.)
+/// Keying contrast (`skirt_contrast`, neighbour cancelled) under which a
+/// channel close to a much stronger station has no keyed carrier of its own.
+const SKIRT_MIN_CONTRAST: f32 = 1.25;
+
+/// Keying contrast of a channel (mean envelope in its marks over the mean in
+/// its gaps), as received and with a tone `df` Hz off its centre cancelled:
+/// y[n] = x[n] - e^(j 2 pi df D T) x[n - D] removes that tone exactly and,
+/// with D near half its period, passes the channel's own carrier doubled.
+/// Keying that is a stronger neighbour's skirt loses its contrast.
+fn skirt_contrast(raw: &VecDeque<Complex32>, marks: &VecDeque<bool>, df: f32, frame_ms: f32) -> Option<(f32, f32)> {
+    let n = raw.len().min(marks.len());
+    let t = frame_ms / 1000.0;
+    let d = ((0.5 / (df.abs() * t)).round() as usize).max(1);
+    if n < 500 || d > 20 {
+        return None;
+    }
+    let (or, om) = (raw.len() - n, marks.len() - n);
+    let rot = Complex32::from_polar(1.0, std::f32::consts::TAU * df * d as f32 * t);
+    // Then averaged over 20 ms (both alike) so a weak station's keying
+    // stands out of the noise as it does through the channel's filter.
+    let w = ((20.0 / frame_ms).round() as usize).max(1);
+    let (mut sx, mut sy) = (Complex32::new(0.0, 0.0), Complex32::new(0.0, 0.0));
+    let (mut rm, mut rg, mut ym, mut yg, mut nm, mut ng) = (0f64, 0f64, 0f64, 0f64, 0usize, 0usize);
+    for i in d..n {
+        let xi = raw[or + i];
+        let yi = xi - rot * raw[or + i - d];
+        sx += xi;
+        sy += yi;
+        if i >= d + w {
+            let xo = raw[or + i - w];
+            sx -= xo;
+            sy -= xo - rot * raw[or + i - w - d];
+        } else {
+            continue;
+        }
+        let (x, y) = (sx, sy);
+        // The average lags the marks by half its length.
+        let i = i - w / 2;
+        if marks[om + i] {
+            rm += f64::from(x.norm());
+            ym += f64::from(y.norm());
+            nm += 1;
+        } else {
+            rg += f64::from(x.norm());
+            yg += f64::from(y.norm());
+            ng += 1;
+        }
+    }
+    if nm < 50 || ng < 50 {
+        return None;
+    }
+    let c = |m: f64, g: f64| ((m / nm as f64) / (g / ng as f64).max(1e-12)) as f32;
+    Some((c(rm, rg), c(ym, yg)))
+}
+
 fn amp_corr(a: &VecDeque<f32>, b: &VecDeque<f32>, marks_a: &VecDeque<bool>) -> f32 {
     let n = a.len().min(b.len()).min(marks_a.len());
     if n < 500 {
@@ -679,6 +736,7 @@ impl Skimmer {
             crowd_pair: crowded,
             crowd_bw,
             raw_ring: VecDeque::with_capacity(SUB_RING),
+            rawc: VecDeque::with_capacity(MARK_HIST),
             sub_checked: 0,
             sub_cand: (0.0, 0),
             sub_spawned: self.spawning,
@@ -870,10 +928,12 @@ impl Skimmer {
                     ch.marks.pop_front();
                     ch.amps.pop_front();
                     ch.wide.pop_front();
+                    ch.rawc.pop_front();
                 }
                 ch.marks.push_back(ch.decoder.is_mark());
                 ch.amps.push_back(z.norm());
                 ch.wide.push_back(raw.norm());
+                ch.rawc.push_back(raw);
                 if ch.raw_ring.len() >= SUB_RING {
                     ch.raw_ring.pop_front();
                 }
@@ -1837,6 +1897,10 @@ impl Skimmer {
                     eprintln!("ART t={:.0} weak {:.0}Hz ({:.0}dB) vs strong {:.0}Hz ({:.0}dB): inside {:.2} ampcorr {:.2}", self.time, weak.demod.freq, weak.level_db, strong.demod.freq, strong.level_db, inside as f32 / tot as f32, amp_corr(&strong.amps, &weak.amps, &strong.marks));
                 }
                 let corr = if tot >= 100 { lagged_corr(&strong.marks, &weak.marks) } else { 0.0 };
+                if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 && df < 150.0 {
+                    let sc = skirt_contrast(&weak.rawc, &weak.marks, (strong.demod.freq - weak.demod.freq) as f32, weak.demod.frame_ms());
+                    eprintln!("    skirt {sc:?} df {df:.0} levels {:.0}/{:.0} shown {}", weak.level_db, strong.level_db, weak.qualified);
+                }
                 if std::env::var_os("CWSK_DEBUG_ART").is_some() && tot >= 100 {
                     eprintln!("    corr {corr:.2} covered {:.2}", covered as f32 / wl.max(1) as f32);
                 }
@@ -1873,10 +1937,19 @@ impl Skimmer {
                 // CWT: K4NMR at 40 dB beside KG9X at 52 was dropped for a
                 // minute at a time, and QSO partners at home likewise.)
                 let agc = much_stronger && weak.level_db < AGC_JUNK_DB && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
-                if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && avoids_gaps && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc) {
+                // Close to a much stronger station, the channel's own
+                // baseband must carry its keying: cancel the strong tone
+                // (`skirt_contrast`) and a skirt copy loses it (W1AW 30 Hz
+                // off: 2.2 -> 1.0); "keying" made by the receiver's AGC in
+                // the strong one's gaps never had it (60 Hz off: 0.9).
+                let skirt = much_stronger && df < 150.0 && tot >= 100 && {
+                    let sc = skirt_contrast(&weak.rawc, &weak.marks, (strong.demod.freq - weak.demod.freq) as f32, weak.demod.frame_ms());
+                    sc.is_some_and(|(raw, null)| null < SKIRT_MIN_CONTRAST || (raw > 1.5 && null < 1.15))
+                };
+                if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && avoids_gaps && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc || skirt) {
                     dead[wi] = true;
                     anti[wi] = inside_frac < 0.3 && !agc && weak.qualified;
-                    let rule = if agc { "agc" } else if twin && corr > 0.7 { "twin" } else if inside_frac > 0.92 { "inside" } else { "corr" };
+                    let rule = if agc { "agc" } else if skirt { "skirt" } else if twin && corr > 0.7 { "twin" } else if inside_frac > 0.92 { "inside" } else { "corr" };
                     why[wi] = format!(" ({rule}, {:.0} Hz at {:.0} dB)", strong.demod.freq, strong.level_db);
                 }
             }
