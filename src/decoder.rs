@@ -115,6 +115,10 @@ pub struct DecoderParams {
     /// Mean log-likelihood gain per gap after a dash needed to model those
     /// gaps apart from the other element gaps (a bug's).
     pub dgap_gain: f32,
+    /// Weight of a mark's evidence relative to the sender's usual dit when
+    /// it may be dismissed as a noise blip (`explain_blip`; 0 = off).
+    pub blip_rel: f32,
+    pub blip_knee: f32,
 }
 
 /// Post-filter floor for a strong signal (Hz; passes 40 WPM). A channel
@@ -182,6 +186,8 @@ impl DecoderParams {
                     "wide_edges" => p.wide_edges = v,
                     "wide_fill" => p.wide_fill = v,
                     "dgap_gain" => p.dgap_gain = v,
+                    "blip_rel" => p.blip_rel = v,
+                    "blip_knee" => p.blip_knee = v,
 
                     _ => eprintln!("unknown param {k}"),
                 }
@@ -226,6 +232,8 @@ impl Default for DecoderParams {
             wide_edges: 0.0,
             wide_fill: 0.06,
             dgap_gain: 0.03,
+            blip_rel: 1.5,
+            blip_knee: 0.3,
 
         }
     }
@@ -324,6 +332,8 @@ pub struct BeamDecoder {
     last_dash: bool,
     /// Smoothed gain of modelling the gaps after dashes apart (`dgap_active`).
     dg_gain: f32,
+    /// Amplitude evidence per ms of the last few marks.
+    dit_ev: f32,
 }
 
 impl BeamDecoder {
@@ -342,6 +352,7 @@ impl BeamDecoder {
             fit_n: 0,
             last_dash: false,
             dg_gain: 0.0,
+            dit_ev: 0.0,
         }
     }
 
@@ -483,10 +494,32 @@ impl BeamDecoder {
         let ev = ev.filter(|_| self.params.soft_weight > 0.0);
         match ev {
             Some(e) if len < 2.0 * dot => Some(base - self.params.soft_weight * e.max(0.0) / dot),
-            None if len < 0.6 * dot => Some(base + 2.0 * (len / dot)),
+            _ if len < 0.6 * dot => Some(base + 2.0 * (len / dot)),
             _ => None,
         }
     }
+
+    /// `explain_away` for a mark: also judged against the evidence per ms
+    /// of the last few marks (`dit_ev`). On a weak signal every mark's
+    /// evidence is small, and a blip with a tenth of a real dit's ("BK" +
+    /// blip -> "BKE" in a Farnsworth over) cost as much to dismiss as a real
+    /// dit; recent marks rather than a long average, so a fade does not make
+    /// its own dits look like blips ("K7CU" -> "K7N TU").
+    fn explain_blip(&self, len: f32, ev: Option<f32>) -> Option<f32> {
+        let c = self.explain_away(self.params.blip_penalty, len, ev)?;
+        let k = self.params.blip_rel;
+        match ev {
+            Some(e) if k > 0.0 && self.dit_ev > 0.0 => {
+                // Only marks far weaker than a dit get cheaper: a faded dit
+                // keeps a third or more of its evidence.
+                let rel = (e.max(0.0) / len.max(1.0) / self.dit_ev).max(0.02);
+                let knee = self.params.blip_knee;
+                Some(if rel < knee { (c - k * (rel / knee).ln()).min(0.0) } else { c })
+            }
+            _ => Some(c),
+        }
+    }
+
 
     /// Ways to explain a space as gap + faded element + gap: for each kind
     /// of the gap before (element/character/word) and element (dot/dash),
@@ -616,6 +649,12 @@ impl BeamDecoder {
             Run::Mark(_) => total,
             _ => total.map(|t| -t),
         };
+        // Reference for `explain_blip`, taken after judging this mark: the
+        // evidence per ms of the last few marks (a fade dims them alike).
+        let dens = match (run, ev) {
+            (Run::Mark(m), Some(e)) if e > 0.0 && m > 0.0 => Some(e / m),
+            _ => None,
+        };
         let hidden = match (run, prof) {
             (Run::Space(sp), Some(p)) => self.hidden_elements(sp, p),
             _ => Vec::new(),
@@ -649,7 +688,7 @@ impl BeamDecoder {
                             }
                             next.push(n);
                         }
-                        if let Some(c) = self.explain_away(self.params.blip_penalty, m, ev) {
+                        if let Some(c) = self.explain_blip(m, ev) {
                             let mut n = h.clone();
                             n.pend_space += m;
                             n.score += c;
@@ -660,7 +699,7 @@ impl BeamDecoder {
                         // mark may be a noise blip too, not only inside
                         // the transmission.
                         if h.pend_mark == 0.0 && h.len == 0 {
-                            if let Some(c) = self.explain_away(self.params.blip_penalty, m, ev) {
+                            if let Some(c) = self.explain_blip(m, ev) {
                                 let mut n = h.clone();
                                 n.score += c;
                                 next.push(n);
@@ -752,6 +791,9 @@ impl BeamDecoder {
             next.push(n);
         }
         self.scratch = std::mem::replace(&mut self.hyps, next);
+        if let Some(d) = dens {
+            self.dit_ev = if self.dit_ev <= 0.0 { d } else { self.dit_ev + 0.3 * (d - self.dit_ev) };
+        }
         self.prune();
         if matches!(run, Run::Flush) {
             self.hyps.truncate(1);
@@ -2127,7 +2169,11 @@ impl CwDecoder {
         let Some(b) = &self.beam else { return };
         let t = &b.timing;
         let nominal = t.wgap() / t.wscale;
-        if sp > 2.0 * t.egap.max(t.dot) && sp < 2.5 * nominal {
+        // Up to 4x the nominal word gap: a slow (Farnsworth) sender's word
+        // gaps are 3x what the 3-dot character gap first assumed predicts,
+        // and without them the clusters never form (his 9-dot character
+        // gaps stayed word gaps: "B R I G H T C O L D").
+        if sp > 2.0 * t.egap.max(t.dot) && sp < 4.0 * nominal {
             self.long_gaps.push_back(sp);
             if self.long_gaps.len() > 48 {
                 self.long_gaps.pop_front();

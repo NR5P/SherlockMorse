@@ -67,6 +67,13 @@ enum Cmd {
         /// Generate a multi-station band scene instead of a single signal.
         #[arg(long)]
         pileup: bool,
+        /// Send in one of the `fists` styles (keyer-20, bug-heavy,
+        /// farnsworth, ...) at --snr; --wpm and --jitter are then the style's.
+        #[arg(long)]
+        fist: Option<String>,
+        /// Noise seed.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
     },
     /// Run the synthetic benchmark suite.
     Bench {
@@ -91,6 +98,9 @@ enum Cmd {
         /// Only fists whose name contains this.
         #[arg(long)]
         only: Option<String>,
+        /// Print each decode against its text.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Render a waterfall PNG of an audio file (for inspecting recordings).
     Waterfall {
@@ -318,8 +328,11 @@ fn main() -> Result<()> {
                 println!("\nCER vs reference (longest channel): {:.1}%", c * 100.0);
             }
         }
-        Cmd::Synth { text, wpm, freq, snr, jitter, qsb, qrn, out, pileup } => {
-            let signals = if pileup {
+        Cmd::Synth { text, wpm, freq, snr, jitter, qsb, qrn, out, pileup, fist, seed } => {
+            let signals = if let Some(f) = fist {
+                let (_, make) = fist_styles().into_iter().find(|(n, _)| *n == f).ok_or_else(|| anyhow::anyhow!("unknown fist {f}"))?;
+                vec![SignalSpec { freq, qsb_depth: qsb, ..make(text, snr) }]
+            } else if pileup {
                 let st = [
                     ("CQ CQ CQ DE K1ABC K1ABC K1ABC K CQ CQ DE K1ABC K", 420.0, 22.0, 15.0, 0.0),
                     ("CQ TEST DL5XYZ DL5XYZ TEST", 540.0, 30.0, 8.0, 0.0),
@@ -344,13 +357,13 @@ fn main() -> Result<()> {
             } else {
                 vec![SignalSpec { text, wpm, freq, snr_db: snr, jitter, qsb_depth: qsb, ..Default::default() }]
             };
-            let scene = Scene { signals, qrn_rate: qrn, noise_sigma: pileup.then_some(0.05), ..Default::default() };
+            let scene = Scene { signals, qrn_rate: qrn, noise_sigma: pileup.then_some(0.05), seed, ..Default::default() };
             let s = synth::render(&scene);
             cwskimmer::audiofile::write_wav(&out, &s, scene.rate)?;
             println!("wrote {} ({:.1} s)", out.display(), s.len() as f32 / scene.rate as f32);
         }
         Cmd::Bench { trials, compare_lm, only, verbose } => bench(trials, compare_lm, only, verbose),
-        Cmd::Fists { trials, only } => fists(trials, only),
+        Cmd::Fists { trials, only, verbose } => fists(trials, only, verbose),
         Cmd::Weak { signal, freq, noise, snr, reference, skip, duration, verbose, trials } => {
             let load = |p: &PathBuf, skip: f32, dur: Option<f32>| -> Result<Vec<f32>> {
                 let (x, rate) = cwskimmer::audiofile::read_audio(p)?;
@@ -1011,7 +1024,7 @@ fn fist_styles() -> Vec<(&'static str, fn(String, f32) -> SignalSpec)> {
     ]
 }
 
-fn fists(trials: u64, only: Option<String>) {
+fn fists(trials: u64, only: Option<String>, verbose: bool) {
     let lm = Arc::new(LanguageModel::new());
     println!("{:<16} {:>8} {:>8}", "fist", "+6 dB", "-6 dB");
     let (mut tot, mut n) = ([0.0f32; 2], 0);
@@ -1024,7 +1037,7 @@ fn fists(trials: u64, only: Option<String>) {
             let mut cers = Vec::new();
             for t in 0..trials {
                 let scene = one(make(text(t + 1), snr), 1000 + t);
-                cers.extend(run_scene(&scene, lm.clone(), false));
+                cers.extend(run_scene(&scene, lm.clone(), verbose));
             }
             m[k] = cers.iter().sum::<f32>() / cers.len().max(1) as f32;
             tot[k] += m[k];
