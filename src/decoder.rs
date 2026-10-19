@@ -1098,7 +1098,11 @@ pub fn estimate_bug(runs: &[Run]) -> Option<TimingModel> {
     // are one group as well, however hand-timed.
     let (q1, q3) = (dits[dits.len() / 4], dits[dits.len() * 3 / 4]);
     let (d1, d3) = (dashes[dashes.len() / 4], dashes[dashes.len() * 3 / 4]);
-    if dash < 3.5 * dot || q3 > 1.4 * q1 || d3 > 2.0 * d1 || !(30.0..=150.0).contains(&dot) {
+    // The dits' spread may be wider (noise on a weaker bug, 56-82 ms through
+    // the narrow filter) only with clearly bug-like dashes: a weak keyer's
+    // dits, trimmed by the threshold, measured 3.7x under its dashes.
+    let spread = if dash >= 4.5 * dot { 1.6 } else { 1.4 };
+    if dash < 3.5 * dot || q3 > spread * q1 || d3 > 2.0 * d1 || !(30.0..=150.0).contains(&dot) {
         return None;
     }
     let cut = (dot * dash).sqrt();
