@@ -366,6 +366,14 @@ fn make_lut() -> [u8; 256] {
     lut
 }
 
+const MONTHS: &[&str] = &[
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER", "JAN", "FEB",
+    "MAR", "APR", "JUN", "JUL", "AUG", "SEPT", "OCT", "NOV", "DEC",
+];
+const DAYS: &[&str] = &[
+    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN", "TODAY",
+    "TOMORROW", "YESTERDAY", "THE WEEKEND",
+];
 const NAMES: &[&str] = &[
     "BOB", "JOHN", "JIM", "BILL", "TOM", "MIKE", "DAVE", "DAN", "ED", "AL", "JOE", "RON", "DON",
     "KEN", "STEVE", "GARY", "LARRY", "PAUL", "PETE", "FRANK", "GEORGE", "HANS", "KLAUS", "PIERRE",
@@ -537,6 +545,27 @@ pub fn generate_corpus(target_len: usize, seed: u64) -> String {
             14 => format!("FB {name} = HPE CUAGN = 73 ES GL {c2} DE {c1} % TU"),
             15..=19 => english_sentence(&mut rng),
             _ => unreachable!(),
+        };
+        out.push_str(&line);
+        out.push(' ');
+    }
+    // Dates, from their own generator so the lines above stay as they
+    // were: no month or day text had JULY, so a faded L read "IN JUDY"
+    // (W7QQQ on 40 m).
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xDA7E);
+    let n = target_len / 20;
+    let start = out.len();
+    while out.len() - start < n {
+        let m = MONTHS.choose(&mut rng).unwrap();
+        let d = DAYS.choose(&mut rng).unwrap();
+        let name = NAMES.choose(&mut rng).unwrap();
+        let line = match rng.gen_range(0..6) {
+            0 => format!("OUR LAST QSO WAS IN {m} = GUD TO HEAR U AGN"),
+            1 => format!("CU AGN ON {d} {name} 73"),
+            2 => format!("LICENSED SINCE {m} {}", rng.gen_range(1960..2026)),
+            3 => format!("QSO PARTY ON {d} = NEW ANT UP IN {m}"),
+            4 => format!("WX HR WAS COLD ON {d} = WARM FER {m}"),
+            _ => format!("BACK FM VACATION IN {m} ES ON THE AIR {d}"),
         };
         out.push_str(&line);
         out.push(' ');
