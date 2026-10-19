@@ -240,7 +240,11 @@ const PREROLL_SECS: f32 = 1.5;
 const MARK_HIST: usize = 2500;
 /// A channel this far over the noise floor is a station, not the noise
 /// keyed by the receiver's AGC (AGC junk was 5-14 dB; stations 20-40).
-const AGC_JUNK_DB: f32 = 15.0;
+/// Raised from 15: a 36-43 dB station pumps junk up to 16-33 dB (a steady
+/// birdie on 7030.0 "keyed" by W7QQQ's AGC dips), and since an AGC
+/// removal frees the frequency as soon as the strong one pauses, a real
+/// station caught by it loses little.
+const AGC_JUNK_DB: f32 = 25.0;
 
 pub fn bin_hz() -> f32 {
     RATE as f32 / FFT_SIZE as f32
