@@ -220,7 +220,9 @@ pub struct Skimmer {
     /// transmission (before detection triggered) is not lost.
     preroll: VecDeque<f32>,
     /// Frequencies where artefacts of strong signals were found: (Hz, until).
-    suppressed: Vec<(f32, f64)>,
+    /// Frequencies kept free of new channels: (Hz, until, while this
+    /// channel keeps keying — an AGC removal's strong station).
+    suppressed: Vec<(f32, f64, Option<u64>)>,
     last_artifact_check: f64,
     graveyard: Vec<Retired>,
     hops: u64,
@@ -470,6 +472,10 @@ struct Retired {
 /// noise the receiver's AGC pumps moves against a strong signal, an
 /// unrelated station does not. (Over the whole span, two stations simply
 /// taking turns would look anti-correlated too.)
+/// An AGC removal keeps its frequency free only until the strong station
+/// has been silent this long (s).
+const AGC_HOLD_IDLE_S: f64 = 1.5;
+
 /// Keying contrast (`skirt_contrast`, neighbour cancelled) under which a
 /// channel close to a much stronger station has no keyed carrier of its own.
 const SKIRT_MIN_CONTRAST: f32 = 1.25;
@@ -1803,7 +1809,9 @@ impl Skimmer {
             let paired = lvl >= CROWDED_START_DB && strong.iter().any(|&(t, l)| (2..=4).contains(&t.abs_diff(b)) && (l - lvl).abs() <= CROWDED_DIFF_DB);
             let off = if den.abs() > 1e-9 && !paired { 0.5 * (a - c) / den } else { 0.0 };
             let f = (b as f32 + off.clamp(-0.5, 0.5)) * hz;
-            if self.suppressed.iter().any(|&(sf, _)| (sf - f).abs() < self.cfg.min_spacing) {
+            let (now, channels) = (self.time, &self.channels);
+            let holds = |by: Option<u64>| by.is_none_or(|id| channels.iter().any(|c| c.id == id && now - c.last_mark < AGC_HOLD_IDLE_S));
+            if self.suppressed.iter().any(|&(sf, _, by)| (sf - f).abs() < self.cfg.min_spacing && holds(by)) {
                 continue;
             }
             if self.channels.iter().any(|ch| (ch.demod.freq as f32 - f).abs() < self.cfg.min_spacing) {
@@ -1853,6 +1861,7 @@ impl Skimmer {
         let mut why = vec![String::new(); n];
         // Removed for keying against the strong signal (marks in its gaps).
         let mut anti = vec![false; n];
+        let mut agc_by: Vec<Option<u64>> = vec![None; n];
         for (si, strong) in self.channels.iter().enumerate() {
             let len = strong.marks.len();
             if len < 500 || dead[si] {
@@ -1948,7 +1957,18 @@ impl Skimmer {
                 };
                 if tot >= 100 && ((much_stronger && ((inside_frac > 0.92 && avoids_gaps && !far_and_clean) || corr > 0.5)) || (twin && corr > 0.7) || agc || skirt) {
                     dead[wi] = true;
+                    // AGC "keying" exists only while the strong station
+                    // sends: in a QSO the frequency is the other station's,
+                    // who answers seconds later (K4WNY, locked out for a
+                    // minute after N4RDX's over on 40 m).
                     anti[wi] = inside_frac < 0.3 && !agc && weak.qualified;
+                    // AGC "keying" exists only while the strong station
+                    // sends: in a QSO the frequency is the other station's,
+                    // who answers when it stops (K4WNY, locked out for a
+                    // minute after N4RDX's over on 40 m).
+                    if agc {
+                        agc_by[wi] = Some(strong.id);
+                    }
                     let rule = if agc { "agc" } else if skirt { "skirt" } else if twin && corr > 0.7 { "twin" } else if inside_frac > 0.92 { "inside" } else { "corr" };
                     why[wi] = format!(" ({rule}, {:.0} Hz at {:.0} dB)", strong.demod.freq, strong.level_db);
                 }
@@ -1971,7 +1991,7 @@ impl Skimmer {
                 // come back out of a fade (KB1FGC, locked out mid-over).
                 let hold = if (c.qualified && now - c.created > 20.0) || anti[i - 1] { 10.0 } else { 60.0 };
                 Self::dropping(c, now, events, spots, &format!("artifact or duplicate of a stronger signal{}", why[i - 1]));
-                self.suppressed.push((c.demod.freq as f32, now + hold));
+                self.suppressed.push((c.demod.freq as f32, now + hold, agc_by[i - 1]));
             }
             keep
         });
@@ -1982,7 +2002,7 @@ impl Skimmer {
         if now - self.last_artifact_check >= 1.0 {
             self.last_artifact_check = now;
             self.reject_artifacts();
-            self.suppressed.retain(|&(_, t)| t > now);
+            self.suppressed.retain(|&(_, t, _)| t > now);
         }
         // Re-check every channel continuously, not only when it decodes new
         // text: a station that stopped leaves a decoder chewing on noise.
