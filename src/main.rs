@@ -815,11 +815,14 @@ impl App {
                     ProbeMsg::Progress(p) => self.probe_status = format!("Probing {p}…"),
                     ProbeMsg::Done(found) => {
                         if let Some(f) = found.first() {
-                            self.probe_status = format!("Found {} on {} @ {}", f.model, f.config.port, f.config.baud);
+                            self.probe_status = match f.config.kind {
+                                RigKind::Hamlib => format!("Found {} at {}", f.model, f.config.host),
+                                _ => format!("Found {} on {} @ {}", f.model, f.config.port, f.config.baud),
+                            };
                             self.s.rig = RigConfig { poll_ms: self.s.rig.poll_ms, ..f.config.clone() };
                             self.connect_rig();
                         } else {
-                            self.probe_status = "No radio found on USB serial ports".into();
+                            self.probe_status = "No radio found (rigctld/RigHelm or USB serial ports)".into();
                         }
                         self.probe_rx = None;
                         break;
@@ -1283,7 +1286,7 @@ impl App {
                 if ui.button("Connect").clicked() {
                     self.connect_rig();
                 }
-                if ui.button("Auto-detect").on_hover_text("Probe USB serial ports for a radio").clicked() && self.probe_rx.is_none() {
+                if ui.button("Auto-detect").on_hover_text("Look for RigHelm or Hamlib rigctld on this computer, then probe USB serial ports for a radio").clicked() && self.probe_rx.is_none() {
                     self.start_probe();
                 }
             } else if ui.button("Disconnect").clicked() {

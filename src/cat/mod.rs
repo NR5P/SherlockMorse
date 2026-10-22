@@ -272,7 +272,7 @@ pub fn list_ports() -> Vec<(String, String)> {
 
 /// RigHelm's virtual serial ports, if it is running. They are symlinks to
 /// PTYs, so the OS port enumeration does not list them.
-fn righelm_ports() -> Vec<(String, String)> {
+pub(crate) fn righelm_ports() -> Vec<(String, String)> {
     if !cfg!(unix) {
         return Vec::new();
     }

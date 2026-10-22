@@ -582,7 +582,10 @@ fn main() -> Result<()> {
                 println!("no radios found");
             }
             for f in found {
-                println!("{} on {} @ {} baud ({:?})", f.model, f.config.port, f.config.baud, f.config.kind);
+                match f.config.kind {
+                    RigKind::Hamlib => println!("{} at {} (Hamlib NET rigctl)", f.model, f.config.host),
+                    _ => println!("{} on {} @ {} baud ({:?})", f.model, f.config.port, f.config.baud, f.config.kind),
+                }
             }
         }
         Cmd::Rig { kind, port, baud, host, civ, set } => {

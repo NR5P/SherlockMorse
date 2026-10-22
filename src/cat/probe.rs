@@ -1,4 +1,5 @@
-//! Auto-detection of radios on USB serial ports.
+//! Auto-detection of radios: a local Hamlib `rigctld` (or RigHelm, which
+//! serves the same protocol) first, then USB serial ports.
 //!
 //! Only USB serial ports are probed (so we never poke unrelated hardware).
 //! Each port is tried with the ASCII `ID;` command (Yaesu / Kenwood /
@@ -7,7 +8,7 @@
 
 use super::icom::{model_name as icom_name, Icom};
 use super::textcat::{model_name, Dialect, TextCat};
-use super::{RigConfig, RigKind};
+use super::{Rig, RigConfig, RigKind};
 
 #[derive(Clone, Debug)]
 pub struct Found {
@@ -49,8 +50,24 @@ fn usb_ports() -> Vec<String> {
     out
 }
 
-/// Probes all USB serial ports. Stops at the first radio found per port.
+/// A `rigctld` server on this computer (Hamlib's, or RigHelm's) that
+/// answers a frequency read.
+fn probe_rigctld(progress: &mut impl FnMut(&str)) -> Option<Found> {
+    let cfg = RigConfig { kind: RigKind::Hamlib, ..Default::default() };
+    progress(&format!("rigctld @ {}", cfg.host));
+    let mut r = super::hamlib::Rigctld::open(&cfg).ok()?;
+    r.get_freq().ok()?;
+    let model = if super::righelm_ports().is_empty() { "Hamlib rigctld" } else { "RigHelm" };
+    Some(Found { config: cfg, model: model.into() })
+}
+
+/// Probes for a local rigctld, then all USB serial ports. Stops at the
+/// first radio found per port. A running rigctld already owns the radio,
+/// so the serial ports are then left alone.
 pub fn probe(mut progress: impl FnMut(&str)) -> Vec<Found> {
+    if let Some(f) = probe_rigctld(&mut progress) {
+        return vec![f];
+    }
     let mut found = Vec::new();
     for port in usb_ports() {
         if let Some(f) = probe_port(&port, &mut progress) {
