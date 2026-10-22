@@ -107,6 +107,9 @@ pub struct Channel {
     /// Last time the keying fitted Morse timing (noise keeps `last_mark`
     /// fresh, so lifetime is based on this instead).
     last_good: f64,
+    /// A pinned channel's text decoded while it is idle (`PIN_IDLE_S`),
+    /// with when: noise, unless keying resumes within `PIN_HOLD_S`.
+    idle_text: VecDeque<(f64, String)>,
     words: String,
     /// Language-model plausibility of the recent text (see
     /// [`text_plausibility`]), once there is enough of it.
@@ -245,6 +248,9 @@ const MARK_HIST: usize = 2500;
 /// removal frees the frequency as soon as the strong one pauses, a real
 /// station caught by it loses little.
 const AGC_JUNK_DB: f32 = 25.0;
+/// A channel that keys this much (`keying_under`, dB) while the strong
+/// station's carrier is up is a station, not AGC junk.
+const AGC_OWN_KEYING_DB: f32 = 9.0;
 
 pub fn bin_hz() -> f32 {
     RATE as f32 / FFT_SIZE as f32
@@ -253,6 +259,16 @@ pub fn bin_hz() -> f32 {
 /// Minimum timing-fit score for a channel to be shown (real CW measured
 /// 0.8-0.97 on live recordings; noise 0.35-0.68).
 const MIN_FIT: f32 = 0.78;
+/// A pinned channel whose keying has not fitted Morse timing for this long
+/// (s) hears no station: its station finished, and a decoder kept on an
+/// empty frequency spells noise (WB2INZ's row after his CQ, "0KINO HR
+/// WEEKU2 K BE T@@I EBK 25F", ~1 character a second on bare 40 m noise).
+/// Its text is held back.
+const PIN_IDLE_S: f64 = 8.0;
+/// Held text from up to this long (s) before keying fits again is the
+/// start of that over (its first word decodes before the fit recovers);
+/// older held text is dropped.
+const PIN_HOLD_S: f64 = 6.0;
 
 /// Above this speed a channel must fit Morse timing at least `FAST_MIN_FIT`
 /// to be shown.
@@ -569,6 +585,63 @@ fn amp_corr(a: &VecDeque<f32>, b: &VecDeque<f32>, marks_a: &VecDeque<bool>) -> f
     if var <= 1e-12 { 0.0 } else { (cov / var.sqrt()) as f32 }
 }
 
+/// How much a channel keys on its own while a strong station's carrier is
+/// up: spread (90th percentile over the median, dB) of its envelope over the
+/// frames well inside the strong one's marks. The receiver's AGC can only
+/// push the channel down there, so AGC "keying" shows the bare noise spread
+/// (~6 dB); a station sending at the same time keys right through it
+/// (WB2INZ at 701 Hz under K3ATK at 431 Hz: 10 dB). What follows the strong
+/// signal's own level is taken out first: its skirt 75 Hz off, or its
+/// splatter raising the noise 180 Hz off, rise and fall with its fading
+/// (W1AW on 40 m: 10-16 dB raw). None if too few frames.
+fn keying_under(strong_marks: &VecDeque<bool>, strong_amps: &VecDeque<f32>, amps: &VecDeque<f32>, frame_ms: f32) -> Option<f32> {
+    let n = strong_marks.len().min(amps.len()).min(strong_amps.len());
+    let (os, osa, oa) = (strong_marks.len() - n, strong_amps.len() - n, amps.len() - n);
+    // Only frames at least 20 ms from the strong mark's edges.
+    let r = ((20.0 / frame_ms).round() as usize).max(1);
+    // Envelopes averaged over 10 ms first: the bare frames' noise spread
+    // hides a weak station's keying.
+    let w = ((10.0 / frame_ms).round() as usize).max(1);
+    let smooth = |x: &VecDeque<f32>, o: usize| {
+        let mut sm = vec![0f32; n];
+        let mut sum = 0f32;
+        for i in 0..n {
+            sum += x[o + i];
+            if i >= w {
+                sum -= x[o + i - w];
+            }
+            // Centred on frame i - w / 2.
+            if i >= w / 2 {
+                sm[i - w / 2] = sum / w.min(i + 1) as f32;
+            }
+        }
+        sm
+    };
+    let (sw, ss) = (smooth(amps, oa), smooth(strong_amps, osa));
+    let db = |a: f32| 20.0 * a.max(1e-9).log10();
+    let mut run = 0usize;
+    let mut v: Vec<(f32, f32)> = Vec::new();
+    for i in 0..n {
+        run = if strong_marks[os + i] { run + 1 } else { 0 };
+        // Frame i - r has r marked frames on either side.
+        if run > 2 * r + w {
+            v.push((db(sw[i - r]), db(ss[i - r])));
+        }
+    }
+    if v.len() < 200 {
+        return None;
+    }
+    let nf = v.len() as f32;
+    let (mx, my) = (v.iter().map(|p| p.1).sum::<f32>() / nf, v.iter().map(|p| p.0).sum::<f32>() / nf);
+    let vxx = v.iter().map(|p| (p.1 - mx).powi(2)).sum::<f32>() / nf;
+    let vxy = v.iter().map(|p| (p.1 - mx) * (p.0 - my)).sum::<f32>() / nf;
+    // (A steady strong signal says nothing about the slope.)
+    let beta = if vxx > 0.25 { (vxy / vxx).clamp(-2.0, 2.0) } else { 0.0 };
+    let mut e: Vec<f32> = v.iter().map(|p| p.0 - beta * (p.1 - mx)).collect();
+    e.sort_by(f32::total_cmp);
+    Some(e[e.len() * 9 / 10] - e[e.len() / 2])
+}
+
 /// Maximum |Pearson correlation| between two mark histories over lags of
 /// ±100 ms, computed only where both channels are keying (so two stations
 /// taking turns are not mistaken for an echo).
@@ -754,6 +827,7 @@ impl Skimmer {
             pending_out: String::new(),
             qualified: pinned || was_revived,
             last_good: self.time,
+            idle_text: VecDeque::new(),
             words: String::new(),
             best_fit: 0.0,
             post: None,
@@ -1217,6 +1291,18 @@ impl Skimmer {
     /// looks like real Morse rather than noise or an artefact.
     fn deliver(ch: &mut Channel, txt: &str, now: f64, final_: bool, lm: &LanguageModel, dropout_s: f32, events: &mut Vec<TextEvent>, spots: &mut Vec<Spot>) {
         let snapped = snap_calls(&split_doubled_calls(txt), &ch.call_counts);
+        if ch.pinned && Self::pin_idle(ch, now) {
+            ch.idle_text.push_back((now, snapped));
+            while ch.idle_text.front().is_some_and(|(t, _)| now - t > PIN_HOLD_S) {
+                ch.idle_text.pop_front();
+            }
+            return;
+        }
+        let mut snapped = snapped;
+        if !ch.idle_text.is_empty() {
+            let held: String = ch.idle_text.drain(..).filter(|(t, _)| now - t <= PIN_HOLD_S).map(|(_, s)| s).collect();
+            snapped.insert_str(0, &held);
+        }
         let txt = snapped.as_str();
         ch.text.push_str(txt);
         if ch.text.len() > 4000 {
@@ -1312,6 +1398,11 @@ impl Skimmer {
             Self::note(ch, now, events, &format!("removed: {why}"));
             Self::hide(ch, now, events, spots);
         }
+    }
+
+    /// A pinned channel with no Morse-like keying for `PIN_IDLE_S`.
+    fn pin_idle(ch: &Channel, now: f64) -> bool {
+        now - ch.last_good > PIN_IDLE_S
     }
 
     /// A shown channel that has proven real keeps its row through a
@@ -1949,7 +2040,13 @@ impl Skimmer {
                 // strong one, whose envelope also dips with its marks. (A
                 // CWT: K4NMR at 40 dB beside KG9X at 52 was dropped for a
                 // minute at a time, and QSO partners at home likewise.)
-                let agc = much_stronger && weak.level_db < AGC_JUNK_DB && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25;
+                let agc = much_stronger && weak.level_db < AGC_JUNK_DB && tot >= 100 && amp_corr(&strong.amps, &weak.amps, &strong.marks) < -0.25 && {
+                    let ku = keying_under(&strong.marks, &strong.amps, &weak.amps, weak.demod.frame_ms());
+                    if std::env::var_os("CWSK_DEBUG_ART").is_some() {
+                        eprintln!("    agc? t={:.0} {:.0}Hz keying under strong {:.0}Hz ({:.0}/{:.0} dB) {ku:?}", self.time, weak.demod.freq, strong.demod.freq, weak.level_db, strong.level_db);
+                    }
+                    ku.is_none_or(|k| k < AGC_OWN_KEYING_DB)
+                };
                 // Close to a much stronger station, the channel's own
                 // baseband must carry its keying: cancel the strong tone
                 // (`skirt_contrast`) and a skirt copy loses it (W1AW 30 Hz
@@ -2148,7 +2245,7 @@ impl Skimmer {
                     wpm: c.decoder.wpm(),
                     snr_db: c.decoder.snr_db(),
                     text: c.text.clone(),
-                    tentative: c.decoder.tentative(),
+                    tentative: if c.pinned && Self::pin_idle(c, self.time) { String::new() } else { c.decoder.tentative() },
                     is_mark: c.decoder.is_mark(),
                     pinned: c.pinned,
                     last_mark_age: (self.time - c.last_mark) as f32,

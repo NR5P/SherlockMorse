@@ -29,6 +29,10 @@ enum Cmd {
         /// Only decode a single signal at this audio frequency (Hz).
         #[arg(long)]
         freq: Option<f32>,
+        /// Decode the whole band, with a channel at this audio frequency
+        /// (Hz) pinned as if selected in the app.
+        #[arg(long)]
+        pin: Option<f32>,
         /// Disable the language model.
         #[arg(long)]
         no_lm: bool,
@@ -227,7 +231,7 @@ enum KindArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Decode { file, freq, no_lm, min_freq, max_freq, reference, skip, duration } => {
+        Cmd::Decode { file, freq, pin, no_lm, min_freq, max_freq, reference, skip, duration } => {
             let (mut samples, rate) = cwskimmer::audiofile::read_audio(&file)?;
             let s0 = ((skip * rate as f32) as usize).min(samples.len());
             samples.drain(..s0);
@@ -239,7 +243,7 @@ fn main() -> Result<()> {
             let detect_db = std::env::var("CWSK_DETECT_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(SkimmerConfig::default().detect_db);
             let cfg = SkimmerConfig { min_freq, max_freq, auto_detect: freq.is_none(), params: DecoderParams::from_env(), detect_db, ..Default::default() };
             let mut sk = Skimmer::new(cfg, lm);
-            if let Some(f) = freq {
+            if let Some(f) = freq.or(pin) {
                 sk.add_channel(f, true);
             }
             let mut rs = Resampler::new(rate, RATE);

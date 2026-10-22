@@ -168,6 +168,7 @@ cwtool rig --kind yaesu --port /dev/ttyUSB0 --baud 38400            # read VFO
 cwtool rig --kind yaesu --port /dev/ttyUSB0 --set 14025000          # QSY
 cwtool decode recording.mp3         # decode every signal in a recording
 cwtool decode w1aw.mp3 --reference w1aw.txt   # measure character error rate
+cwtool decode rec.wav --pin 701     # decode it with the 701 Hz signal selected, as in the app
 cwtool synth --pileup -o band.wav   # generate a 6-station test scene
 cwtool bench --compare-lm           # synthetic benchmark suite
 cwtool weak rec.wav --freq 750 --noise band*.wav   # fade a recording into real band noise
