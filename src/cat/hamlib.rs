@@ -90,4 +90,13 @@ impl Rig for Rigctld {
         };
         self.cmd(&format!("M {m} 0"))
     }
+    fn get_pitch(&mut self) -> Result<Option<u32>> {
+        self.writer.write_all(b"l CWPITCH\n")?;
+        let r = self.line()?;
+        // "RPRT -n" when the radio or backend has no CW pitch level.
+        if r.starts_with("RPRT") {
+            return Ok(None);
+        }
+        Ok(r.parse::<f64>().ok().map(|p| p as u32))
+    }
 }

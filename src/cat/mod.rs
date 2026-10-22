@@ -150,14 +150,21 @@ pub trait Rig: Send {
 }
 
 pub fn open_serial(cfg: &RigConfig, stop_bits_two: bool) -> Result<Box<dyn serialport::SerialPort>> {
-    let mut p = serialport::new(&cfg.port, cfg.baud)
-        .timeout(Duration::from_millis(250))
-        .data_bits(serialport::DataBits::Eight)
-        .parity(serialport::Parity::None)
-        .stop_bits(if stop_bits_two { serialport::StopBits::Two } else { serialport::StopBits::One })
-        .flow_control(serialport::FlowControl::None)
-        .open()
-        .map_err(|e| anyhow!("cannot open {}: {e}", cfg.port))?;
+    let open = |baud: u32| {
+        serialport::new(&cfg.port, baud)
+            .timeout(Duration::from_millis(250))
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(if stop_bits_two { serialport::StopBits::Two } else { serialport::StopBits::One })
+            .flow_control(serialport::FlowControl::None)
+            .open()
+    };
+    // On macOS the baud rate is set with the IOSSIOSPEED ioctl, which a
+    // pseudo-terminal (e.g. a RigHelm virtual port) rejects with ENOTTY.
+    // A PTY has no baud rate, so retry without setting one.
+    let first = open(cfg.baud);
+    let first = if cfg!(target_os = "macos") && first.is_err() { open(0).or(first) } else { first };
+    let mut p = first.map_err(|e| anyhow!("cannot open {}: {e}", cfg.port))?;
     // Set the control lines immediately after opening (the OS may raise
     // them on open). Low unless explicitly enabled, so we never key PTT/CW.
     let _ = p.write_request_to_send(cfg.assert_rts);
@@ -258,5 +265,33 @@ pub fn list_ports() -> Vec<(String, String)> {
         })
         .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
-    v.into_iter().map(|(a, b, _)| (a, b)).collect()
+    let mut out = righelm_ports();
+    out.extend(v.into_iter().map(|(a, b, _)| (a, b)));
+    out
+}
+
+/// RigHelm's virtual serial ports, if it is running. They are symlinks to
+/// PTYs, so the OS port enumeration does not list them.
+fn righelm_ports() -> Vec<(String, String)> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    // Same directory RigHelm uses: $XDG_RUNTIME_DIR/ftdx3000 on Linux,
+    // /tmp/ftdx3000-$USER where there is no XDG runtime dir (macOS).
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) => std::path::PathBuf::from(d).join("ftdx3000"),
+        None => format!("/tmp/ftdx3000-{}", std::env::var("USER").unwrap_or_else(|_| "user".into())).into(),
+    };
+    let mut v: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_symlink()) && e.path().exists())
+        .map(|e| {
+            let desc = if e.file_name() == "sim" { "RigHelm simulator" } else { "RigHelm virtual port" };
+            (e.path().to_string_lossy().into_owned(), desc.to_string())
+        })
+        .collect();
+    v.sort();
+    v
 }

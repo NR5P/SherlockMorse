@@ -542,8 +542,11 @@ impl Run {
                 return Ok(());
             }
             let left = t - now;
-            if left > Duration::from_micros(1500) {
-                match self.rx.recv_timeout(left - Duration::from_micros(1000)) {
+            // macOS lets a timed wait run late by up to about a quarter of its
+            // length, so there it sleeps in shrinking steps before spinning.
+            let margin = if cfg!(target_os = "macos") { left / 3 } else { Duration::ZERO } + Duration::from_micros(1000);
+            if left > margin + Duration::from_micros(500) {
+                match self.rx.recv_timeout(left - margin) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => {
                         self.stopping = true;
                         return Err(Stopped);
@@ -904,10 +907,10 @@ mod tests {
         let mut master: std::os::raw::c_int = 0;
         let mut slave: std::os::raw::c_int = 0;
         let mut name = [0 as std::os::raw::c_char; 128];
-        let r = unsafe { libc::openpty(&mut master, &mut slave, name.as_mut_ptr(), std::ptr::null(), std::ptr::null()) };
+        let r = unsafe { libc::openpty(&mut master, &mut slave, name.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) };
         assert_eq!(r, 0);
         let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_str().unwrap().to_string();
-        assert!(path.starts_with("/dev/pts/"), "{path}");
+        assert!(path.starts_with("/dev/pts/") || path.starts_with("/dev/ttys"), "{path}");
         let cfg = KeyerConfig { port: path.clone(), ..Default::default() };
         match SerialKey::open(&cfg) {
             Err(e) => assert!(e.to_string().contains("DTR/RTS"), "{e}"),
