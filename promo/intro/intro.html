@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sherlock Morse Intro</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: absolute; inset: 0; margin: auto; display: block; }
+  #ui { position: fixed; left: 16px; bottom: 16px; display: flex; gap: 8px; font: 14px system-ui, sans-serif; }
+  #ui button { background: #1d1a24; color: #f1e4c6; border: 1px solid #c2452d88; border-radius: 6px; padding: 8px 14px; cursor: pointer; font: inherit; }
+  body.render #ui { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<div id="ui"><button id="play">&#9654; Play</button></div>
+<script src="timeline.js"></script>
+<script>
+'use strict';
+const TL = window.TIMELINE;
+const T = TL.T;
+const W = 1920, H = 1080, FPS = TL.FPS;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+// logo palette
+const CREAM = '#f1e4c6', PARCH = '#e6d2a8', INK = '#1d1a24', RED = '#c2452d', MUTED = '#b8a687';
+const SERIF = 'Baskerville, "Playfair Display", Georgia, serif';
+const UI_FONT = 'system-ui, -apple-system, "Helvetica Neue", sans-serif';
+const MONO = '"SF Mono", Menlo, Monaco, monospace';
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const easeOutCubic = (x) => 1 - Math.pow(1 - x, 3);
+const easeInCubic = (x) => x * x * x;
+const easeInOutCubic = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+const easeOutBack = (x, s = 1.70158) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2);
+const easeOutExpo = (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x));
+function hash(a, b) {
+  let h = Math.imul(a | 0, 374761393) ^ Math.imul(b | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function rrect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.roundRect(x, y, w, h, Math.min(r, h / 2, w / 2));
+}
+
+// ---------- waterfall (the app's colormap) ----------
+const STOPS = [[0, [0, 0, 0]], [0.25, [0, 25, 153]], [0.45, [0, 178, 229]], [0.65, [255, 242, 51]], [0.85, [255, 51, 25]], [1, [255, 255, 255]]];
+const LUT = new Uint8ClampedArray(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  let k = 0;
+  while (k < STOPS.length - 2 && t > STOPS[k + 1][0]) k++;
+  const [a0, ac] = STOPS[k], [b0, bc] = STOPS[k + 1];
+  const f = clamp((t - a0) / (b0 - a0));
+  for (let j = 0; j < 3; j++) LUT[i * 3 + j] = ac[j] + f * (bc[j] - ac[j]);
+}
+
+const WF_W = TL.WF_W, WF_H = TL.WF_H, SX = W / WF_W, RPS = TL.RPS; // rows per second
+const wfCanvas = document.createElement('canvas');
+wfCanvas.width = WF_W; wfCanvas.height = WF_H;
+const wfCtx = wfCanvas.getContext('2d');
+const wfImg = wfCtx.createImageData(WF_W, WF_H);
+const rowCache = new Map();
+const acc = new Float32Array(WF_W);
+
+function gauss(center, sigma, amp) {
+  const lo = Math.max(0, Math.floor(center - 4 * sigma)), hi = Math.min(WF_W - 1, Math.ceil(center + 4 * sigma));
+  for (let x = lo; x <= hi; x++) { const d = (x - center) / sigma; acc[x] += amp * Math.exp(-0.5 * d * d); }
+}
+
+// A row is a pure function of the moment it was received, so it never changes as it scrolls.
+function wfRow(k) {
+  let row = rowCache.get(k);
+  if (row) return row;
+  const rt = k / RPS;
+  for (let x = 0; x < WF_W; x++) {
+    acc[x] = 0.1 + 0.09 * hash(x, k) + 0.05 * hash(x >> 2, k >> 1);
+  }
+  gauss(281, 1.2, 0.2); // a birdie the skimmer ignores
+  for (const s of TL.signals) {
+    const kc = TL.cover(s.keys, rt, rt + 1 / RPS) * RPS;
+    if (kc <= 0) continue;
+    const qsb = s === TL.target ? 1 : 0.8 + 0.2 * Math.sin(rt * 0.9 + s.col);
+    gauss(s.col, 1.15, s.amp * qsb * kc);
+    gauss(s.col, 4.5, 0.1 * s.amp * kc);
+  }
+  row = new Uint8ClampedArray(WF_W * 4);
+  for (let x = 0; x < WF_W; x++) {
+    const i = Math.round(clamp(acc[x]) * 255) * 3;
+    row[x * 4] = LUT[i]; row[x * 4 + 1] = LUT[i + 1]; row[x * 4 + 2] = LUT[i + 2]; row[x * 4 + 3] = 255;
+  }
+  rowCache.set(k, row);
+  return row;
+}
+function buildWaterfall(fi) {
+  const k0 = fi * (RPS / FPS);
+  for (let y = 0; y < WF_H; y++) wfImg.data.set(wfRow(k0 - y), y * WF_W * 4);
+  wfCtx.putImageData(wfImg, 0, 0);
+}
+
+// ---------- fog, grain, vignette ----------
+function fogTexture(seed, period) {
+  const w = 512, h = 256;
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x2 = c.getContext('2d');
+  const img = x2.createImageData(w, h);
+  const sm = (u) => u * u * (3 - 2 * u);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 0, amp = 0.5, norm = 0;
+      for (let o = 0; o < 5; o++) {
+        const px = period << o, py = (period >> 1) << o;
+        const fx = (x / w) * px, fy = (y / h) * py;
+        const ix = Math.floor(fx), iy = Math.floor(fy);
+        const ux = sm(fx - ix), uy = sm(fy - iy);
+        const q = (a, b) => hash(((a % px) + px) % px + seed * 977 + o * 131, ((b % py) + py) % py + o * 71);
+        v += amp * lerp(lerp(q(ix, iy), q(ix + 1, iy), ux), lerp(q(ix, iy + 1), q(ix + 1, iy + 1), ux), uy);
+        norm += amp; amp *= 0.5;
+      }
+      v /= norm;
+      const a = Math.pow(clamp((v - 0.38) * 2.2), 1.6);
+      const i = (y * w + x) * 4;
+      img.data[i] = 210; img.data[i + 1] = 200; img.data[i + 2] = 182; img.data[i + 3] = a * 255;
+    }
+  }
+  x2.putImageData(img, 0, 0);
+  return c;
+}
+const fogs = [fogTexture(1, 4), fogTexture(2, 3)];
+
+const grains = [];
+for (let n = 0; n < 4; n++) {
+  const g = document.createElement('canvas');
+  g.width = 480; g.height = 270;
+  const gc = g.getContext('2d');
+  const im = gc.createImageData(480, 270);
+  for (let i = 0; i < im.data.length; i += 4) {
+    const v = hash(i, n + 11) * 255;
+    im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255;
+  }
+  gc.putImageData(im, 0, 0);
+  grains.push(g);
+}
+const vignette = document.createElement('canvas');
+vignette.width = W; vignette.height = H;
+{
+  const vc = vignette.getContext('2d');
+  const g = vc.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, W * 0.62);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.78)');
+  vc.fillStyle = g; vc.fillRect(0, 0, W, H);
+}
+
+// ---------- the cameo (docs/logo/sherlock-morse-icon-strong.svg) ----------
+const P = (d) => new Path2D(d);
+const SIL = [
+  P('M86,512 C104,462 162,432 222,416 L238,404 L304,404 L320,416 C374,430 424,462 444,512 Z'),
+  P('M176,246 L340,246 C342,254 346,260 352,266 C354,270 350,274 347,277 C360,286 378,300 392,314 C396,320 392,326 384,326 C376,326 370,326 366,328 C364,332 366,335 368,337 C366,340 362,341 360,342 C364,344 366,347 363,350 C360,352 359,354 361,357 C366,362 369,370 367,378 C365,384 358,387 350,386 C336,384 322,382 314,380 C320,392 318,402 311,412 L236,412 C236,392 232,372 220,352 C196,336 176,312 172,282 C170,266 172,254 176,246 Z'),
+  P('M162,248 C162,170 214,128 260,128 C316,128 352,170 352,246 Z'),
+  P('M326,236 C356,232 392,240 410,256 C380,260 346,256 320,250 Z'),
+  P('M190,236 C162,236 132,246 114,262 C146,266 176,260 198,252 Z'),
+];
+const HILITE = [
+  [P('M170,250 L338,250'), 5, 1], [P('M259,132 L260,244'), 3, 0.7],
+  [P('M240,274 C258,270 266,292 256,308 C252,314 246,314 244,310'), 4, 1], [P('M330,279 L343,281'), 4, 1],
+  [P('M314,302 C326,312 332,326 330,342'), 3, 0.8], [P('M222,418 L262,452 L240,410 M318,418 L284,452 L304,410'), 4, 1],
+];
+const STEM = P('M361,342 C378,352 390,374 410,378');
+const BOWL = P('M404,336 C402,372 410,398 428,398 C446,398 456,372 454,336 C440,331 418,331 404,336 Z');
+// smoke puffs, bottom first: ..--.. ("?")
+const PUFFS = [[419, 296, 18, 1], [435, 260, 18, 0.92], [406, 224, 52, 0.84], [390, 188, 52, 0.76], [423, 152, 18, 0.68], [439, 116, 18, 0.6]];
+const CX = 256, CY = 282, CR = 196;
+
+function emberGlow(t) {
+  let k = 0;
+  for (const e of TL.smoke.chars[0].els) k = Math.max(k, Math.exp(-Math.max(0, t - e.b) / 0.18) * (t >= e.a ? 1 : 0));
+  return 0.35 + 0.15 * Math.sin(t * 7.1) * Math.sin(t * 3.3) + 0.5 * k;
+}
+
+// Draws the cameo filling a circle of radius R at (cx, cy); `iris` < 1 reveals it from the centre.
+// `part` is 'all', 'body' (under the glass) or 'pipe' (over the frame).
+function drawCameo(cx, cy, R, iris, t, part = 'all') {
+  const s = R / CR;
+  ctx.save();
+  if (part !== 'pipe') {
+  ctx.translate(cx, cy); ctx.scale(s, s); ctx.translate(-CX, -CY);
+  ctx.beginPath(); ctx.arc(CX, CY, CR * iris, 0, Math.PI * 2); ctx.clip();
+  const bg = ctx.createRadialGradient(CX - 40, CY - 60, 10, CX, CY, CR);
+  bg.addColorStop(0, '#f3e5c4'); bg.addColorStop(0.7, PARCH); bg.addColorStop(1, '#cdb487');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, 512, 512);
+  ctx.strokeStyle = 'rgba(29,26,36,0.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(CX, CY, 182, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = INK;
+  for (const p of SIL) ctx.fill(p);
+  ctx.beginPath(); ctx.ellipse(244, 124, 18, 9, -20 * Math.PI / 180, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(278, 124, 18, 9, 20 * Math.PI / 180, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = PARCH; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const [p, w, a] of HILITE) { ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke(p); }
+  ctx.globalAlpha = 1;
+  }
+  if (part === 'body') { ctx.restore(); return; }
+  if (part === 'pipe') { ctx.translate(cx, cy); ctx.scale(s, s); ctx.translate(-CX, -CY); }
+  // the pipe pokes out over the frame
+  ctx.strokeStyle = INK; ctx.lineWidth = 9; ctx.lineCap = 'round';
+  ctx.stroke(STEM);
+  ctx.fillStyle = INK; ctx.fill(BOWL);
+  ctx.strokeStyle = 'rgba(241,228,198,0.25)'; ctx.lineWidth = 2; ctx.stroke(BOWL);
+  const glow = emberGlow(t);
+  ctx.fillStyle = RED;
+  ctx.beginPath(); ctx.ellipse(429, 336, 21, 4.5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'lighter';
+  const eg = ctx.createRadialGradient(429, 334, 0, 429, 334, 46);
+  eg.addColorStop(0, `rgba(255,140,60,${0.55 * glow})`); eg.addColorStop(1, 'rgba(255,90,40,0)');
+  ctx.fillStyle = eg; ctx.fillRect(380, 290, 100, 90);
+  ctx.restore();
+}
+
+// The pipe smoke rises in Morse: each puff leaves the bowl as it is keyed.
+function drawSmoke(cx, cy, R, t, alpha) {
+  if (alpha <= 0) return;
+  const s = R / CR;
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(s, s); ctx.translate(-CX, -CY);
+  const els = TL.smoke.chars[0].els;
+  PUFFS.forEach(([x, y, w, op], i) => {
+    const e = els[i];
+    if (t < e.a) return;
+    const fly = easeOutBack(seg(t, e.a, e.a + 0.42), 1.3);
+    const grow = e.sym === '-' ? seg(t, e.a, e.b) : 1;
+    const ww = lerp(16, w, grow);
+    const drift = Math.sin(t * 1.4 + i * 1.7) * 3 * (i / 5) * seg(t, e.a + 0.4, e.a + 1.2);
+    const px = lerp(429 - ww / 2, x + (w - ww) / 2, fly) + drift;
+    const py = lerp(326, y, fly) + Math.sin(t * 2 + i) * 1.5;
+    ctx.globalAlpha = alpha * op * seg(t, e.a, e.a + 0.08);
+    ctx.shadowColor = 'rgba(255,90,50,0.6)'; ctx.shadowBlur = 18 * s;
+    ctx.fillStyle = RED;
+    rrect(ctx, px, py, ww, 16, 8); ctx.fill();
+  });
+  ctx.restore();
+}
+
+// ---------- the magnifying glass ----------
+const MAG = 1.55;
+function brass(c, x0, y0, x1, y1) {
+  const g = c.createLinearGradient(x0, y0, x1, y1);
+  g.addColorStop(0, '#6b4c1f'); g.addColorStop(0.22, '#e9c97c'); g.addColorStop(0.45, '#8f6a2f');
+  g.addColorStop(0.62, '#f7e2a6'); g.addColorStop(0.82, '#7d5b26'); g.addColorStop(1, '#c9a35a');
+  return g;
+}
+const HANDLE_A = 0.62;
+function drawHandle(cx, cy, r, rim, alpha, slide) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(cx, cy); ctx.rotate(HANDLE_A);
+  const d0 = r + rim - 6 + slide;
+  ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 30; ctx.shadowOffsetY = 12;
+  // collar
+  ctx.fillStyle = brass(ctx, 0, -18, 0, 18);
+  rrect(ctx, d0, -16, 54, 32, 6); ctx.fill();
+  ctx.shadowColor = 'transparent';
+  // walnut grip
+  const wood = ctx.createLinearGradient(0, -22, 0, 22);
+  wood.addColorStop(0, '#1c0f08'); wood.addColorStop(0.3, '#5a3219'); wood.addColorStop(0.45, '#8a5530');
+  wood.addColorStop(0.6, '#4a2813'); wood.addColorStop(1, '#140a05');
+  ctx.fillStyle = wood;
+  ctx.beginPath();
+  ctx.moveTo(d0 + 52, -17); ctx.lineTo(d0 + 270, -21);
+  ctx.quadraticCurveTo(d0 + 292, 0, d0 + 270, 21); ctx.lineTo(d0 + 52, 17); ctx.closePath(); ctx.fill();
+  for (const u of [0.25, 0.5, 0.75]) {
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 2;
+    const x = d0 + 52 + 218 * u;
+    ctx.beginPath(); ctx.moveTo(x, -18.5); ctx.lineTo(x, 18.5); ctx.stroke();
+  }
+  ctx.fillStyle = brass(ctx, 0, -16, 0, 16);
+  rrect(ctx, d0 + 46, -19, 12, 38, 4); ctx.fill();
+  rrect(ctx, d0 + 266, -22, 10, 44, 4); ctx.fill();
+  ctx.restore();
+}
+
+function drawRim(cx, cy, r, rim, glow) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.65)'; ctx.shadowBlur = 40; ctx.shadowOffsetY = 14;
+  ctx.strokeStyle = brass(ctx, cx - r, cy - r, cx + r, cy + r);
+  ctx.lineWidth = rim;
+  ctx.beginPath(); ctx.arc(cx, cy, r + rim / 2, 0, Math.PI * 2); ctx.stroke();
+  ctx.shadowColor = 'transparent';
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = 'rgba(40,25,8,0.9)';
+  ctx.beginPath(); ctx.arc(cx, cy, r + 0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, r + rim - 0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,240,200,0.55)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(cx, cy, r + rim * 0.3, Math.PI * 1.05, Math.PI * 1.55); ctx.stroke();
+  if (glow > 0) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = `rgba(255,190,90,${0.5 * glow})`;
+    ctx.lineWidth = rim + 10;
+    ctx.shadowColor = `rgba(255,170,70,${glow})`; ctx.shadowBlur = 50;
+    ctx.beginPath(); ctx.arc(cx, cy, r + rim / 2, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function label(x, y, text, col, a, size) {
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.font = `600 ${size}px ${MONO}`;
+  const w = ctx.measureText(text).width;
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  rrect(ctx, x - 5, y - 3, w + 10, size + 8, 5); ctx.fill();
+  ctx.strokeStyle = col.replace('rgb', 'rgba').replace(')', ',0.6)'); ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = col; ctx.textBaseline = 'top';
+  ctx.fillText(text, x, y + 1);
+  ctx.restore();
+}
+
+// Inside the glass: the waterfall in full colour, magnified, with every signal identified.
+function drawLensView(cx, cy, r, t, iris) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.clip();
+  if (iris < 1) {
+    ctx.save();
+    ctx.translate(cx, cy); ctx.scale(MAG, MAG); ctx.translate(-cx, -cy);
+    ctx.imageSmoothingEnabled = true;
+    ctx.filter = 'contrast(1.2) brightness(0.92)';
+    ctx.drawImage(wfCanvas, 0, 0, W, H);
+    ctx.filter = 'none';
+    ctx.restore();
+    const now = Math.round(t * FPS) / FPS;
+    for (const s of TL.signals) {
+      const x = cx + (s.col * SX - cx) * MAG;
+      const dx = Math.abs(x - cx) / r;
+      if (dx > 0.92) continue;
+      let text, col;
+      if (s === TL.target) {
+        if (t < T.morseStart - 0.3) continue;
+        const done = t >= T.morseEnd + 0.05;
+        text = done ? s.call : `${s.wpm}wpm`;
+        col = done ? 'rgb(255,210,90)' : 'rgb(170,200,255)';
+      } else {
+        text = s.call ?? `${s.wpm}wpm`;
+        col = s.call ? 'rgb(255,210,90)' : 'rgb(170,200,255)';
+      }
+      const a = clamp((0.92 - dx) / 0.2) * (1 - iris);
+      const ly = cy - r * 0.66;
+      const on = TL.cover(s.keys, now - 0.02, now) > 0;
+      ctx.fillStyle = on ? (s.call ? 'rgb(255,230,120)' : 'rgb(120,255,120)') : 'rgba(120,160,255,0.6)';
+      ctx.globalAlpha = a;
+      ctx.fillRect(x - 1.5, ly - 22, 3, 16);
+      ctx.globalAlpha = 1;
+      const pop = s === TL.target && t >= T.morseEnd + 0.05 ? 1 + 0.25 * Math.exp(-(t - T.morseEnd - 0.05) / 0.12) : 1;
+      label(x + 6, ly - 4, text, col, a, Math.round(25 * pop));
+    }
+  }
+  if (iris > 0) drawCameo(cx, cy, r, Math.min(1, iris), t, iris >= 1 ? 'body' : 'all');
+  // glass: darker toward the rim, a highlight up and to the left
+  const sh = ctx.createRadialGradient(cx, cy, r * 0.7, cx, cy, r);
+  sh.addColorStop(0, 'rgba(0,0,0,0)'); sh.addColorStop(1, `rgba(10,6,0,${lerp(0.5, 0.25, iris)})`);
+  ctx.fillStyle = sh; ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+  ctx.globalCompositeOperation = 'screen';
+  ctx.save();
+  ctx.translate(cx - r * 0.36, cy - r * 0.42); ctx.rotate(-0.65);
+  const hl = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.5);
+  hl.addColorStop(0, `rgba(255,250,235,${lerp(0.22, 0.12, iris)})`); hl.addColorStop(1, 'rgba(255,250,235,0)');
+  ctx.scale(1, 0.38);
+  ctx.fillStyle = hl; ctx.beginPath(); ctx.arc(0, 0, r * 0.5, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,250,235,0.3)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(cx, cy, r - 9, Math.PI * 1.08, Math.PI * 1.42); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- lockup layout ----------
+const WORD_FONT = `148px ${SERIF}`;
+const R_END = 188, RIM_END = 12, GAP = 96;
+let LAY = null;
+function layout() {
+  if (LAY) return LAY;
+  ctx.save();
+  ctx.font = WORD_FONT;
+  const word = 'Sherlock Morse';
+  const wordW = ctx.measureText(word).width;
+  const xs = [];
+  for (let i = 0; i < word.length; i++) xs.push(ctx.measureText(word.slice(0, i)).width);
+  ctx.font = `500 24px ${UI_FONT}`;
+  const chips = TL.chipLabels.map((s) => ({ s, w: ctx.measureText(s).width + 40 }));
+  const chipsW = chips.reduce((a, c) => a + c.w, 0) + 14 * (chips.length - 1);
+  ctx.restore();
+  const blockW = Math.max(wordW, chipsW);
+  const total = 2 * (R_END + RIM_END) + GAP + blockW;
+  const left = (W - total) / 2;
+  const mx = left + R_END + RIM_END, my = 528;
+  const tx = mx + R_END + RIM_END + GAP;
+  LAY = { word, wordW, xs, chips, mx, my, tx, base: my - 4 };
+  return LAY;
+}
+
+// ---------- pieces ----------
+function drawScale(alpha) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, 34);
+  ctx.font = `15px ${MONO}`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let f = 200; f <= 1100; f += 50) {
+    const x = (TL.MID + (f - 650) / 1.6) * SX;
+    const major = f % 100 === 0;
+    ctx.fillStyle = major ? 'rgba(220,220,220,0.75)' : 'rgba(220,220,220,0.35)';
+    ctx.fillRect(x - 0.5, 34 - (major ? 10 : 6), 1, major ? 10 : 6);
+    if (major) ctx.fillText(String(f), x, 5);
+  }
+  ctx.restore();
+}
+
+const SLOT = 96, DEC_Y = 880, KEY_Y = 935;
+function slotX(i) { return W / 2 + (i - (TL.WORD.length - 1) / 2) * SLOT; }
+
+// The decode: letters land as they are copied, the current letter's code keys out beneath.
+function drawDecode(t) {
+  if (t < T.morseStart || t > T.impact) return;
+  const absorb = seg(t, T.riseStart, T.impact - 0.08);
+  const lens = TL.pathAt(t);
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  TL.chars.forEach((c, i) => {
+    if (t < c.end) return;
+    const p = seg(t, c.end, c.end + 0.25);
+    const e = easeInCubic(clamp(absorb * 1.25 - i * 0.03));
+    const x = lerp(slotX(i), lens.x, e), y = lerp(DEC_Y, lens.y + 30, e);
+    const sc = lerp(1 + 0.3 * (1 - easeOutCubic(p)), 0.25, e);
+    ctx.save();
+    ctx.translate(x, y); ctx.scale(sc, sc);
+    ctx.globalAlpha = p * (1 - e);
+    ctx.font = `96px ${SERIF}`;
+    ctx.shadowColor = `rgba(255,200,120,${0.6 * (1 - p) + 0.25})`; ctx.shadowBlur = 24;
+    ctx.fillStyle = CREAM;
+    ctx.fillText(c.ch, 0, 0);
+    ctx.restore();
+  });
+  // the letter being keyed now
+  const cur = TL.chars.find((c) => t >= c.start && t < c.end + 0.16);
+  if (cur && absorb === 0) {
+    const fade = 1 - seg(t, cur.end, cur.end + 0.14);
+    const unit = TL.UNIT;
+    const len = (e) => (e.sym === '.' ? 18 : 58);
+    const total = cur.els.reduce((a, e) => a + len(e), 0) + 14 * (cur.els.length - 1);
+    let x = W / 2 - total / 2;
+    ctx.globalAlpha = fade;
+    ctx.shadowColor = 'rgba(255,90,50,0.7)'; ctx.shadowBlur = 16;
+    for (const e of cur.els) {
+      if (t >= e.a) {
+        const g = e.sym === '-' ? seg(t, e.a, e.b) : 1;
+        ctx.fillStyle = RED;
+        rrect(ctx, x, KEY_Y - 8, lerp(18, len(e), g), 16, 8); ctx.fill();
+      }
+      x += len(e) + 14;
+    }
+    void unit;
+  }
+  ctx.restore();
+}
+
+function drawWordmark(t) {
+  const L = layout();
+  if (t < T.wordStart) return;
+  ctx.save();
+  ctx.font = WORD_FONT;
+  ctx.textBaseline = 'alphabetic';
+  const grad = ctx.createLinearGradient(0, L.base - 110, 0, L.base + 10);
+  grad.addColorStop(0, '#fbf2dc'); grad.addColorStop(1, '#dcc79c');
+  const shineX = lerp(-300, L.wordW + 300, easeInOutCubic(seg(t, T.shine, T.shine + 0.9)));
+  for (let i = 0; i < L.word.length; i++) {
+    const ch = L.word[i];
+    if (ch === ' ') continue;
+    const p = seg(t, T.wordStart + i * T.letterStep, T.wordStart + i * T.letterStep + 0.45);
+    if (p <= 0) continue;
+    const e = easeOutCubic(p);
+    const x = L.tx + L.xs[i];
+    ctx.globalAlpha = e;
+    ctx.filter = p < 1 ? `blur(${(1 - e) * 10}px)` : 'none';
+    ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 24; ctx.shadowOffsetY = 6;
+    ctx.fillStyle = grad;
+    ctx.fillText(ch, x, L.base + 34 * (1 - e));
+    // shine passing over the letter
+    const d = (L.xs[i] + 40 - shineX) / 120;
+    const sh = Math.exp(-d * d);
+    if (sh > 0.02 && t > T.shine) {
+      ctx.shadowColor = 'transparent';
+      ctx.globalAlpha = 0.85 * sh;
+      ctx.fillStyle = '#fffaf0';
+      ctx.fillText(ch, x, L.base);
+    }
+  }
+  ctx.restore();
+}
+
+// "... --" (SM) and CW SKIMMER, as in the logo
+function drawSkimmer(t) {
+  const L = layout();
+  if (t < T.skimmer) return;
+  const y = L.base + 52;
+  ctx.save();
+  const items = [['.', 0], ['.', 0], ['.', 0], ['-', 1], ['-', 1]];
+  let x = L.tx + 6;
+  items.forEach(([s], i) => {
+    const w = s === '.' ? 20 : 62;
+    const p = easeOutBack(seg(t, T.skimmer + i * 0.05, T.skimmer + i * 0.05 + 0.35), 2);
+    if (p > 0) {
+      ctx.globalAlpha = clamp(p);
+      ctx.fillStyle = RED;
+      rrect(ctx, x, y - 7, w * clamp(p, 0, 1.2), 14, 7); ctx.fill();
+    }
+    x += w + (i === 2 ? 34 : 14);
+  });
+  const p = seg(t, T.skimmer + 0.25, T.skimmer + 0.85);
+  ctx.globalAlpha = easeOutCubic(p);
+  ctx.font = `36px ${SERIF}`;
+  ctx.letterSpacing = `${lerp(30, 9, easeOutCubic(p))}px`;
+  ctx.fillStyle = RED;
+  ctx.textBaseline = 'middle';
+  ctx.fillText('CW SKIMMER', x + 22, y + 2);
+  ctx.restore();
+}
+
+function drawTagline(t) {
+  const L = layout();
+  if (t < T.tagline) return;
+  const text = 'Elementary, my dear QSO.';
+  const n = Math.min(text.length, Math.floor((t - T.tagline) / T.charStep) + 1);
+  ctx.save();
+  ctx.font = `italic 44px ${SERIF}`;
+  ctx.fillStyle = MUTED;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(text.slice(0, n), L.tx + 2, L.base + 128);
+  if (n < text.length || (t - T.tagline - text.length * T.charStep) < 0.5) {
+    const w = ctx.measureText(text.slice(0, n)).width;
+    if (Math.floor(t * 6) % 2 === 0) { ctx.fillStyle = RED; ctx.fillRect(L.tx + 6 + w, L.base + 96, 3, 38); }
+  }
+  ctx.restore();
+}
+
+function drawChips(t) {
+  const L = layout();
+  let x = L.tx;
+  const y = L.base + 172;
+  ctx.save();
+  ctx.font = `500 24px ${UI_FONT}`;
+  ctx.textBaseline = 'middle';
+  L.chips.forEach((c, i) => {
+    const p = seg(t, T.chips + i * T.chipStep, T.chips + i * T.chipStep + 0.4);
+    if (p > 0) {
+      const s = easeOutBack(p, 2.2);
+      ctx.save();
+      ctx.translate(x + c.w / 2, y + 23);
+      ctx.scale(s, s);
+      ctx.globalAlpha = clamp(p * 2);
+      ctx.fillStyle = 'rgba(241,228,198,0.07)';
+      ctx.strokeStyle = 'rgba(241,228,198,0.38)'; ctx.lineWidth = 1.5;
+      rrect(ctx, -c.w / 2, -23, c.w, 46, 23); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#ece0c4';
+      ctx.textAlign = 'center';
+      ctx.fillText(c.s, 0, 1);
+      ctx.restore();
+    }
+    x += c.w + 14;
+  });
+  ctx.restore();
+}
+
+// ---------- frame ----------
+function renderAt(t) {
+  const fi = Math.round(t * FPS);
+  const L = layout();
+  const I = T.impact;
+  buildWaterfall(fi);
+
+  ctx.save();
+  ctx.fillStyle = '#060509'; ctx.fillRect(0, 0, W, H);
+  // slow push in, a kick on the impact
+  const push = 1 + 0.035 * seg(t, 0, I) + 0.02 * seg(t, I, TL.DURATION);
+  const kick = t >= I ? Math.exp(-(t - I) / 0.18) : 0;
+  ctx.translate(W / 2 + (hash(fi, 1) - 0.5) * 26 * kick, H / 2 + (hash(fi, 2) - 0.5) * 26 * kick);
+  ctx.scale(push, push);
+  ctx.translate(-W / 2, -H / 2);
+
+  // the band, out of focus in the fog
+  const after = seg(t, I, I + 1.2);
+  ctx.filter = `blur(2.5px) saturate(${lerp(0.4, 0.3, after)}) sepia(0.35) brightness(${lerp(0.55, 0.3, after)})`;
+  ctx.drawImage(wfCanvas, 0, 0, W, H);
+  ctx.filter = 'none';
+  drawScale(0.8 * seg(t, 0.2, 0.8) * (1 - seg(t, T.riseStart, I)));
+
+  // fog drifting through
+  ctx.save();
+  fogs.forEach((f, i) => {
+    const fw = 2400, fh = 1200;
+    const off = (((i ? 1 : -1) * t * (i ? 32 : 46)) % fw + fw) % fw;
+    ctx.globalAlpha = (i ? 0.3 : 0.38) * lerp(1, 0.55, after);
+    for (const dx of [-fw, 0]) ctx.drawImage(f, off + dx, -60 + i * 30, fw, fh);
+  });
+  ctx.restore();
+
+  // where the glass is
+  const path = TL.pathAt(t);
+  const rise = easeInOutCubic(seg(t, T.riseStart, I));
+  const mv = easeInOutCubic(seg(t, T.moveStart, T.moveEnd));
+  const pop = t >= I ? 0.07 * Math.exp(-(t - I) / 0.12) : 0;
+  const cx = lerp(path.x, L.mx, mv);
+  const cy = lerp(path.y - 20 * rise, L.my, mv);
+  const r = lerp(lerp(TL.LENS_R, TL.LENS_R * 1.08, rise) * (1 + pop), R_END, mv);
+  const rim = lerp(22, RIM_END, mv);
+  const iris = t >= I ? easeOutExpo(seg(t, I, I + 0.45)) : 0;
+
+  // gaslight pooling around the glass
+  {
+    const a = 0.22 + 0.25 * rise + 0.3 * kick;
+    const g = ctx.createRadialGradient(cx, cy, r * 0.6, cx, cy, r * 2.6);
+    g.addColorStop(0, `rgba(255,190,110,${a})`); g.addColorStop(1, 'rgba(255,170,90,0)');
+    ctx.save(); ctx.globalCompositeOperation = 'screen';
+    ctx.fillStyle = g; ctx.fillRect(cx - r * 3, cy - r * 3, r * 6, r * 6);
+    ctx.restore();
+  }
+
+  drawDecode(t);
+
+  // the clue's energy converging on the glass
+  if (t > T.riseStart && t < I) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 90; i++) {
+      const t0 = T.riseStart + hash(i, 1) * 0.25;
+      const t1 = I - 0.2 * hash(i, 2);
+      const p = seg(t, t0, t1);
+      if (p <= 0 || p >= 1) continue;
+      const a = hash(i, 3) * Math.PI * 2;
+      const e = easeInCubic(p);
+      const rr = lerp(900 + hash(i, 4) * 700, r * 0.8, e);
+      const tail = 30 + 220 * e;
+      ctx.strokeStyle = `rgba(255,${170 + (hash(i, 5) * 70) | 0},${90 + (hash(i, 6) * 60) | 0},${0.2 + 0.55 * p})`;
+      ctx.lineWidth = 1.5 + 2.5 * hash(i, 6);
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr);
+      ctx.lineTo(cx + Math.cos(a) * (rr + tail), cy + Math.sin(a) * (rr + tail));
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  const handleA = 1 - easeInCubic(seg(t, T.moveStart, T.moveStart + 0.45));
+  drawHandle(cx, cy, r, rim, handleA, 160 * easeInCubic(seg(t, T.moveStart, T.moveStart + 0.5)));
+  drawLensView(cx, cy, r, t, iris);
+  const rimGlow = rise * 0.8 + (t >= I ? Math.exp(-(t - I) / 0.5) : 0);
+  drawRim(cx, cy, r, rim, rimGlow);
+  if (iris >= 1) drawCameo(cx, cy, r, 1, t, 'pipe'); // the pipe over the frame
+  drawSmoke(cx, cy, r, t, 1);
+
+  // impact flash and shockwave
+  if (t >= I) {
+    const d = t - I;
+    const f = Math.exp(-d / 0.14);
+    if (f > 0.01) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(W / 2, H / 2 - 70, 0, W / 2, H / 2 - 70, W * 0.6);
+      g.addColorStop(0, `rgba(255,240,210,${0.9 * f})`); g.addColorStop(0.4, `rgba(255,170,90,${0.35 * f})`); g.addColorStop(1, 'rgba(255,140,60,0)');
+      ctx.fillStyle = g; ctx.fillRect(-60, -60, W + 120, H + 120);
+      ctx.restore();
+    }
+    const sk = seg(d, 0, 0.85);
+    if (sk < 1) {
+      ctx.save();
+      ctx.strokeStyle = `rgba(241,215,160,${0.7 * (1 - sk)})`;
+      ctx.lineWidth = lerp(14, 1, sk);
+      ctx.beginPath(); ctx.arc(W / 2, H / 2 - 70, lerp(260, 1500, easeOutExpo(sk)), 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  drawWordmark(t);
+  drawSkimmer(t);
+  drawTagline(t);
+  drawChips(t);
+  ctx.restore();
+
+  ctx.drawImage(vignette, 0, 0);
+  ctx.save();
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.globalAlpha = 0.08;
+  ctx.drawImage(grains[fi % grains.length], 0, 0, W, H);
+  ctx.restore();
+
+  const black = Math.max(1 - seg(t, 0, 0.4), seg(t, T.fadeOut, TL.DURATION));
+  if (black > 0) { ctx.fillStyle = `rgba(0,0,0,${black})`; ctx.fillRect(0, 0, W, H); }
+}
+window.renderAt = renderAt;
+
+// ---------- preview ----------
+const params = new URLSearchParams(location.search);
+if (params.has('render')) document.body.classList.add('render');
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+}
+addEventListener('resize', fit); fit();
+renderAt(params.has('t') ? parseFloat(params.get('t')) : T.shine + 1);
+
+let audio = null;
+document.getElementById('play').onclick = () => {
+  if (audio) audio.pause();
+  audio = new Audio('sherlock-morse-intro.wav');
+  const t0 = performance.now();
+  let useAudio = false;
+  audio.play().then(() => { useAudio = true; }).catch(() => {});
+  const tick = () => {
+    const t = useAudio ? audio.currentTime : (performance.now() - t0) / 1000;
+    renderAt(Math.min(t, TL.DURATION));
+    if (t < TL.DURATION) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+};
+</script>
+</body>
+</html>
