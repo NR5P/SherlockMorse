@@ -119,6 +119,11 @@ pub struct DecoderParams {
     /// it may be dismissed as a noise blip (`explain_blip`; 0 = off).
     pub blip_rel: f32,
     pub blip_knee: f32,
+    /// Mean amplitude evidence per ms (noise sigmas over the threshold;
+    /// the cap is 8) above which a dit- or dah-sized mark counts as solid
+    /// keying: a word of lone E's or T's made only of solid marks is sent
+    /// ("E E" ending an over), not noise (0 = drop them all).
+    pub solid_z: f32,
     /// Margin (log-score) by which the bug reading of a start must beat the
     /// ordinary one to be kept (`estimate_bug`; 0 = off).
     pub bug_boot: f32,
@@ -192,6 +197,7 @@ impl DecoderParams {
                     "blip_rel" => p.blip_rel = v,
                     "blip_knee" => p.blip_knee = v,
                     "bug_boot" => p.bug_boot = v,
+                    "solid_z" => p.solid_z = v,
 
                     _ => eprintln!("unknown param {k}"),
                 }
@@ -239,6 +245,7 @@ impl Default for DecoderParams {
             blip_rel: 1.5,
             blip_knee: 0.3,
             bug_boot: 3.0,
+            solid_z: 5.0,
 
         }
     }
@@ -303,6 +310,12 @@ struct Hyp {
     /// The word being decoded (truncated), for the repetition bonus.
     word: [u8; 12],
     wlen: u8,
+    /// The pending mark is one solid run (`BeamDecoder::solid`), and so
+    /// were all elements of the character so far.
+    pend_solid: bool,
+    csolid: bool,
+    /// Decoded text; a single-element character (E, T) from a solid mark
+    /// is kept in lower case until it leaves the beam (`take_marked`).
     out: Vec<u8>,
 }
 
@@ -371,17 +384,36 @@ impl BeamDecoder {
     }
 
     fn root() -> Hyp {
-        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' '; 4], word: [0; 12], wlen: 0, out: Vec::new() }
+        Hyp { score: 0.0, bits: 0, len: 0, pend_mark: 0.0, pend_space: 0.0, ctx: [b' '; 4], word: [0; 12], wlen: 0, pend_solid: false, csolid: false, out: Vec::new() }
     }
 
     /// Takes text committed so far.
     pub fn take_committed(&mut self) -> Vec<u8> {
+        let mut c = self.take_marked();
+        c.make_ascii_uppercase();
+        c
+    }
+
+    /// Committed text with solid single-element characters in lower case.
+    pub fn take_marked(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.committed)
     }
 
     /// Text of the best hypothesis not yet committed (for live display).
     pub fn tentative(&self) -> String {
-        self.hyps.first().map(|h| String::from_utf8_lossy(&h.out).into_owned()).unwrap_or_default()
+        self.hyps.first().map(|h| String::from_utf8_lossy(&h.out).to_ascii_uppercase()).unwrap_or_default()
+    }
+
+    /// A mark that is solid keying: dit- or dah-sized for the current
+    /// timing and standing far above the threshold all along, as strongly
+    /// as the sender's recent marks.
+    fn solid(&self, len: f32, ev: Option<f32>) -> bool {
+        let z = self.params.solid_z;
+        let t = &self.timing;
+        let Some(e) = ev else { return false };
+        let sized = (0.6 * t.dot..=1.6 * t.dot).contains(&len) || (0.7 * t.dash..=1.5 * t.dash).contains(&len);
+        let dens = e / len.max(1.0);
+        z > 0.0 && sized && dens >= z && dens >= 0.6 * self.dit_ev
     }
 
     fn mark_options(&self, m: f32) -> [(bool, f32); 2] {
@@ -471,7 +503,7 @@ impl BeamDecoder {
         if w.len() > 12 {
             return false;
         }
-        self.recent.iter().any(|r| r.as_slice() == w) || before.split(|&c| c == b' ').any(|x| x == w)
+        self.recent.iter().any(|r| r.as_slice() == w) || before.split(|&c| c == b' ').any(|x| x.eq_ignore_ascii_case(w))
     }
 
     /// Ends the current character; returns false if the elements are invalid.
@@ -482,7 +514,14 @@ impl BeamDecoder {
                     self.emit(h, b'B');
                     self.emit(h, b'K');
                 }
-                Some(c) => self.emit(h, c),
+                Some(c) => {
+                    self.emit(h, c);
+                    if h.len == 1 && h.csolid {
+                        if let Some(l) = h.out.last_mut() {
+                            l.make_ascii_lowercase();
+                        }
+                    }
+                }
                 None => return false,
             }
             h.bits = 0;
@@ -677,6 +716,10 @@ impl BeamDecoder {
             (Run::Mark(m), Some(p)) => self.hidden_gaps(m, p),
             _ => Vec::new(),
         };
+        let solid = match run {
+            Run::Mark(m) => self.solid(m, total),
+            _ => false,
+        };
         let mut next = std::mem::take(&mut self.scratch);
         next.clear();
         match run {
@@ -692,11 +735,14 @@ impl BeamDecoder {
                             }
                             n.pend_space = 0.0;
                             n.pend_mark = m;
+                            n.pend_solid = solid;
                             for &(d1, m2, sc) in &gaps {
                                 let mut g = n.clone();
                                 if self.apply_mark(&mut g, d1) && can_extend(g.bits, g.len) {
                                     g.score += sc;
                                     g.pend_mark = m2;
+                                    g.pend_solid = false;
+                                    g.csolid = false;
                                     next.push(g);
                                 }
                             }
@@ -720,6 +766,7 @@ impl BeamDecoder {
                             }
                         }
                         let mut n = h.clone();
+                        n.pend_solid = solid && n.pend_mark == 0.0;
                         n.pend_mark += m;
                         next.push(n);
                     }
@@ -734,6 +781,7 @@ impl BeamDecoder {
                                 continue;
                             }
                             n.score += ll;
+                            n.csolid = n.pend_solid && (n.len == 1 || n.csolid);
                             n.pend_mark = 0.0;
                             n.pend_space = sp;
                             for &(k, hdash, s2, sc) in &hidden {
@@ -741,6 +789,7 @@ impl BeamDecoder {
                                 if self.apply_space(&mut m, k) && self.apply_mark(&mut m, hdash) {
                                     m.score += sc;
                                     m.pend_space = s2;
+                                    m.csolid = false;
                                     next.push(m);
                                 }
                             }
@@ -749,6 +798,7 @@ impl BeamDecoder {
                         if let Some(c) = self.explain_away(self.params.dropout_penalty, sp, ev) {
                             let mut n = h.clone();
                             n.pend_mark += sp;
+                            n.pend_solid = false;
                             n.score += c;
                             next.push(n);
                         }
@@ -771,6 +821,7 @@ impl BeamDecoder {
                             n.bits = (n.bits << 1) | u8::from(dash);
                             n.len += 1;
                             n.score += ll;
+                            n.csolid = n.pend_solid && (n.len == 1 || n.csolid);
                             cands.push(n);
                         }
                     } else {
@@ -841,7 +892,7 @@ impl BeamDecoder {
                 }
                 self.cword.clear();
             } else {
-                self.cword.push(c);
+                self.cword.push(c.to_ascii_uppercase());
             }
         }
     }
@@ -955,13 +1006,18 @@ impl BeamDecoder {
 /// Prefix sums of a run's evidence profile measured halfway between the
 /// threshold and the run's median, so a window sum rewards both standing
 /// out from the rest of the run and coming close to the threshold.
+/// Erased frames (a static crash: evidence exactly 0, no information)
+/// count as the run's median: next to a strong signal's gap at the -8
+/// cap they would otherwise stand out like a hidden dit ("GOD" read as
+/// "GOL" around a click).
 fn prefix_above_median(prof: &[f32]) -> Vec<f32> {
-    let mut sorted = prof.to_vec();
+    let mut sorted: Vec<f32> = prof.iter().copied().filter(|&z| z != 0.0).collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let med = sorted[sorted.len() / 2];
+    let med = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
     let mut pre = Vec::with_capacity(prof.len() + 1);
     pre.push(0.0f32);
     for &z in prof {
+        let z = if z == 0.0 { med } else { z };
         pre.push(pre.last().unwrap() + z - 0.5 * med);
     }
     pre
@@ -1620,11 +1676,14 @@ impl CwDecoder {
     /// artefacts and applying the error sign.
     fn release_words(&mut self) {
         if let Some(b) = &mut self.beam {
-            let c = b.take_committed();
+            let c = b.take_marked();
             self.word.extend_from_slice(&c);
         }
         while let Some(p) = self.word.iter().position(|&c| c == b' ') {
-            let w: Vec<u8> = self.word.drain(..=p).collect();
+            let mut w: Vec<u8> = self.word.drain(..=p).collect();
+            // Lone E's and T's are noise unless every one was solid keying.
+            let solid = p > 0 && w[..p].iter().all(|&c| c == b'e' || c == b't');
+            w.make_ascii_uppercase();
             let body = &w[..w.len() - 1];
             if let Some(e) = body.iter().position(|&c| c == ERROR) {
                 // The error sign erases the word in progress, or if it came
@@ -1632,7 +1691,7 @@ impl CwDecoder {
                 if body[..e].is_empty() {
                     self.held.clear();
                 }
-            } else if !is_noise_word(body) || (body.iter().all(|&c| c == b'T') && self.solid_keying()) {
+            } else if !is_noise_word(body) || ((solid || body.iter().all(|&c| c == b'T')) && self.solid_keying()) {
                 self.text.append(&mut self.held);
                 // A human copying fills in a garbled letter from the word;
                 // do the same when the fix is unambiguous.
@@ -1652,7 +1711,7 @@ impl CwDecoder {
     /// Text not yet released: the held word, then the live decode.
     pub fn tentative(&self) -> String {
         let mut b = self.held.clone();
-        b.extend_from_slice(&self.word);
+        b.extend_from_slice(&self.word.to_ascii_uppercase());
         if let Some(beam) = &self.beam {
             b.extend_from_slice(beam.tentative().as_bytes());
         }
@@ -2355,7 +2414,7 @@ impl CwDecoder {
             self.finish_runs();
         }
         if let Some(b) = &mut self.beam {
-            let c = b.take_committed();
+            let c = b.take_marked();
             self.word.extend_from_slice(&c);
         }
         if !self.word.ends_with(b" ") && !self.word.is_empty() {

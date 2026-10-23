@@ -47,6 +47,20 @@ pub fn morse_distance(a: &str, b: &str) -> usize {
     prev[y.len()]
 }
 
+/// True if one Morse rendering is the other with a single dit added, or a
+/// dit in place of a character break (two letters joined into one): the
+/// copying errors a fade or a clipped dit makes (N8AE read as T8AE). A dit
+/// read as a dah (WB2KMR as OB2KMR) is not one of them.
+pub fn dit_apart(a: &str, b: &str) -> bool {
+    let (x, y) = (render(a), render(b));
+    if x.len() == y.len() {
+        let diff: Vec<usize> = (0..x.len()).filter(|&i| x[i] != y[i]).collect();
+        return diff.len() == 1 && matches!((x[diff[0]], y[diff[0]]), (b'.', b' ') | (b' ', b'.'));
+    }
+    let (long, short) = if x.len() > y.len() { (x, y) } else { (y, x) };
+    long.len() == short.len() + 1 && (0..long.len()).any(|i| long[i] == b'.' && long[..i] == short[..i] && long[i + 1..] == short[i..])
+}
+
 /// True if the call has the shape most real calls have: a prefix of one or
 /// two characters (at most one of them a digit), one area digit, and a
 /// suffix of one to three letters; two or three letters after a one-letter
@@ -235,6 +249,16 @@ fn is_base_call(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dit_apart_only_for_lost_dits() {
+        assert!(dit_apart("N8AE", "T8AE"));
+        assert!(dit_apart("R8AI", "N8AI"));
+        assert!(dit_apart("K1TMX", "K1YX"));
+        assert!(!dit_apart("WB2KMR", "OB2KMR"));
+        assert!(!dit_apart("WB2KMR", "WB2KMR"));
+        assert!(!dit_apart("K1AB", "K1AN"));
+    }
 
     #[test]
     fn consensus_of_copies() {

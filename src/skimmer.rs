@@ -427,7 +427,10 @@ fn split_glued(w: &str) -> Vec<&str> {
 }
 
 /// Replaces near-miss decodes of a callsign confirmed on this channel
-/// (a dit lost or gained in a fade) with the call itself.
+/// (a dit lost or gained in a fade) with the call itself. Other one-element
+/// errors (a dit read as a dah: W1IW for W1AW) only toward a call heard far
+/// more often than the copy: two bad copies of WB2KMR as OB2KMR were
+/// confirmed first and then turned every good copy into the bad one.
 fn snap_calls(text: &str, calls: &HashMap<String, u32>) -> String {
     let confirmed: Vec<&String> = calls.iter().filter(|(_, &n)| n >= 2).map(|(c, _)| c).collect();
     if confirmed.is_empty() {
@@ -439,7 +442,14 @@ fn snap_calls(text: &str, calls: &HashMap<String, u32>) -> String {
             out.push(' ');
         }
         let near: Vec<&&String> = if w.len() >= 3 && !confirmed.iter().any(|c| c.as_str() == w) {
-            confirmed.iter().filter(|c| crate::callsign::morse_distance(c, w) == 1).collect()
+            let own = calls.get(w).copied().unwrap_or(0);
+            confirmed
+                .iter()
+                .filter(|c| {
+                    let n = calls[c.as_str()];
+                    crate::callsign::dit_apart(c, w) || (n >= 3 && n >= 2 * (own + 1) && crate::callsign::morse_distance(c, w) == 1)
+                })
+                .collect()
         } else {
             Vec::new()
         };
